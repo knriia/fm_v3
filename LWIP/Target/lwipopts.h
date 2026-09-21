@@ -1,0 +1,142 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : Target/lwipopts.h
+  * Description        : This file overrides LwIP stack default configuration
+  *                      done in opt.h file.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Define to prevent recursive inclusion --------------------------------------*/
+#ifndef __LWIPOPTS__H__
+#define __LWIPOPTS__H__
+
+#include "main.h"
+
+/*-----------------------------------------------------------------------------*/
+/* Current version of LwIP supported by CubeMx: 2.1.2 -*/
+/*-----------------------------------------------------------------------------*/
+
+/* Within 'USER CODE' section, code will be kept by default at each generation */
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+#ifdef __cplusplus
+ extern "C" {
+#endif
+
+/* STM32CubeMX Specific Parameters (not defined in opt.h) ---------------------*/
+/* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
+/*----- WITH_RTOS disabled (Since FREERTOS is not set) -----*/
+#define WITH_RTOS 0
+/*----- CHECKSUM_BY_HARDWARE enabled -----*/
+#define CHECKSUM_BY_HARDWARE 1
+/*-----------------------------------------------------------------------------*/
+
+/* LwIP Stack Parameters (modified compared to initialization value in opt.h) -*/
+/* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
+/*----- Default value in ETH configuration GUI in CubeMx: 1524 -----*/
+#define ETH_RX_BUFFER_SIZE 1536
+/*----- Default Value for LWIP_UDP: 1 ---*/
+#define LWIP_UDP 0
+/*----- Value in opt.h for NO_SYS: 0 -----*/
+#define NO_SYS 1
+/*----- Value in opt.h for SYS_LIGHTWEIGHT_PROT: 1 -----*/
+#define SYS_LIGHTWEIGHT_PROT 0
+/*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
+#define MEM_ALIGNMENT 4
+/*
+ * STM32H7 D-Cache lines are 32 bytes.  The zero-copy Ethernet RX pool
+ * contains both the pbuf metadata and the DMA payload in one object.  The
+ * default lwIP declaration only guarantees the CPU alignment, so an aligned
+ * cache invalidate of the payload could evict the pbuf callback field from
+ * the same cache line.  Keep every lwIP statically declared pool base at a
+ * cache-line boundary.
+ */
+#define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
+  u8_t variable_name[size] __attribute__((aligned(32)))
+/*
+ * The ARP header is packed and its IPv4 fields are only 16-bit aligned.
+ * GCC may turn the default 4-byte memcpy into an unaligned word access,
+ * which faults on the Cortex-M7 Ethernet path.  Force byte accesses in
+ * both directions instead.
+ */
+#define IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(dest, src) do { \
+  volatile unsigned char *d_ = (volatile unsigned char *)(dest); \
+  const volatile unsigned char *s_ = (const volatile unsigned char *)(src); \
+  d_[0] = s_[0]; d_[1] = s_[1]; d_[2] = s_[2]; d_[3] = s_[3]; \
+} while (0)
+#define IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(dest, src) do { \
+  volatile unsigned char *d_ = (volatile unsigned char *)(dest); \
+  const volatile unsigned char *s_ = (const volatile unsigned char *)(src); \
+  d_[0] = s_[0]; d_[1] = s_[1]; d_[2] = s_[2]; d_[3] = s_[3]; \
+} while (0)
+/*----- Default Value for MEM_SIZE: 1600 ---*/
+#define MEM_SIZE 8192
+/*----- H723 D2 SRAM: keep heap after Ethernet DMA descriptors -----*/
+#define LWIP_RAM_HEAP_POINTER 0x30001000
+/*----- Default Value for MEMP_NUM_TCP_SEG: 16 ---*/
+#define MEMP_NUM_TCP_SEG 32
+/*----- Default Value for MEMP_NUM_NETCONN: 4 ---*/
+#define MEMP_NUM_NETCONN 8
+/*----- Value supported for H7 devices: 1 -----*/
+#define LWIP_SUPPORT_CUSTOM_PBUF 1
+/*----- Default Value for PBUF_POOL_BUFSIZE: 592 ---*/
+#define PBUF_POOL_BUFSIZE 1536
+/*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
+#define LWIP_ETHERNET 1
+/*----- Value in opt.h for LWIP_DNS_SECURE: (LWIP_DNS_SECURE_RAND_XID | LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING | LWIP_DNS_SECURE_RAND_SRC_PORT) -*/
+#define LWIP_DNS_SECURE 7
+/*----- Default Value for TCP_MSS: 536 ---*/
+#define TCP_MSS 1460
+/*----- Default Value for TCP_SND_BUF: 2920 ---*/
+#define TCP_SND_BUF 5840
+/*----- Value in opt.h for LWIP_NETIF_LINK_CALLBACK: 0 -----*/
+#define LWIP_NETIF_LINK_CALLBACK 1
+/*----- Value in opt.h for LWIP_NETCONN: 1 -----*/
+#define LWIP_NETCONN 0
+/*----- Value in opt.h for LWIP_SOCKET: 1 -----*/
+#define LWIP_SOCKET 0
+/*----- Value in opt.h for RECV_BUFSIZE_DEFAULT: INT_MAX -----*/
+#define RECV_BUFSIZE_DEFAULT 2000000000
+/*----- Default Value for LWIP_STATS: 0 ---*/
+#define LWIP_STATS 1
+/*----- Value in opt.h for MIB2_STATS: 0 or SNMP_LWIP_MIB2 -----*/
+#define MIB2_STATS 0
+/*----- Value in opt.h for CHECKSUM_GEN_IP: 1 -----*/
+#define CHECKSUM_GEN_IP 0
+/*----- Value in opt.h for CHECKSUM_GEN_UDP: 1 -----*/
+#define CHECKSUM_GEN_UDP 0
+/*----- Value in opt.h for CHECKSUM_GEN_TCP: 1 -----*/
+#define CHECKSUM_GEN_TCP 0
+/*----- Value in opt.h for CHECKSUM_GEN_ICMP6: 1 -----*/
+#define CHECKSUM_GEN_ICMP6 0
+/*----- Value in opt.h for CHECKSUM_CHECK_IP: 1 -----*/
+#define CHECKSUM_CHECK_IP 0
+/*----- Value in opt.h for CHECKSUM_CHECK_UDP: 1 -----*/
+#define CHECKSUM_CHECK_UDP 0
+/*----- Value in opt.h for CHECKSUM_CHECK_TCP: 1 -----*/
+#define CHECKSUM_CHECK_TCP 0
+/*----- Value in opt.h for CHECKSUM_CHECK_ICMP6: 1 -----*/
+#define CHECKSUM_CHECK_ICMP6 0
+/*-----------------------------------------------------------------------------*/
+/* USER CODE BEGIN 1 */
+
+/* USER CODE END 1 */
+
+#ifdef __cplusplus
+}
+#endif
+#endif /*__LWIPOPTS__H__ */

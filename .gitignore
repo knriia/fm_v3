@@ -1,0 +1,22 @@
+# Сборка и артефакты
+Debug/
+Release/
+/cmake-build-debug
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.o
+*.d
+
+.idea/
+
+# Настройки IDE
+.settings/
+.metadata/
+*.launch
+
+# Временные файлы ОС
+.DS_Store
+Thumbs.db
