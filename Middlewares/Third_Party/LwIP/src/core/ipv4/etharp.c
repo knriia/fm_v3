@@ -650,6 +650,7 @@ etharp_input(struct pbuf *p, struct netif *netif)
   LWIP_ERROR("netif != NULL", (netif != NULL), return;);
 
   hdr = (struct etharp_hdr *)p->payload;
+
   /* RFC 826 "Packet Reception": */
   if ((hdr->hwtype != PP_HTONS(LWIP_IANA_HWTYPE_ETHERNET)) ||
       (hdr->hwlen != ETH_HWADDR_LEN) ||

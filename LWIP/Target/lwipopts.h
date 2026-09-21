@@ -57,36 +57,10 @@
 #define SYS_LIGHTWEIGHT_PROT 0
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
-/*
- * STM32H7 D-Cache lines are 32 bytes.  The zero-copy Ethernet RX pool
- * contains both the pbuf metadata and the DMA payload in one object.  The
- * default lwIP declaration only guarantees the CPU alignment, so an aligned
- * cache invalidate of the payload could evict the pbuf callback field from
- * the same cache line.  Keep every lwIP statically declared pool base at a
- * cache-line boundary.
- */
-#define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
-  u8_t variable_name[size] __attribute__((aligned(32)))
-/*
- * The ARP header is packed and its IPv4 fields are only 16-bit aligned.
- * GCC may turn the default 4-byte memcpy into an unaligned word access,
- * which faults on the Cortex-M7 Ethernet path.  Force byte accesses in
- * both directions instead.
- */
-#define IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(dest, src) do { \
-  volatile unsigned char *d_ = (volatile unsigned char *)(dest); \
-  const volatile unsigned char *s_ = (const volatile unsigned char *)(src); \
-  d_[0] = s_[0]; d_[1] = s_[1]; d_[2] = s_[2]; d_[3] = s_[3]; \
-} while (0)
-#define IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(dest, src) do { \
-  volatile unsigned char *d_ = (volatile unsigned char *)(dest); \
-  const volatile unsigned char *s_ = (const volatile unsigned char *)(src); \
-  d_[0] = s_[0]; d_[1] = s_[1]; d_[2] = s_[2]; d_[3] = s_[3]; \
-} while (0)
 /*----- Default Value for MEM_SIZE: 1600 ---*/
 #define MEM_SIZE 8192
-/*----- H723 D2 SRAM: keep heap after Ethernet DMA descriptors -----*/
-#define LWIP_RAM_HEAP_POINTER 0x30001000
+/*----- Default Value for H7 devices: 0x30044000 -----*/
+#define LWIP_RAM_HEAP_POINTER 0x30044000
 /*----- Default Value for MEMP_NUM_TCP_SEG: 16 ---*/
 #define MEMP_NUM_TCP_SEG 32
 /*----- Default Value for MEMP_NUM_NETCONN: 4 ---*/
@@ -133,6 +107,30 @@
 #define CHECKSUM_CHECK_ICMP6 0
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
+
+/* H723 D2 SRAM is the non-cacheable Ethernet/lwIP heap region. */
+#undef LWIP_RAM_HEAP_POINTER
+#define LWIP_RAM_HEAP_POINTER 0x30001000U
+
+/* Keep lwIP memory pools aligned to the STM32H7 D-cache line size. */
+#undef LWIP_DECLARE_MEMORY_ALIGNED
+#define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
+  u8_t variable_name[size] __attribute__((aligned(32)))
+
+/* ARP IPv4 fields are packed and may be only 16-bit aligned. */
+#undef IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T
+#define IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(dest, src) do { \
+  volatile unsigned char *d_ = (volatile unsigned char *)(dest); \
+  const volatile unsigned char *s_ = (const volatile unsigned char *)(src); \
+  d_[0] = s_[0]; d_[1] = s_[1]; d_[2] = s_[2]; d_[3] = s_[3]; \
+} while (0)
+
+#undef IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T
+#define IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(dest, src) do { \
+  volatile unsigned char *d_ = (volatile unsigned char *)(dest); \
+  const volatile unsigned char *s_ = (const volatile unsigned char *)(src); \
+  d_[0] = s_[0]; d_[1] = s_[1]; d_[2] = s_[2]; d_[3] = s_[3]; \
+} while (0)
 
 /* USER CODE END 1 */
 

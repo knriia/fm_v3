@@ -28,6 +28,7 @@
 #include "ethernetif.h"
 
 /* USER CODE BEGIN 0 */
+#include "ethernet_port.h"
 
 /* USER CODE END 0 */
 /* Private function prototypes -----------------------------------------------*/
@@ -126,6 +127,7 @@ void MX_LWIP_Init(void)
 static void Ethernet_Link_Periodic_Handle(struct netif *netif)
 {
 /* USER CODE BEGIN 4_4_1 */
+#define ethernet_link_check_state EthernetPort_CheckLinkState
 /* USER CODE END 4_4_1 */
 
   /* Ethernet Link every 100ms */
@@ -135,6 +137,7 @@ static void Ethernet_Link_Periodic_Handle(struct netif *netif)
     ethernet_link_check_state(netif);
   }
 /* USER CODE BEGIN 4_4 */
+#undef ethernet_link_check_state
 /* USER CODE END 4_4 */
 }
 
