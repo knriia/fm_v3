@@ -1,0 +1,35 @@
+---
+Language: Cpp
+
+# Project formatting rules for manually maintained files in Core.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+MaxEmptyLinesToKeep: 2
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AlignAfterOpenBracket: false
+BreakAfterOpenBracketFunction: true
+BreakBeforeCloseBracketFunction: true
+BreakAfterOpenBracketIf: true
+BreakBeforeCloseBracketIf: true
+BreakAfterOpenBracketLoop: true
+BreakBeforeCloseBracketLoop: true
+BreakAfterOpenBracketSwitch: true
+BreakBeforeCloseBracketSwitch: true
+
+SortIncludes: CaseInsensitive
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<[^>]+>$'
+    Priority: 1
+  - Regex: '^"(dp83848|main|stm32h7xx_hal_conf|stm32h7xx_it)\.h"$'
+    Priority: 2
+  - Regex: '.*'
+    Priority: 3

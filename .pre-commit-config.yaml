@@ -1,0 +1,11 @@
+minimum_pre_commit_version: '3.0.0'
+
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format-core
+        name: clang-format Core
+        entry: clang-format --style=file -i
+        language: system
+        files: ^(Core|BSP)/.*\.(c|h)$
+        exclude: ^Core/(Inc/(FreeRTOSConfig|gpio|iwdg|main|stm32h7xx_hal_conf|stm32h7xx_it)\.h|Src/(freertos|gpio|iwdg|main|stm32h7xx_hal_msp|stm32h7xx_hal_timebase_tim|stm32h7xx_it|syscalls|sysmem|system_stm32h7xx)\.c)$
