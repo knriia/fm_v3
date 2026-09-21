@@ -25,35 +25,16 @@ static HAL_StatusTypeDef dp83848_wait_reset(const DP83848_HandleTypeDef *phy) {
     return HAL_TIMEOUT;
 }
 
-static HAL_StatusTypeDef dp83848_find_address(DP83848_HandleTypeDef *phy) {
-    uint32_t address;
-    uint32_t smr = 0U;
+static HAL_StatusTypeDef dp83848_validate(DP83848_HandleTypeDef *phy) {
     uint32_t id1 = 0U;
     uint32_t id2 = 0U;
 
-    if (DP83848_PHY_ADDRESS <= 31U) {
-        phy->address = DP83848_PHY_ADDRESS;
-        if (dp83848_read(phy, DP83848_PHYID1, &id1) != HAL_OK || dp83848_read(phy, DP83848_PHYID2, &id2) != HAL_OK ||
-            (id1 == 0U) || (id1 == 0xFFFFU) || (id2 == 0U) || (id2 == 0xFFFFU)) {
-            return HAL_ERROR;
-        }
-        return HAL_OK;
+    phy->address = DP83848_PHY_ADDRESS;
+    if (dp83848_read(phy, DP83848_PHYID1, &id1) != HAL_OK || dp83848_read(phy, DP83848_PHYID2, &id2) != HAL_OK ||
+        (id1 == 0U) || (id1 == 0xFFFFU) || (id2 == 0U) || (id2 == 0xFFFFU)) {
+        return HAL_ERROR;
     }
-
-    for (address = 0U; address <= 31U; ++address) {
-        phy->address = address;
-
-        if (dp83848_read(phy, DP83848_SMR, &smr) != HAL_OK || (smr & 0x001FU) != address) {
-            continue;
-        }
-
-        if (dp83848_read(phy, DP83848_PHYID1, &id1) == HAL_OK && dp83848_read(phy, DP83848_PHYID2, &id2) == HAL_OK &&
-            id1 != 0U && id1 != 0xFFFFU && id2 != 0U && id2 != 0xFFFFU) {
-            return HAL_OK;
-        }
-    }
-
-    return HAL_ERROR;
+    return HAL_OK;
 }
 
 HAL_StatusTypeDef DP83848_Init(DP83848_HandleTypeDef *phy, ETH_HandleTypeDef *heth) {
@@ -65,7 +46,7 @@ HAL_StatusTypeDef DP83848_Init(DP83848_HandleTypeDef *phy, ETH_HandleTypeDef *he
 
     phy->heth = heth;
 
-    if (dp83848_find_address(phy) != HAL_OK) {
+    if (dp83848_validate(phy) != HAL_OK) {
         return HAL_ERROR;
     }
 
