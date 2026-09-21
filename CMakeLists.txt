@@ -96,12 +96,10 @@ else ()
 endif ()
 
 include_directories(Core/Inc BSP/ETH Drivers/STM32H7xx_HAL_Driver/Inc Drivers/STM32H7xx_HAL_Driver/Inc/Legacy Drivers/CMSIS/Device/ST/STM32H7xx/Include Drivers/CMSIS/Include LWIP/App LWIP/Target Middlewares/Third_Party/LwIP/src/include Middlewares/Third_Party/LwIP/system Middlewares/Third_Party/LwIP/src/include/netif/ppp Middlewares/Third_Party/LwIP/src/include/lwip Middlewares/Third_Party/LwIP/src/include/lwip/apps Middlewares/Third_Party/LwIP/src/include/lwip/priv Middlewares/Third_Party/LwIP/src/include/lwip/prot Middlewares/Third_Party/LwIP/src/include/netif Middlewares/Third_Party/LwIP/src/include/compat/posix Middlewares/Third_Party/LwIP/src/include/compat/posix/arpa Middlewares/Third_Party/LwIP/src/include/compat/posix/net Middlewares/Third_Party/LwIP/src/include/compat/posix/sys Middlewares/Third_Party/LwIP/src/include/compat/stdc Middlewares/Third_Party/LwIP/system/arch)
-include_directories(BSP/ETH)
 
 add_definitions(-DDEBUG -DUSE_HAL_DRIVER -DSTM32H723xx -DDATA_IN_D2_SRAM)
-add_definitions(-DDATA_IN_D2_SRAM)
 
-file(GLOB_RECURSE SOURCES "Core/*.*" "BSP/*.*" "Middlewares/*.*" "LWIP/*.*" "Drivers/*.*" "BSP/*.*")
+file(GLOB_RECURSE SOURCES "BSP/*.*" "Core/*.*" "Middlewares/*.*" "LWIP/*.*" "Drivers/*.*")
 
 set(LINKER_SCRIPT ${CMAKE_SOURCE_DIR}/STM32H723ZETX_FLASH.ld)
 

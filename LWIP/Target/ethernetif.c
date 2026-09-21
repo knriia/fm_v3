@@ -29,7 +29,7 @@
 #include "lwip/ethip6.h"
 #include "ethernetif.h"
 /* USER CODE BEGIN Include for User BSP */
-#include "dp83848.h"
+#include "ethernet_port.h"
 
 /* USER CODE END Include for User BSP */
 #include <string.h>
@@ -88,7 +88,7 @@ typedef struct
 {
   struct pbuf_custom pbuf_custom;
   uint8_t buff[(ETH_RX_BUFFER_SIZE + 31) & ~31] __ALIGNED(32);
-} RxBuff_t __ALIGNED(32);
+} RxBuff_t;
 
 /* Memory Pool Declaration */
 #define ETH_RX_BUFFER_CNT             12U
@@ -117,11 +117,6 @@ ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecr
 #endif
 
 /* USER CODE BEGIN 2 */
-static DP83848_HandleTypeDef dp83848;
-static uint32_t EthernetLinkConfigured;
-static uint32_t EthernetLinkSpeed;
-static uint32_t EthernetLinkDuplex;
-
 /* USER CODE END 2 */
 
 /* Global Ethernet handle */
@@ -173,15 +168,21 @@ static void low_level_init(struct netif *netif)
   HAL_StatusTypeDef hal_eth_init_status = HAL_OK;
   /* Start ETH HAL Init */
 
-   uint8_t MACAddr[6];
-   heth.Instance = ETH;
-   heth.Init.MACAddr = &MACAddr[0];
+   uint8_t MACAddr[6] ;
+  heth.Instance = ETH;
+  MACAddr[0] = 0x00;
+  MACAddr[1] = 0x80;
+  MACAddr[2] = 0xE1;
+  MACAddr[3] = 0x00;
+  MACAddr[4] = 0x00;
+  MACAddr[5] = 0x00;
+  heth.Init.MACAddr = &MACAddr[0];
   heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
   heth.Init.TxDesc = DMATxDscrTab;
   heth.Init.RxDesc = DMARxDscrTab;
   heth.Init.RxBuffLen = 1536;
 
-   /* USER CODE BEGIN MACADDRESS */
+  /* USER CODE BEGIN MACADDRESS */
    static uint8_t mac_address[6];
    ethernet_make_mac_address(mac_address);
    heth.Init.MACAddr = mac_address;
@@ -228,12 +229,7 @@ static void low_level_init(struct netif *netif)
 
   if (hal_eth_init_status == HAL_OK)
   {
-    hal_eth_init_status = DP83848_Init(&dp83848, &heth);
-  }
-
-  if (hal_eth_init_status == HAL_OK)
-  {
-    hal_eth_init_status = HAL_ETH_Start(&heth);
+    hal_eth_init_status = EthernetPort_Init(&heth);
   }
 
 /* USER CODE END low_level_init Code 1 for User BSP */
@@ -250,6 +246,12 @@ static void low_level_init(struct netif *netif)
 #endif /* LWIP_ARP || LWIP_ETHERNET */
 
 /* USER CODE BEGIN LOW_LEVEL_INIT */
+
+  if (hal_eth_init_status == HAL_OK)
+  {
+    EthernetPort_CheckLinkState(netif);
+    netif->linkoutput = EthernetPort_LowLevelOutput;
+  }
 
 /* USER CODE END LOW_LEVEL_INIT */
 }
@@ -303,12 +305,6 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   TxConfig.Length = p->tot_len;
   TxConfig.TxBuffer = Txbuffer;
   TxConfig.pData = p;
-
-  /* Ethernet DMA reads TX data from memory, so make CPU cache contents visible. */
-  for (q = p; q != NULL; q = q->next)
-  {
-    SCB_CleanDCache_by_Addr((uint32_t *)q->payload, q->len);
-  }
 
   HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT);
 
@@ -484,62 +480,7 @@ u32_t sys_now(void)
   */
 void ethernet_link_check_state(struct netif *netif)
 {
-  DP83848_LinkStateTypeDef link_state;
 
-  if (DP83848_GetLinkState(&dp83848, &link_state) != HAL_OK)
-  {
-    return;
-  }
-
-  if (link_state.link_up == 0U)
-  {
-    EthernetLinkConfigured = 0U;
-    netif_set_link_down(netif);
-    netif_set_down(netif);
-    return;
-  }
-
-  if (EthernetLinkConfigured == 0U ||
-      EthernetLinkSpeed != link_state.speed ||
-      EthernetLinkDuplex != link_state.duplex)
-  {
-    ETH_MACConfigTypeDef mac_config;
-
-    /* HAL_ETH_SetMACConfig() requires the HAL handle to be READY. */
-    if (heth.gState != HAL_ETH_STATE_READY && HAL_ETH_Stop(&heth) != HAL_OK)
-    {
-      Error_Handler();
-      return;
-    }
-
-    if (HAL_ETH_GetMACConfig(&heth, &mac_config) != HAL_OK)
-    {
-      Error_Handler();
-      return;
-    }
-
-    mac_config.Speed = link_state.speed;
-    mac_config.DuplexMode = link_state.duplex;
-
-    if (HAL_ETH_SetMACConfig(&heth, &mac_config) != HAL_OK)
-    {
-      Error_Handler();
-      return;
-    }
-
-    if (HAL_ETH_Start(&heth) != HAL_OK)
-    {
-      Error_Handler();
-      return;
-    }
-
-    EthernetLinkSpeed = link_state.speed;
-    EthernetLinkDuplex = link_state.duplex;
-    EthernetLinkConfigured = 1U;
-  }
-
-  netif_set_link_up(netif);
-  netif_set_up(netif);
 }
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
