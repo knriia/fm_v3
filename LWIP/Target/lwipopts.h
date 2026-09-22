@@ -57,8 +57,7 @@
 #define MEM_ALIGNMENT 4
 /*----- Default Value for MEM_SIZE: 1600 ---*/
 #define MEM_SIZE 8192
-/*----- Default Value for H7 devices: 0x30044000 -----*/
-#define LWIP_RAM_HEAP_POINTER 0x30044000
+/*----- LwIP heap is placed by the linker in the dedicated D2 section. -----*/
 /*----- Default Value for MEMP_NUM_TCP_SEG: 16 ---*/
 #define MEMP_NUM_TCP_SEG 32
 /*----- Default Value for MEMP_NUM_SYS_TIMEOUT: 3 ---*/
@@ -126,14 +125,21 @@
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
 
-/* H723 D2 SRAM is the non-cacheable Ethernet/lwIP heap region. */
-#undef LWIP_RAM_HEAP_POINTER
-#define LWIP_RAM_HEAP_POINTER 0x30001000U
+/*
+ * Ethernet memory placement contract:
+ * - DMA descriptors and the LwIP heap are in RAM_D2. MPU marks RAM_D2 as
+ *   non-cacheable because the ETH DMA accesses these areas directly.
+ * - LwIP pools, including the zero-copy RX pool and TX pbufs, are in RAM_D1.
+ *   RX DMA writes are followed by D-cache invalidation in ethernetif.c;
+ *   TX DMA reads are preceded by D-cache cleaning in ethernet_port.c.
+ */
+extern unsigned char __lwip_heap_start__;
+#define LWIP_RAM_HEAP_POINTER ((void *)&__lwip_heap_start__)
 
-/* Keep lwIP memory pools aligned to the STM32H7 D-cache line size. */
+/* Keep lwIP memory pools in DMA-accessible D1 and aligned to 32 bytes. */
 #undef LWIP_DECLARE_MEMORY_ALIGNED
 #define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
-  u8_t variable_name[size] __attribute__((aligned(32)))
+  u8_t variable_name[size] __attribute__((section(".LwIPPool"), aligned(32)))
 
 /* ARP IPv4 fields are packed and may be only 16-bit aligned. */
 #undef IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T
