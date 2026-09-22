@@ -1,6 +1,6 @@
 /**
   ******************************************************************************
-  * @file      startup_stm32h723xx.s
+  * @file      startup_stm32h723zgtx.s
   * @author    MCD Application Team
   * @brief     STM32H723xx Devices vector table for GCC based toolchain.
   *            This module performs:
