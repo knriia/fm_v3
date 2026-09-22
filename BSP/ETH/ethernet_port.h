@@ -11,6 +11,7 @@ extern "C" {
 
 HAL_StatusTypeDef EthernetPort_Init(ETH_HandleTypeDef *heth);
 HAL_StatusTypeDef EthernetPort_ReadData(void **pAppBuff);
+HAL_StatusTypeDef EthernetPort_HandleLinkInterrupt(struct netif *netif);
 void EthernetPort_CheckLinkState(struct netif *netif);
 err_t EthernetPort_LowLevelOutput(struct netif *netif, struct pbuf *p);
 

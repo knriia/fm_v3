@@ -39,6 +39,7 @@ static HAL_StatusTypeDef dp83848_validate(DP83848_HandleTypeDef *phy) {
 
 HAL_StatusTypeDef DP83848_Init(DP83848_HandleTypeDef *phy, ETH_HandleTypeDef *heth) {
     uint32_t bcr = 0U;
+    uint32_t misr = 0U;
 
     if (phy == NULL || heth == NULL) {
         return HAL_ERROR;
@@ -58,7 +59,28 @@ HAL_StatusTypeDef DP83848_Init(DP83848_HandleTypeDef *phy, ETH_HandleTypeDef *he
     bcr &= ~(DP83848_BCR_SPEED100 | DP83848_BCR_FULLDUPLEX);
     bcr |= DP83848_BCR_AUTONEG | DP83848_BCR_RESTART;
 
-    return dp83848_write(phy, DP83848_BCR, bcr);
+    if (dp83848_write(phy, DP83848_BCR, bcr) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    /* Clear stale events, enable link-related sources, then expose the
+     * open-drain interrupt on the PHY
+     * PWR_DOWN/INT pin. */
+    if (dp83848_write(phy, DP83848_MICR, 0U) != HAL_OK || dp83848_read(phy, DP83848_MISR, &misr) != HAL_OK ||
+        dp83848_write(phy, DP83848_MISR, DP83848_MISR_EVENT_ENABLE_MASK) != HAL_OK ||
+        dp83848_write(phy, DP83848_MICR, DP83848_MICR_INT_OE | DP83848_MICR_INTEN) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef DP83848_ReadInterruptStatus(const DP83848_HandleTypeDef *phy, uint32_t *status) {
+    if (phy == NULL || status == NULL) {
+        return HAL_ERROR;
+    }
+
+    return dp83848_read(phy, DP83848_MISR, status);
 }
 
 HAL_StatusTypeDef DP83848_GetLinkState(const DP83848_HandleTypeDef *phy, DP83848_LinkStateTypeDef *state) {

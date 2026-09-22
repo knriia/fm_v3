@@ -23,6 +23,8 @@ extern "C" {
 #define DP83848_PHYID1 0x02U
 #define DP83848_PHYID2 0x03U
 #define DP83848_PHYSCSR 0x10U
+#define DP83848_MICR 0x11U
+#define DP83848_MISR 0x12U
 #define DP83848_SMR 0x19U
 
 #define DP83848_BCR_RESET 0x8000U
@@ -37,6 +39,22 @@ extern "C" {
 #define DP83848_PHYSCSR_SPEED_DUPLEX 0x0006U
 #define DP83848_PHYSCSR_100_FULL 0x0004U
 #define DP83848_PHYSCSR_10_FULL 0x0006U
+
+#define DP83848_MICR_INT_OE 0x0001U
+#define DP83848_MICR_INTEN 0x0002U
+#define DP83848_MISR_LINK_INT 0x2000U
+#define DP83848_MISR_SPEED_INT 0x1000U
+#define DP83848_MISR_DUPLEX_INT 0x0800U
+#define DP83848_MISR_AUTONEG_COMPLETE_INT 0x0400U
+#define DP83848_MISR_EVENT_STATUS_MASK                                                                                 \
+    (DP83848_MISR_LINK_INT | DP83848_MISR_SPEED_INT | DP83848_MISR_DUPLEX_INT | DP83848_MISR_AUTONEG_COMPLETE_INT)
+#define DP83848_MISR_LINK_INT_ENABLE 0x0020U
+#define DP83848_MISR_SPEED_INT_ENABLE 0x0010U
+#define DP83848_MISR_DUPLEX_INT_ENABLE 0x0008U
+#define DP83848_MISR_AUTONEG_COMPLETE_INT_ENABLE 0x0004U
+#define DP83848_MISR_EVENT_ENABLE_MASK                                                                                 \
+    (DP83848_MISR_LINK_INT_ENABLE | DP83848_MISR_SPEED_INT_ENABLE | DP83848_MISR_DUPLEX_INT_ENABLE |                   \
+        DP83848_MISR_AUTONEG_COMPLETE_INT_ENABLE)
 
 #define DP83848_INIT_TIMEOUT_MS 500U
 
@@ -54,6 +72,7 @@ typedef struct {
 
 HAL_StatusTypeDef DP83848_Init(DP83848_HandleTypeDef *phy, ETH_HandleTypeDef *heth);
 HAL_StatusTypeDef DP83848_GetLinkState(const DP83848_HandleTypeDef *phy, DP83848_LinkStateTypeDef *state);
+HAL_StatusTypeDef DP83848_ReadInterruptStatus(const DP83848_HandleTypeDef *phy, uint32_t *status);
 
 #ifdef __cplusplus
 }
