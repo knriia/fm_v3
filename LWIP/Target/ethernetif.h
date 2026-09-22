@@ -24,6 +24,7 @@
 #include "lwip/err.h"
 #include "lwip/netif.h"
 #include "cmsis_os.h"
+#include <stdint.h>
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
@@ -35,6 +36,16 @@ err_t ethernetif_init(struct netif *netif);
 
 void ethernetif_input(void* argument);
 void ethernet_link_thread(void* argument );
+
+typedef struct
+{
+  uint32_t rx_pool_exhaustions;
+  uint32_t hal_read_data_errors;
+  uint32_t dma_receive_buffer_unavailable;
+  uint32_t dropped_packets;
+} EthernetRxDiagnostics;
+
+void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics);
 
 void Error_Handler(void);
 u32_t sys_jiffies(void);

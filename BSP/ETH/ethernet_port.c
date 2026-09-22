@@ -42,12 +42,21 @@ HAL_StatusTypeDef EthernetPort_Init(ETH_HandleTypeDef *heth) {
 HAL_StatusTypeDef EthernetPort_ReadData(void **pAppBuff) {
     HAL_StatusTypeDef status;
 
-    if (pAppBuff == NULL || ethernet_mutex == NULL || osMutexAcquire(ethernet_mutex, ETH_PORT_MUTEX_TIMEOUT) != osOK) {
+    if (pAppBuff == NULL) {
         return HAL_ERROR;
+    }
+
+    if (ethernet_mutex == NULL || osMutexAcquire(ethernet_mutex, ETH_PORT_MUTEX_TIMEOUT) != osOK) {
+        return HAL_BUSY;
     }
 
     status = HAL_ETH_ReadData(&heth, pAppBuff);
     (void)osMutexRelease(ethernet_mutex);
+
+    /* HAL_ETH_ReadData uses HAL_ERROR for the normal "no complete packet" case. */
+    if (status == HAL_ERROR && heth.gState == HAL_ETH_STATE_STARTED) {
+        return HAL_BUSY;
+    }
 
     return status;
 }

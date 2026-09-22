@@ -31,6 +31,7 @@
 
 /* USER CODE END Include for User BSP */
 #include <string.h>
+#include <stdint.h>
 #include "cmsis_os.h"
 #include "lwip/tcpip.h"
 
@@ -97,7 +98,25 @@ typedef struct
 LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX PBUF pool");
 
 /* Variable Definitions */
-static uint8_t RxAllocStatus;
+static volatile RxAllocStatusTypeDef RxAllocStatus = RX_ALLOC_OK;
+static volatile EthernetRxDiagnostics ethernet_rx_diagnostics;
+
+static void ethernet_rx_counter_increment(volatile uint32_t *counter)
+{
+  uint32_t current_value;
+
+  do
+  {
+    current_value = __LDREXW(counter);
+    if (current_value == UINT32_MAX)
+    {
+      __CLREX();
+      return;
+    }
+  } while (__STREXW(current_value + 1U, counter) != 0U);
+
+  __DMB();
+}
 
 #if defined ( __ICCARM__ ) /*!< IAR Compiler */
 
@@ -139,6 +158,19 @@ ETH_TxPacketConfig TxConfig;
 /* Private functions ---------------------------------------------------------*/
 void pbuf_free_custom(struct pbuf *p);
 
+void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics)
+{
+  if (diagnostics == NULL)
+  {
+    return;
+  }
+
+  diagnostics->rx_pool_exhaustions = ethernet_rx_diagnostics.rx_pool_exhaustions;
+  diagnostics->hal_read_data_errors = ethernet_rx_diagnostics.hal_read_data_errors;
+  diagnostics->dma_receive_buffer_unavailable = ethernet_rx_diagnostics.dma_receive_buffer_unavailable;
+  diagnostics->dropped_packets = ethernet_rx_diagnostics.dropped_packets;
+}
+
 /**
   * @brief  Ethernet Rx Transfer completed callback
   * @param  handlerEth: ETH handler
@@ -157,6 +189,7 @@ void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *handlerEth)
 {
   if((HAL_ETH_GetDMAError(handlerEth) & ETH_DMACSR_RBU) == ETH_DMACSR_RBU)
   {
+     ethernet_rx_counter_increment(&ethernet_rx_diagnostics.dma_receive_buffer_unavailable);
      osSemaphoreRelease(RxPktSemaphore);
   }
 }
@@ -258,7 +291,7 @@ static void low_level_init(struct netif *netif)
   #endif /* LWIP_ARP */
 
   /* create a binary semaphore used for informing ethernetif of frame reception */
-  RxPktSemaphore = osSemaphoreNew(1, 1, NULL);
+  RxPktSemaphore = osSemaphoreNew(1, 0, NULL);
 
   if (RxPktSemaphore == NULL)
   {
@@ -335,11 +368,16 @@ static void low_level_init(struct netif *netif)
    */
 static struct pbuf * low_level_input(struct netif *netif)
 {
+  HAL_StatusTypeDef status = HAL_OK;
   struct pbuf *p = NULL;
 
   if(RxAllocStatus == RX_ALLOC_OK)
   {
-    EthernetPort_ReadData((void **)&p);
+    status = EthernetPort_ReadData((void **)&p);
+    if (status == HAL_ERROR)
+    {
+      ethernet_rx_counter_increment(&ethernet_rx_diagnostics.hal_read_data_errors);
+    }
   }
 
   return p;
@@ -370,6 +408,7 @@ void ethernetif_input(void* argument)
         {
           if (netif->input( p, netif) != ERR_OK )
           {
+            ethernet_rx_counter_increment(&ethernet_rx_diagnostics.dropped_packets);
             pbuf_free(p);
           }
         }
@@ -536,6 +575,7 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   }
   else
   {
+    ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_pool_exhaustions);
     RxAllocStatus = RX_ALLOC_ERROR;
     *buff = NULL;
   }
