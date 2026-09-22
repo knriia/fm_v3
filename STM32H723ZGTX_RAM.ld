@@ -50,6 +50,12 @@ MEMORY
   RAM_D3  (xrw)   : ORIGIN = 0x38000000, LENGTH = 16K
 }
 
+/* Ethernet memory layout contract. Keep these values in sync with the
+ * descriptor counts and MEM_SIZE in the Ethernet/LwIP configuration. */
+_ETH_RX_DESC_BASE = ORIGIN(RAM_D2);
+_ETH_TX_DESC_BASE = ORIGIN(RAM_D2) + 0x200;
+_LWIP_HEAP_SIZE = 0x2010; /* MEM_SIZE=8192 + 2 * SIZEOF_STRUCT_MEM (8 bytes) */
+
 /* Define output sections */
 SECTIONS
 {
@@ -149,6 +155,62 @@ SECTIONS
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
   } >DTCMRAM
+
+  /* LwIP pools must not fall into DTCM: ETH DMA cannot access DTCM. Keep
+   * them in the DMA-accessible, cacheable RAM_EXEC/D1 region. */
+  .LwIPPool (NOLOAD) :
+  {
+    . = ALIGN(32);
+    __lwip_pool_start__ = .;
+    KEEP(*(.LwIPPool))
+    __lwip_pool_end__ = .;
+    . = ALIGN(32);
+  } >RAM_EXEC
+  ASSERT(__lwip_pool_end__ <= (ORIGIN(RAM_EXEC) + LENGTH(RAM_EXEC)),
+         "LwIP pools do not fit in RAM_EXEC")
+
+  /* Ethernet DMA descriptors must be placed in D2 SRAM, accessible by ETH DMA. */
+  .RxDecripSection (NOLOAD) :
+  {
+    . = ABSOLUTE(_ETH_RX_DESC_BASE);
+    __eth_rx_desc_start__ = .;
+    KEEP(*(.RxDecripSection))
+    __eth_rx_desc_end__ = .;
+    . = ALIGN(32);
+  } >RAM_D2
+  ASSERT(__eth_rx_desc_start__ == _ETH_RX_DESC_BASE,
+         "ETH RX descriptors are not at the RAM_D2 base")
+  ASSERT(__eth_rx_desc_end__ <= _ETH_TX_DESC_BASE,
+         "ETH RX descriptors overlap the TX descriptor area")
+
+  .TxDecripSection (NOLOAD) :
+  {
+    . = ABSOLUTE(_ETH_TX_DESC_BASE);
+    __eth_tx_desc_start__ = .;
+    KEEP(*(.TxDecripSection))
+    __eth_tx_desc_end__ = .;
+    . = ALIGN(32);
+  } >RAM_D2
+  ASSERT(__eth_tx_desc_start__ == _ETH_TX_DESC_BASE,
+         "ETH TX descriptors are not at the expected RAM_D2 address")
+  ASSERT(__eth_tx_desc_end__ <= (ORIGIN(RAM_D2) + LENGTH(RAM_D2)),
+         "ETH descriptors do not fit in RAM_D2")
+
+  /* LwIP mem.c uses this linker-provided heap instead of a magic address. */
+  .LwIPHeap (NOLOAD) :
+  {
+    . = ALIGN(32);
+    __lwip_heap_start__ = .;
+    . = . + _LWIP_HEAP_SIZE;
+    __lwip_heap_end__ = .;
+    . = ALIGN(32);
+  } >RAM_D2
+  ASSERT(__lwip_heap_start__ >= __eth_tx_desc_end__,
+         "LwIP heap overlaps the ETH descriptor area")
+  ASSERT((__lwip_heap_end__ - __lwip_heap_start__) == _LWIP_HEAP_SIZE,
+         "LwIP heap size changed unexpectedly")
+  ASSERT(__lwip_heap_end__ <= (ORIGIN(RAM_D2) + LENGTH(RAM_D2)),
+         "LwIP heap does not fit in RAM_D2")
 
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack :

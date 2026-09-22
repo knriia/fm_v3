@@ -33,6 +33,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define ETH_DMA_RAM_BASE_ADDRESS 0x30000000U
+#define ETH_DMA_RAM_MPU_SIZE MPU_REGION_SIZE_32KB
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -250,12 +252,15 @@ static void MPU_Config(void)
 {
   MPU_Region_InitTypeDef MPU_InitStruct = {0};
 
+  /* RAM_D2 contains ETH descriptors and the linker-reserved LwIP heap.
+   * Keep it non-cacheable. LwIP pools and RX/TX pbufs remain in cacheable D1
+   * and are handled with explicit cache maintenance in the ETH driver. */
   HAL_MPU_Disable();
 
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
-  MPU_InitStruct.BaseAddress = 0x30000000U;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_32KB;
+  MPU_InitStruct.BaseAddress = ETH_DMA_RAM_BASE_ADDRESS;
+  MPU_InitStruct.Size = ETH_DMA_RAM_MPU_SIZE;
   MPU_InitStruct.SubRegionDisable = 0x00U;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
   MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
