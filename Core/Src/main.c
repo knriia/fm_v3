@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
-#include "lwip.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -33,8 +32,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ETH_DMA_RAM_BASE_ADDRESS 0x30000000U
-#define ETH_DMA_RAM_MPU_SIZE MPU_REGION_SIZE_32KB
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,13 +41,6 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-/* Definitions for StartupTask */
-osThreadId_t StartupTaskHandle;
-const osThreadAttr_t StartupTask_attributes = {
-  .name = "StartupTask",
-  .stack_size = 4096 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -58,7 +48,7 @@ const osThreadAttr_t StartupTask_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-void StartStartupTask(void *argument);
+void MX_FREERTOS_Init(void);
 
 /* USER CODE BEGIN PFP */
 
@@ -133,16 +123,8 @@ int main(void)
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
-  /* Create the thread(s) */
-  /* creation of StartupTask */
-  StartupTaskHandle = osThreadNew(StartStartupTask, NULL, &StartupTask_attributes);
-  if (StartupTaskHandle == NULL)
-  {
-    Error_Handler();
-  }
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+/* USER CODE BEGIN RTOS_THREADS */
+  MX_FREERTOS_Init();
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -276,6 +258,8 @@ static void PHY_INT_GPIO_Init(void)
 static void MPU_Config(void)
 {
   MPU_Region_InitTypeDef MPU_InitStruct = {0};
+  const uint32_t ram_d2_base_address = 0x30000000U;
+  const uint32_t ram_d2_mpu_size = MPU_REGION_SIZE_32KB;
 
   /* RAM_D2 contains ETH descriptors and the linker-reserved LwIP heap.
    * Keep it non-cacheable. LwIP pools and RX/TX pbufs remain in cacheable D1
@@ -284,8 +268,8 @@ static void MPU_Config(void)
 
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
-  MPU_InitStruct.BaseAddress = ETH_DMA_RAM_BASE_ADDRESS;
-  MPU_InitStruct.Size = ETH_DMA_RAM_MPU_SIZE;
+  MPU_InitStruct.BaseAddress = ram_d2_base_address;
+  MPU_InitStruct.Size = ram_d2_mpu_size;
   MPU_InitStruct.SubRegionDisable = 0x00U;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
   MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
@@ -299,29 +283,6 @@ static void MPU_Config(void)
 }
 
 /* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartStartupTask */
-/**
-  * @brief  Function implementing the StartupTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartStartupTask */
-void StartStartupTask(void *argument)
-{
-  (void)argument;
-
-  /* init code for LWIP */
-  MX_LWIP_Init();
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    HAL_GPIO_TogglePin(LED_STATUS_GPIO_Port, LED_STATUS_Pin);
-    osDelay(500);
-  }
-  /* USER CODE END 5 */
-}
 
 /**
   * @brief  Period elapsed callback in non blocking mode

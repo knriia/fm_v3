@@ -21,6 +21,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
+#include "cmsis_os.h"
+#include "startup_task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -45,42 +47,33 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 
+static osThreadId_t startup_task_handle;
+static const osThreadAttr_t startup_task_attr = {
+  .name = "StartupTask",
+  .stack_size = 4096 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
 /* USER CODE END Variables */
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
+void MX_FREERTOS_Init(void);
+
 /* USER CODE END FunctionPrototypes */
-
-/* Hook prototypes */
-void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName);
-void vApplicationMallocFailedHook(void);
-
-/* USER CODE BEGIN 4 */
-void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
-{
-   (void)xTask;
-   (void)pcTaskName;
-
-   taskDISABLE_INTERRUPTS();
-   for (;;)
-   {
-   }
-}
-/* USER CODE END 4 */
-
-/* USER CODE BEGIN 5 */
-void vApplicationMallocFailedHook(void)
-{
-   taskDISABLE_INTERRUPTS();
-   for (;;)
-   {
-   }
-}
-/* USER CODE END 5 */
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+void MX_FREERTOS_Init(void)
+{
+  startup_task_handle = osThreadNew(StartStartupTask, NULL, &startup_task_attr);
+  if (startup_task_handle == NULL)
+  {
+    Error_Handler();
+  }
+}
 
 /* USER CODE END Application */
 
