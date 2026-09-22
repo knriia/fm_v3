@@ -20,6 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32h7xx_it.h"
+#include "ethernetif.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
@@ -186,6 +187,18 @@ void ETH_IRQHandler(void)
   /* USER CODE BEGIN ETH_IRQn 1 */
 
   /* USER CODE END ETH_IRQn 1 */
+}
+
+/**
+  * @brief This function handles the DP83848 interrupt on PB0/EXTI0.
+  */
+void EXTI0_IRQHandler(void)
+{
+  if ((EXTI->PR1 & EXTI_PR1_PR0) != 0U)
+  {
+    EXTI->PR1 = EXTI_PR1_PR0;
+    ethernetif_phy_interrupt_notify();
+  }
 }
 
 /* USER CODE BEGIN 1 */

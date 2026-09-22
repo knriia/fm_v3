@@ -100,6 +100,7 @@ LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX
 /* Variable Definitions */
 static volatile RxAllocStatusTypeDef RxAllocStatus = RX_ALLOC_OK;
 static volatile EthernetRxDiagnostics ethernet_rx_diagnostics;
+static osThreadId_t ethernet_link_thread_id;
 
 static void ethernet_rx_counter_increment(volatile uint32_t *counter)
 {
@@ -542,20 +543,47 @@ u32_t sys_now(void)
 void ethernet_link_thread(void* argument)
 {
   struct netif *netif = (struct netif *)argument;
+  uint32_t flags;
+  HAL_StatusTypeDef status;
+
+  ethernet_link_thread_id = osThreadGetId();
 
 /* USER CODE BEGIN ETH link init */
 
 /* USER CODE END ETH link init */
 
+  /* Handle the state that may already exist before the first PHY interrupt. */
+  EthernetPort_CheckLinkState(netif);
+  (void)EthernetPort_HandleLinkInterrupt(netif);
+
   for(;;)
   {
 
 /* USER CODE BEGIN ETH link Thread core code for User BSP */
-    EthernetPort_CheckLinkState(netif);
+    flags = osThreadFlagsWait(ETHERNET_LINK_EVENT_PHY, osFlagsWaitAny, osWaitForever);
+    if ((flags & ETHERNET_LINK_EVENT_PHY) == 0U)
+    {
+      continue;
+    }
+
+    do
+    {
+      status = EthernetPort_HandleLinkInterrupt(netif);
+      if (status == HAL_BUSY)
+      {
+        osDelay(1U);
+      }
+    } while (status == HAL_BUSY);
 
 /* USER CODE END ETH link Thread core code for User BSP */
+  }
+}
 
-    osDelay(100);
+void ethernetif_phy_interrupt_notify(void)
+{
+  if (ethernet_link_thread_id != NULL)
+  {
+    (void)osThreadFlagsSet(ethernet_link_thread_id, ETHERNET_LINK_EVENT_PHY);
   }
 }
 

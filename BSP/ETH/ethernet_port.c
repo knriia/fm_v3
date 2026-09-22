@@ -61,6 +61,36 @@ HAL_StatusTypeDef EthernetPort_ReadData(void **pAppBuff) {
     return status;
 }
 
+HAL_StatusTypeDef EthernetPort_HandleLinkInterrupt(struct netif *netif) {
+    uint32_t interrupt_status = 0U;
+    HAL_StatusTypeDef status;
+
+    if (netif == NULL || dp83848.heth == NULL || ethernet_mutex == NULL) {
+        return HAL_ERROR;
+    }
+
+    if (osMutexAcquire(ethernet_mutex, ETH_PORT_MUTEX_TIMEOUT) != osOK) {
+        return HAL_BUSY;
+    }
+
+    status = DP83848_ReadInterruptStatus(&dp83848, &interrupt_status);
+    (void)osMutexRelease(ethernet_mutex);
+
+    if (status != HAL_OK) {
+        return status;
+    }
+
+    if ((interrupt_status & DP83848_MISR_EVENT_STATUS_MASK) == 0U) {
+        return HAL_OK;
+    }
+
+    /* Reading MISR clears the PHY event. Read the complete link state in the
+     * task context so MAC/netif changes
+     * never happen inside the ISR. */
+    EthernetPort_CheckLinkState(netif);
+    return HAL_OK;
+}
+
 void EthernetPort_CheckLinkState(struct netif *netif) {
     DP83848_LinkStateTypeDef link_state;
     ETH_HandleTypeDef *heth;
