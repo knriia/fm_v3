@@ -2,8 +2,12 @@
 
 #include <string.h>
 #include "dp83848.h"
+#include "cmsis_os.h"
+#include "lwip/netifapi.h"
 
 #define ETH_DMA_TRANSMIT_TIMEOUT (20U)
+#define ETH_PORT_MUTEX_TIMEOUT (20U)
+#define ETH_CACHE_LINE_SIZE (32U)
 
 extern ETH_HandleTypeDef heth;
 extern ETH_TxPacketConfig TxConfig;
@@ -12,8 +16,8 @@ static DP83848_HandleTypeDef dp83848;
 static uint32_t ethernet_link_configured;
 static uint32_t ethernet_link_speed;
 static uint32_t ethernet_link_duplex;
-
-extern void Error_Handler(void);
+static uint32_t ethernet_netif_up;
+static osMutexId_t ethernet_mutex;
 
 HAL_StatusTypeDef EthernetPort_Init(ETH_HandleTypeDef *heth) {
     if (heth == NULL) {
@@ -21,47 +25,81 @@ HAL_StatusTypeDef EthernetPort_Init(ETH_HandleTypeDef *heth) {
     }
 
     ethernet_link_configured = 0U;
+    ethernet_netif_up = 0U;
+    ethernet_mutex = osMutexNew(NULL);
+
+    if (ethernet_mutex == NULL) {
+        return HAL_ERROR;
+    }
 
     if (DP83848_Init(&dp83848, heth) != HAL_OK) {
         return HAL_ERROR;
     }
 
-    return HAL_ETH_Start(heth);
+    return HAL_ETH_Start_IT(heth);
+}
+
+HAL_StatusTypeDef EthernetPort_ReadData(void **pAppBuff) {
+    HAL_StatusTypeDef status;
+
+    if (pAppBuff == NULL || ethernet_mutex == NULL || osMutexAcquire(ethernet_mutex, ETH_PORT_MUTEX_TIMEOUT) != osOK) {
+        return HAL_ERROR;
+    }
+
+    status = HAL_ETH_ReadData(&heth, pAppBuff);
+    (void)osMutexRelease(ethernet_mutex);
+
+    return status;
 }
 
 void EthernetPort_CheckLinkState(struct netif *netif) {
     DP83848_LinkStateTypeDef link_state;
     ETH_HandleTypeDef *heth;
 
-    if (netif == NULL || dp83848.heth == NULL) {
+    if (netif == NULL || dp83848.heth == NULL || ethernet_mutex == NULL) {
+        return;
+    }
+
+    if (osMutexAcquire(ethernet_mutex, ETH_PORT_MUTEX_TIMEOUT) != osOK) {
         return;
     }
 
     heth = dp83848.heth;
 
     if (DP83848_GetLinkState(&dp83848, &link_state) != HAL_OK) {
+        (void)osMutexRelease(ethernet_mutex);
         return;
     }
 
     if (link_state.link_up == 0U) {
         ethernet_link_configured = 0U;
-        netif_set_link_down(netif);
-        netif_set_down(netif);
+        (void)osMutexRelease(ethernet_mutex);
+
+        if (ethernet_netif_up != 0U) {
+            if ((netifapi_netif_set_down(netif) == ERR_OK) && (netifapi_netif_set_link_down(netif) == ERR_OK)) {
+                ethernet_netif_up = 0U;
+            }
+        }
         return;
     }
 
     if (ethernet_link_configured == 0U || ethernet_link_speed != link_state.speed ||
-        ethernet_link_duplex != link_state.duplex) {
+        ethernet_link_duplex != link_state.duplex || heth->gState != HAL_ETH_STATE_STARTED) {
         ETH_MACConfigTypeDef mac_config;
 
+        if (heth->gState == HAL_ETH_STATE_STARTED && HAL_ETH_Stop_IT(heth) != HAL_OK) {
+            (void)osMutexRelease(ethernet_mutex);
+            return;
+        }
+
         /* HAL_ETH_SetMACConfig() requires the HAL handle to be READY. */
-        if (heth->gState != HAL_ETH_STATE_READY && HAL_ETH_Stop(heth) != HAL_OK) {
-            Error_Handler();
+        if (heth->gState != HAL_ETH_STATE_READY) {
+            (void)osMutexRelease(ethernet_mutex);
             return;
         }
 
         if (HAL_ETH_GetMACConfig(heth, &mac_config) != HAL_OK) {
-            Error_Handler();
+            (void)osMutexRelease(ethernet_mutex);
             return;
         }
 
@@ -69,12 +107,12 @@ void EthernetPort_CheckLinkState(struct netif *netif) {
         mac_config.DuplexMode = link_state.duplex;
 
         if (HAL_ETH_SetMACConfig(heth, &mac_config) != HAL_OK) {
-            Error_Handler();
+            (void)osMutexRelease(ethernet_mutex);
             return;
         }
 
-        if (HAL_ETH_Start(heth) != HAL_OK) {
-            Error_Handler();
+        if (HAL_ETH_Start_IT(heth) != HAL_OK) {
+            (void)osMutexRelease(ethernet_mutex);
             return;
         }
 
@@ -83,8 +121,13 @@ void EthernetPort_CheckLinkState(struct netif *netif) {
         ethernet_link_configured = 1U;
     }
 
-    netif_set_link_up(netif);
-    netif_set_up(netif);
+    (void)osMutexRelease(ethernet_mutex);
+
+    if (ethernet_netif_up == 0U) {
+        if ((netifapi_netif_set_up(netif) == ERR_OK) && (netifapi_netif_set_link_up(netif) == ERR_OK)) {
+            ethernet_netif_up = 1U;
+        }
+    }
 }
 
 err_t EthernetPort_LowLevelOutput(struct netif *netif, struct pbuf *p) {
@@ -116,7 +159,11 @@ err_t EthernetPort_LowLevelOutput(struct netif *netif, struct pbuf *p) {
             tx_buffer[i].next = NULL;
         }
 
-        SCB_CleanDCache_by_Addr((uint32_t *)q->payload, q->len);
+        const uintptr_t payload_start = (uintptr_t)q->payload & ~(uintptr_t)(ETH_CACHE_LINE_SIZE - 1U);
+        const uintptr_t payload_end =
+            ((uintptr_t)q->payload + q->len + ETH_CACHE_LINE_SIZE - 1U) & ~(uintptr_t)(ETH_CACHE_LINE_SIZE - 1U);
+
+        SCB_CleanDCache_by_Addr((uint32_t *)payload_start, (int32_t)(payload_end - payload_start));
         i++;
     }
 
@@ -124,7 +171,14 @@ err_t EthernetPort_LowLevelOutput(struct netif *netif, struct pbuf *p) {
     TxConfig.TxBuffer = tx_buffer;
     TxConfig.pData = p;
 
-    if (HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT) != HAL_OK) {
+    if (ethernet_mutex == NULL || osMutexAcquire(ethernet_mutex, ETH_PORT_MUTEX_TIMEOUT) != osOK) {
+        return ERR_TIMEOUT;
+    }
+
+    const HAL_StatusTypeDef transmit_status = HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT);
+    (void)osMutexRelease(ethernet_mutex);
+
+    if (transmit_status != HAL_OK) {
         return ERR_IF;
     }
 
