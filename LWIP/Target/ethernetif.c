@@ -94,7 +94,6 @@ typedef struct
 } RxBuff_t;
 
 /* Memory Pool Declaration */
-#define ETH_RX_BUFFER_CNT             12U
 LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX PBUF pool");
 
 /* Variable Definitions */
@@ -166,6 +165,11 @@ void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics)
     return;
   }
 
+  diagnostics->rx_interrupts = ethernet_rx_diagnostics.rx_interrupts;
+  diagnostics->rx_packets = ethernet_rx_diagnostics.rx_packets;
+  diagnostics->rx_segments = ethernet_rx_diagnostics.rx_segments;
+  diagnostics->rx_bytes = ethernet_rx_diagnostics.rx_bytes;
+  diagnostics->rx_pool_exhausted = RxAllocStatus == RX_ALLOC_ERROR;
   diagnostics->rx_pool_exhaustions = ethernet_rx_diagnostics.rx_pool_exhaustions;
   diagnostics->hal_read_data_errors = ethernet_rx_diagnostics.hal_read_data_errors;
   diagnostics->dma_receive_buffer_unavailable = ethernet_rx_diagnostics.dma_receive_buffer_unavailable;
@@ -179,6 +183,7 @@ void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics)
   */
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *handlerEth)
 {
+  ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_interrupts);
   osSemaphoreRelease(RxPktSemaphore);
 }
 /**
@@ -407,6 +412,7 @@ void ethernetif_input(void* argument)
         p = low_level_input( netif );
         if (p != NULL)
         {
+          ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_packets);
           if (netif->input( p, netif) != ERR_OK )
           {
             ethernet_rx_counter_increment(&ethernet_rx_diagnostics.dropped_packets);
@@ -646,6 +652,8 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
 
   /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale. */
   SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
+  ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_segments);
+  ethernet_rx_diagnostics.rx_bytes += Length;
 
 /* USER CODE END HAL ETH RxLinkCallback */
 }

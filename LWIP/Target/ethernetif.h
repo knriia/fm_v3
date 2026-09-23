@@ -26,6 +26,8 @@
 #include "cmsis_os.h"
 #include <stdint.h>
 
+#define ETH_RX_BUFFER_CNT 12U
+
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
 
@@ -42,6 +44,11 @@ void ethernetif_phy_interrupt_notify(void);
 
 typedef struct
 {
+  uint32_t rx_interrupts;
+  uint32_t rx_packets;
+  uint32_t rx_segments;
+  uint32_t rx_bytes;
+  uint32_t rx_pool_exhausted;
   uint32_t rx_pool_exhaustions;
   uint32_t hal_read_data_errors;
   uint32_t dma_receive_buffer_unavailable;
