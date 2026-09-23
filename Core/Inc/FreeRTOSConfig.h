@@ -50,6 +50,7 @@
 /* Ensure definitions are only used by the compiler, and not by the assembler. */
 #if defined(__ICCARM__) || defined(__CC_ARM) || defined(__GNUC__)
   #include <stdint.h>
+  #include "stm32h7xx.h"
   extern uint32_t SystemCoreClock;
 #endif
 #ifndef CMSIS_device_header
@@ -71,6 +72,8 @@
 #define configTOTAL_HEAP_SIZE                    ((size_t)32768)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
+#define configGENERATE_RUN_TIME_STATS            1
+#define configRUN_TIME_COUNTER_TYPE              uint32_t
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
 #define configQUEUE_REGISTRY_SIZE                8
@@ -116,11 +119,21 @@ to exclude the API function. */
 #define INCLUDE_vTaskDelayUntil              1
 #define INCLUDE_vTaskDelay                   1
 #define INCLUDE_xTaskGetSchedulerState       1
+#define INCLUDE_xTaskGetHandle               1
+#define INCLUDE_xTaskGetIdleTaskHandle       1
 #define INCLUDE_xTimerPendFunctionCall       1
 #define INCLUDE_xQueueGetMutexHolder         1
 #define INCLUDE_uxTaskGetStackHighWaterMark  1
 #define INCLUDE_xTaskGetCurrentTaskHandle    1
 #define INCLUDE_eTaskGetState                1
+
+/* Use the Cortex-M7 DWT cycle counter for task run-time statistics. */
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() do { \
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; \
+  DWT->CYCCNT = 0U; \
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk; \
+} while (0)
+#define portGET_RUN_TIME_COUNTER_VALUE() (DWT->CYCCNT)
 
 /*
  * The CMSIS-RTOS V2 FreeRTOS wrapper is dependent on the heap implementation used

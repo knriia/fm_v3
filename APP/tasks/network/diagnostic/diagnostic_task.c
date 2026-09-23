@@ -13,9 +13,11 @@
 #include "lwip/api.h"
 #include "lwip/err.h"
 #include "lwip/ip_addr.h"
+#include "lwip/opt.h"
 #include "task.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     uint32_t stack_min_free_bytes;
@@ -34,6 +36,139 @@ typedef struct {
     uint32_t snapshot_errors;
     int32_t last_error;
 } DiagnosticTaskRuntime;
+
+typedef struct {
+    uint32_t eth_if_min_free_bytes;
+    uint32_t eth_link_min_free_bytes;
+    uint32_t tcpip_thread_min_free_bytes;
+} NetworkTasksRuntime;
+
+typedef struct {
+    TaskHandle_t task_handle;
+    uint32_t previous_runtime_ticks;
+} TaskRuntimeSample;
+
+typedef struct {
+    uint32_t previous_total_runtime_ticks;
+    uint8_t initialized;
+    TaskRuntimeSample diagnostic_task;
+    TaskRuntimeSample eth_if;
+    TaskRuntimeSample eth_link;
+    TaskRuntimeSample tcpip_thread;
+} RuntimePercentTracker;
+
+static RuntimePercentTracker runtime_percent_tracker;
+
+static uint32_t diagnostic_task_calculate_runtime_percent(
+    TaskRuntimeSample *sample,
+    TaskHandle_t task_handle,
+    uint32_t runtime_ticks,
+    uint32_t total_runtime_ticks
+) {
+    if (task_handle == NULL) {
+        sample->task_handle = NULL;
+        sample->previous_runtime_ticks = 0U;
+        return 0U;
+    }
+
+    if ((runtime_percent_tracker.initialized == 0U) || (sample->task_handle != task_handle)) {
+        sample->task_handle = task_handle;
+        sample->previous_runtime_ticks = runtime_ticks;
+        return 0U;
+    }
+
+    const uint32_t total_runtime_delta = total_runtime_ticks - runtime_percent_tracker.previous_total_runtime_ticks;
+    const uint32_t task_runtime_delta = runtime_ticks - sample->previous_runtime_ticks;
+    sample->previous_runtime_ticks = runtime_ticks;
+
+    if (total_runtime_delta == 0U) {
+        return 0U;
+    }
+
+    const uint32_t runtime_percent = (uint32_t)(((uint64_t)task_runtime_delta * 100U) / total_runtime_delta);
+    return runtime_percent > 100U ? 100U : runtime_percent;
+}
+
+static void diagnostic_task_commit_runtime_sample(uint32_t total_runtime_ticks) {
+    runtime_percent_tracker.previous_total_runtime_ticks = total_runtime_ticks;
+    runtime_percent_tracker.initialized = 1U;
+}
+
+static void diagnostic_network_task_fill_stats(
+    TaskDiagnosticsDTO_t *diagnostics,
+    TaskHandle_t task_handle,
+    TaskRuntimeSample *runtime_sample,
+    uint32_t stack_size_bytes,
+    uint32_t *minimum_free_bytes,
+    uint32_t total_runtime_ticks
+) {
+    TaskStatus_t task_status = {0};
+    diagnostics->stack_size_bytes = stack_size_bytes;
+
+    if (task_handle == NULL) {
+        diagnostics->priority = (int32_t)osPriorityError;
+        diagnostics->base_priority = (int32_t)osPriorityError;
+        diagnostics->state = (uint32_t)osThreadError;
+        diagnostics->stack_free_bytes = 0U;
+        diagnostics->stack_min_free_bytes = 0U;
+        diagnostics->stack_base_address = 0U;
+        diagnostics->runtime_ticks = 0U;
+        diagnostics->runtime_percent =
+            diagnostic_task_calculate_runtime_percent(runtime_sample, NULL, 0U, total_runtime_ticks);
+        return;
+    }
+
+    vTaskGetInfo(task_handle, &task_status, pdTRUE, eInvalid);
+    const uint32_t stack_free_bytes = (uint32_t)task_status.usStackHighWaterMark * sizeof(StackType_t);
+    if (*minimum_free_bytes == UINT32_MAX || stack_free_bytes < *minimum_free_bytes) {
+        *minimum_free_bytes = stack_free_bytes;
+    }
+
+    diagnostics->stack_free_bytes = stack_free_bytes;
+    diagnostics->stack_min_free_bytes = *minimum_free_bytes;
+    diagnostics->stack_base_address = (uint32_t)(uintptr_t)task_status.pxStackBase;
+    diagnostics->priority = (int32_t)task_status.uxCurrentPriority;
+    diagnostics->base_priority = (int32_t)task_status.uxBasePriority;
+    diagnostics->state = (uint32_t)task_status.eCurrentState;
+    diagnostics->runtime_ticks = task_status.ulRunTimeCounter;
+    diagnostics->runtime_percent = diagnostic_task_calculate_runtime_percent(
+        runtime_sample,
+        task_handle,
+        task_status.ulRunTimeCounter,
+        total_runtime_ticks
+    );
+}
+
+static void diagnostic_collect_network_tasks(
+    DiagnosticPayloadDTO_t *payload,
+    NetworkTasksRuntime *runtime,
+    uint32_t total_runtime_ticks
+) {
+    diagnostic_network_task_fill_stats(
+        &payload->eth_if.runtime,
+        xTaskGetHandle("EthIf"),
+        &runtime_percent_tracker.eth_if,
+        ETHERNETIF_INPUT_THREAD_STACK_SIZE_BYTES,
+        &runtime->eth_if_min_free_bytes,
+        total_runtime_ticks
+    );
+    diagnostic_network_task_fill_stats(
+        &payload->eth_link.runtime,
+        xTaskGetHandle("EthLink"),
+        &runtime_percent_tracker.eth_link,
+        ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES,
+        &runtime->eth_link_min_free_bytes,
+        total_runtime_ticks
+    );
+    diagnostic_network_task_fill_stats(
+        &payload->tcpip_thread.runtime,
+        xTaskGetHandle(TCPIP_THREAD_NAME),
+        &runtime_percent_tracker.tcpip_thread,
+        TCPIP_THREAD_STACKSIZE,
+        &runtime->tcpip_thread_min_free_bytes,
+        total_runtime_ticks
+    );
+}
 
 static void diagnostic_counter_increment(uint32_t *counter) {
     if (*counter != UINT32_MAX) {
@@ -54,43 +189,56 @@ static void diagnostic_record_error(DiagnosticTaskRuntime *runtime, err_t error)
 }
 
 static void diagnostic_task_fill_stats(DiagnosticPayloadDTO_t *payload, DiagnosticTaskRuntime *runtime) {
-    const uint32_t stack_free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    TaskStatus_t task_status = {0};
+    vTaskGetInfo(NULL, &task_status, pdTRUE, eInvalid);
+    const uint32_t stack_free_bytes = (uint32_t)task_status.usStackHighWaterMark * sizeof(StackType_t);
 
     if ((runtime->stack_min_free_bytes == 0U) || (stack_free_bytes < runtime->stack_min_free_bytes)) {
         runtime->stack_min_free_bytes = stack_free_bytes;
     }
 
-    payload->task.stack_size_bytes = DIAGNOSTIC_TASK_STACK_SIZE_BYTES;
-    payload->task.stack_free_bytes = stack_free_bytes;
-    payload->task.stack_min_free_bytes = runtime->stack_min_free_bytes;
-    payload->task.priority = (int32_t)osThreadGetPriority(osThreadGetId());
-    payload->task.state = (uint32_t)osThreadGetState(osThreadGetId());
-    payload->task.port = DIAGNOSTIC_NETWORK_TASK_PORT;
-    payload->task.interval_ms = DIAGNOSTIC_NETWORK_TASK_INTERVAL_MS;
-    payload->task.send_timeout_ms = DIAGNOSTIC_NETWORK_SEND_TIMEOUT_MS;
-    payload->task.connections_accepted = runtime->connections_accepted;
-    payload->task.connections_closed = runtime->connections_closed;
-    payload->task.active_connection = runtime->active_connection;
-    payload->task.send_attempts = runtime->send_attempts;
-    payload->task.send_successes = runtime->send_successes;
-    payload->task.send_errors = runtime->send_errors;
-    payload->task.partial_writes = runtime->partial_writes;
-    payload->task.bytes_sent = runtime->bytes_sent;
-    payload->task.netconn_alloc_errors = runtime->netconn_alloc_errors;
-    payload->task.bind_errors = runtime->bind_errors;
-    payload->task.listen_errors = runtime->listen_errors;
-    payload->task.accept_errors = runtime->accept_errors;
-    payload->task.snapshot_errors = runtime->snapshot_errors;
-    payload->task.last_error = runtime->last_error;
+    payload->diagnostic_task.runtime.stack_size_bytes = DIAGNOSTIC_TASK_STACK_SIZE_BYTES;
+    payload->diagnostic_task.runtime.stack_free_bytes = stack_free_bytes;
+    payload->diagnostic_task.runtime.stack_min_free_bytes = runtime->stack_min_free_bytes;
+    payload->diagnostic_task.runtime.stack_base_address = (uint32_t)(uintptr_t)task_status.pxStackBase;
+    payload->diagnostic_task.runtime.priority = (int32_t)task_status.uxCurrentPriority;
+    payload->diagnostic_task.runtime.base_priority = (int32_t)task_status.uxBasePriority;
+    payload->diagnostic_task.runtime.state = (uint32_t)task_status.eCurrentState;
+    payload->diagnostic_task.runtime.runtime_ticks = task_status.ulRunTimeCounter;
+    payload->diagnostic_task.runtime.runtime_percent = diagnostic_task_calculate_runtime_percent(
+        &runtime_percent_tracker.diagnostic_task,
+        xTaskGetCurrentTaskHandle(),
+        task_status.ulRunTimeCounter,
+        payload->system.freertos.total_runtime_ticks
+    );
+    diagnostic_task_commit_runtime_sample(payload->system.freertos.total_runtime_ticks);
+    payload->diagnostic_task.port = DIAGNOSTIC_NETWORK_TASK_PORT;
+    payload->diagnostic_task.interval_ms = DIAGNOSTIC_NETWORK_TASK_INTERVAL_MS;
+    payload->diagnostic_task.send_timeout_ms = DIAGNOSTIC_NETWORK_SEND_TIMEOUT_MS;
+    payload->diagnostic_task.connections_accepted = runtime->connections_accepted;
+    payload->diagnostic_task.connections_closed = runtime->connections_closed;
+    payload->diagnostic_task.active_connection = runtime->active_connection;
+    payload->diagnostic_task.send_attempts = runtime->send_attempts;
+    payload->diagnostic_task.send_successes = runtime->send_successes;
+    payload->diagnostic_task.send_errors = runtime->send_errors;
+    payload->diagnostic_task.partial_writes = runtime->partial_writes;
+    payload->diagnostic_task.bytes_sent = runtime->bytes_sent;
+    payload->diagnostic_task.netconn_alloc_errors = runtime->netconn_alloc_errors;
+    payload->diagnostic_task.bind_errors = runtime->bind_errors;
+    payload->diagnostic_task.listen_errors = runtime->listen_errors;
+    payload->diagnostic_task.accept_errors = runtime->accept_errors;
+    payload->diagnostic_task.snapshot_errors = runtime->snapshot_errors;
+    payload->diagnostic_task.last_error = runtime->last_error;
 }
 
 void DiagnosticTask(void *argument) {
     NetworkTaskContext *context = argument;
-    EthernetRxDiagnostics ethernet_rx_diagnostics = {0};
-    EthernetPortDiagnostics ethernet_port_diagnostics = {0};
-    SystemDiagnostics system_diagnostics = {0};
-    LwipDiagnostics lwip_diagnostics = {0};
     DiagnosticTaskRuntime runtime = {0};
+    NetworkTasksRuntime network_tasks_runtime = {
+        .eth_if_min_free_bytes = UINT32_MAX,
+        .eth_link_min_free_bytes = UINT32_MAX,
+        .tcpip_thread_min_free_bytes = UINT32_MAX,
+    };
 
     if ((context == NULL) || (context->lwip_flags == NULL)) {
         Error_Handler();
@@ -156,17 +304,18 @@ void DiagnosticTask(void *argument) {
             for (;;) {
                 ++sequence;
                 diagnostic_frame.payload.sequence = sequence;
-                system_diagnostics_collect(&system_diagnostics);
-                diagnostic_frame.payload.system = system_diagnostics;
-                ethernetif_get_rx_diagnostics(&ethernet_rx_diagnostics);
-                diagnostic_frame.payload.ethernet_rx = ethernet_rx_diagnostics;
-                if (EthernetPort_GetDiagnostics(&ethernet_port_diagnostics) != HAL_OK) {
+                system_diagnostics_collect(&diagnostic_frame.payload.system);
+                ethernetif_get_rx_diagnostics(&diagnostic_frame.payload.eth_if.ethernet_rx);
+                if (EthernetPort_GetDiagnostics(&diagnostic_frame.payload.eth_link.ethernet_port) != HAL_OK) {
                     diagnostic_counter_increment(&runtime.snapshot_errors);
-                    ethernet_port_diagnostics = (EthernetPortDiagnostics){0};
+                    diagnostic_frame.payload.eth_link.ethernet_port = (EthernetPortDiagnostics){0};
                 }
-                diagnostic_frame.payload.ethernet_port = ethernet_port_diagnostics;
-                lwip_diagnostics_collect(&lwip_diagnostics);
-                diagnostic_frame.payload.lwip = lwip_diagnostics;
+                lwip_diagnostics_collect(&diagnostic_frame.payload.tcpip_thread.lwip);
+                diagnostic_collect_network_tasks(
+                    &diagnostic_frame.payload,
+                    &network_tasks_runtime,
+                    diagnostic_frame.payload.system.freertos.total_runtime_ticks
+                );
                 diagnostic_counter_increment(&runtime.send_attempts);
                 diagnostic_task_fill_stats(&diagnostic_frame.payload, &runtime);
 
