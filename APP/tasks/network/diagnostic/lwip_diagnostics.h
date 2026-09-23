@@ -125,6 +125,7 @@ typedef struct {
     uint32_t pbuf_pool_size;
     uint32_t pbuf_pool_bufsize;
     LwipMib2Diagnostics mib2;
+    uint32_t udp_packets_count;
     uint32_t if_in_octets;
     uint32_t if_in_unicast_packets;
     uint32_t if_in_non_unicast_packets;

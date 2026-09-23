@@ -83,10 +83,10 @@ _Static_assert(sizeof(FreeRtosDiagnostics) == 64U, "Invalid FreeRTOS diagnostics
 _Static_assert(sizeof(SystemDiagnostics) == 320U, "Invalid system diagnostics size");
 _Static_assert(sizeof(LwipMemoryPoolDiagnostics) == 24U, "Invalid LwIP memory pool diagnostics size");
 _Static_assert(sizeof(LwipMib2Diagnostics) == 192U, "Invalid LwIP MIB2 diagnostics size");
-_Static_assert(sizeof(LwipDiagnostics) == 912U, "Invalid LwIP diagnostics size");
-_Static_assert(sizeof(TcpipTaskDiagnosticsDTO_t) == 948U, "Invalid tcpip diagnostics size");
+_Static_assert(sizeof(LwipDiagnostics) == 916U, "Invalid LwIP diagnostics size");
+_Static_assert(sizeof(TcpipTaskDiagnosticsDTO_t) == 952U, "Invalid tcpip diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1692U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1700U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1696U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1704U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */
