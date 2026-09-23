@@ -5,6 +5,7 @@
 #include "lwip/priv/memp_priv.h"
 #include "lwip/snmp.h"
 #include "lwip/stats.h"
+#include "lwip_udp_diagnostics.h"
 
 extern struct netif gnetif;
 
@@ -144,6 +145,7 @@ void lwip_diagnostics_collect(LwipDiagnostics *diagnostics) {
     diagnostics->pbuf_pool_size = PBUF_POOL_SIZE;
     diagnostics->pbuf_pool_bufsize = PBUF_POOL_BUFSIZE;
     copy_mib2_stats(&diagnostics->mib2, &lwip_stats.mib2);
+    diagnostics->udp_packets_count = lwip_udp_diagnostics_get_packet_count();
 
     diagnostics->if_in_octets = gnetif.mib2_counters.ifinoctets;
     diagnostics->if_in_unicast_packets = gnetif.mib2_counters.ifinucastpkts;

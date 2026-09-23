@@ -56,6 +56,7 @@
 #include "lwip/autoip.h"
 #include "lwip/stats.h"
 #include "lwip/prot/iana.h"
+#include "lwip_udp_diagnostics.h"
 
 #include <string.h>
 
@@ -737,6 +738,10 @@ ip4_input(struct pbuf *p, struct netif *inp)
 #endif /* LWIP_ICMP */
 
           LWIP_DEBUGF(IP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("Unsupported transport protocol %"U16_F"\n", (u16_t)IPH_PROTO(iphdr)));
+
+          if ((uint32_t)IPH_PROTO(iphdr) == IP_PROTO_UDP) {
+            lwip_udp_diagnostics_record_packet();
+          }
 
           IP_STATS_INC(ip.proterr);
           IP_STATS_INC(ip.drop);
