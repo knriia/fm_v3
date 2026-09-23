@@ -34,6 +34,9 @@ static HAL_StatusTypeDef dp83848_validate(DP83848_HandleTypeDef *phy) {
         (id1 == 0U) || (id1 == 0xFFFFU) || (id2 == 0U) || (id2 == 0xFFFFU)) {
         return HAL_ERROR;
     }
+
+    phy->phy_id1 = id1;
+    phy->phy_id2 = id2;
     return HAL_OK;
 }
 
@@ -142,5 +145,15 @@ HAL_StatusTypeDef DP83848_GetLinkState(const DP83848_HandleTypeDef *phy, DP83848
     }
 
     state->link_up = 1U;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef DP83848_GetIdentity(const DP83848_HandleTypeDef *phy, uint32_t *id1, uint32_t *id2) {
+    if (phy == NULL || id1 == NULL || id2 == NULL) {
+        return HAL_ERROR;
+    }
+
+    *id1 = phy->phy_id1;
+    *id2 = phy->phy_id2;
     return HAL_OK;
 }

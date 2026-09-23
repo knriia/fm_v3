@@ -104,8 +104,20 @@
 #define RECV_BUFSIZE_DEFAULT 2000000000
 /*----- Default Value for LWIP_STATS: 0 ---*/
 #define LWIP_STATS 1
+/* Keep diagnostic counters usable during long-running traffic tests. */
+#define LWIP_STATS_LARGE 1
+/* Collect all statistics for the protocols and resources enabled below. */
+#define LINK_STATS 1
+#define ETHARP_STATS 1
+#define IP_STATS 1
+#define ICMP_STATS 1
+#define TCP_STATS 1
+#define MEM_STATS 1
+#define MEMP_STATS 1
+#define SYS_STATS 1
+/* Collect interface-level packet and byte counters. */
+#define MIB2_STATS 1
 /*----- Value in opt.h for MIB2_STATS: 0 or SNMP_LWIP_MIB2 -----*/
-#define MIB2_STATS 0
 /*----- Value in opt.h for CHECKSUM_GEN_IP: 1 -----*/
 #define CHECKSUM_GEN_IP 0
 /*----- Value in opt.h for CHECKSUM_GEN_UDP: 1 -----*/

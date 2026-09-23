@@ -23,6 +23,8 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "startup_task.h"
+#include "diagnostic_task.h"
+#include "task_context.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -50,9 +52,19 @@
 static osThreadId_t startup_task_handle;
 static const osThreadAttr_t startup_task_attr = {
   .name = "StartupTask",
-  .stack_size = 4096 * 4,
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+
+static osThreadId_t diagnostic_task_handle;
+static const osThreadAttr_t diagnostic_task_attr = {
+  .name = "DiagnosticTask",
+  .stack_size = DIAGNOSTIC_TASK_STACK_SIZE_BYTES,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+static osEventFlagsId_t lwip_ready_flags;
+static NetworkTaskContext diagnostic_task_context;
 
 /* USER CODE END Variables */
 
@@ -68,8 +80,21 @@ void MX_FREERTOS_Init(void);
 
 void MX_FREERTOS_Init(void)
 {
-  startup_task_handle = osThreadNew(StartStartupTask, NULL, &startup_task_attr);
+  lwip_ready_flags = osEventFlagsNew(NULL);
+  if (lwip_ready_flags == NULL)
+  {
+    Error_Handler();
+  }
+
+  startup_task_handle = osThreadNew(StartStartupTask, &lwip_ready_flags, &startup_task_attr);
   if (startup_task_handle == NULL)
+  {
+    Error_Handler();
+  }
+
+  diagnostic_task_context.lwip_flags = lwip_ready_flags;
+  diagnostic_task_handle = osThreadNew(DiagnosticTask, &diagnostic_task_context, &diagnostic_task_attr);
+  if (diagnostic_task_handle == NULL)
   {
     Error_Handler();
   }
