@@ -25,6 +25,7 @@
 #include "netif/ethernet.h"
 #include "netif/etharp.h"
 #include "lwip/ethip6.h"
+#include "lwip/snmp.h"
 #include "ethernetif.h"
 /* USER CODE BEGIN Include for User BSP */
 #include "ethernet_port.h"
@@ -45,7 +46,7 @@
 #define TIME_WAITING_FOR_INPUT ( portMAX_DELAY )
 /* USER CODE BEGIN OS_THREAD_STACK_SIZE_WITH_RTOS */
 /* Stack size of the interface thread */
-#define INTERFACE_THREAD_STACK_SIZE ( 1024 )
+#define INTERFACE_THREAD_STACK_SIZE ETHERNETIF_INPUT_THREAD_STACK_SIZE_BYTES
 /* USER CODE END OS_THREAD_STACK_SIZE_WITH_RTOS */
 /* Network interface name */
 #define IFNAME0 's'
@@ -174,6 +175,13 @@ void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics)
   diagnostics->hal_read_data_errors = ethernet_rx_diagnostics.hal_read_data_errors;
   diagnostics->dma_receive_buffer_unavailable = ethernet_rx_diagnostics.dma_receive_buffer_unavailable;
   diagnostics->dropped_packets = ethernet_rx_diagnostics.dropped_packets;
+  diagnostics->rx_pool_base_address = (uint32_t)(uintptr_t)memp_RX_POOL.base;
+  diagnostics->rx_pool_element_size = memp_RX_POOL.size;
+  diagnostics->rx_pool_capacity = memp_RX_POOL.num;
+  diagnostics->rx_pool_used = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->used : 0U;
+  diagnostics->rx_pool_max_used = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->max : 0U;
+  diagnostics->rx_pool_errors = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->err : 0U;
+  diagnostics->rx_pool_illegal = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->illegal : 0U;
 }
 
 /**
@@ -471,7 +479,7 @@ err_t ethernetif_init(struct netif *netif)
    * The last argument should be replaced with your link speed, in units
    * of bits per second.
    */
-  // MIB2_INIT_NETIF(netif, snmp_ifType_ethernet_csmacd, LINK_SPEED_OF_YOUR_NETIF_IN_BPS);
+  MIB2_INIT_NETIF(netif, snmp_ifType_ethernet_csmacd, 100000000U);
 
   netif->name[0] = IFNAME0;
   netif->name[1] = IFNAME1;

@@ -56,7 +56,6 @@ uint8_t IP_ADDRESS[4];
 uint8_t NETMASK_ADDRESS[4];
 uint8_t GATEWAY_ADDRESS[4];
 /* USER CODE BEGIN OS_THREAD_ATTR_CMSIS_RTOS_V2 */
-#define INTERFACE_THREAD_STACK_SIZE ( 1024 )
 osThreadAttr_t attributes;
 /* USER CODE END OS_THREAD_ATTR_CMSIS_RTOS_V2 */
 
@@ -122,7 +121,7 @@ void MX_LWIP_Init(void)
 /* USER CODE BEGIN H7_OS_THREAD_NEW_CMSIS_RTOS_V2 */
   memset(&attributes, 0x0, sizeof(osThreadAttr_t));
   attributes.name = "EthLink";
-  attributes.stack_size = INTERFACE_THREAD_STACK_SIZE;
+  attributes.stack_size = ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES;
   attributes.priority = osPriorityBelowNormal;
   if (osThreadNew(ethernet_link_thread, &gnetif, &attributes) == NULL)
   {

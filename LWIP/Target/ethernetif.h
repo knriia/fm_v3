@@ -27,6 +27,8 @@
 #include <stdint.h>
 
 #define ETH_RX_BUFFER_CNT 12U
+#define ETHERNETIF_INPUT_THREAD_STACK_SIZE_BYTES 1024U
+#define ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES 1024U
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
@@ -53,6 +55,13 @@ typedef struct
   uint32_t hal_read_data_errors;
   uint32_t dma_receive_buffer_unavailable;
   uint32_t dropped_packets;
+  uint32_t rx_pool_base_address;
+  uint32_t rx_pool_element_size;
+  uint32_t rx_pool_capacity;
+  uint32_t rx_pool_used;
+  uint32_t rx_pool_max_used;
+  uint32_t rx_pool_errors;
+  uint32_t rx_pool_illegal;
 } EthernetRxDiagnostics;
 
 void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics);
