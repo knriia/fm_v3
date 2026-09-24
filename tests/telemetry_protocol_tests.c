@@ -27,7 +27,8 @@ static void expect_i32(int32_t actual, int32_t expected, const char *message) {
 
 int main(void) {
     TelemetryFrameDTO_t frame = {0};
-    telemetry_build_test_frame(&frame, 42U);
+    const TelemetryCoordinates_t coordinates = {.x = -123, .y = 456, .z = -789};
+    telemetry_build_frame(&frame, 42U, &coordinates);
 
     expect_u32(frame.header.magic, NETWORK_PROTOCOL_MAGIC, "telemetry magic");
     expect_u32(frame.header.version, NETWORK_PROTOCOL_VERSION, "telemetry protocol version");
@@ -35,13 +36,13 @@ int main(void) {
     expect_u32(frame.header.header_length, sizeof(NetworkFrameHeaderDTO_t), "telemetry header length");
     expect_u32(frame.header.payload_length, sizeof(TelemetryPayloadDTO_t), "telemetry payload length");
     expect_u32(frame.payload.sequence, 42U, "telemetry sequence");
-    expect_i32(frame.payload.x, TELEMETRY_TEST_COORDINATE_X, "telemetry test x");
-    expect_i32(frame.payload.y, TELEMETRY_TEST_COORDINATE_Y, "telemetry test y");
-    expect_i32(frame.payload.z, TELEMETRY_TEST_COORDINATE_Z, "telemetry test z");
-    expect_u32(frame.payload.is_test_data, 1U, "telemetry test data flag");
+    expect_i32(frame.payload.x, coordinates.x, "telemetry x");
+    expect_i32(frame.payload.y, coordinates.y, "telemetry y");
+    expect_i32(frame.payload.z, coordinates.z, "telemetry z");
+    expect_u32(frame.payload.is_test_data, 0U, "telemetry test data flag");
     expect_u32(sizeof(frame), 28U, "telemetry frame size");
 
-    telemetry_build_test_frame(&frame, UINT32_MAX);
+    telemetry_build_frame(&frame, UINT32_MAX, &coordinates);
     expect_u32(frame.payload.sequence, UINT32_MAX, "telemetry sequence maximum");
 
     return test_failures == 0U ? 0 : 1;

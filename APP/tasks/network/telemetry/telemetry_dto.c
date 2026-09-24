@@ -2,8 +2,8 @@
 
 #include <stddef.h>
 
-void telemetry_build_test_frame(TelemetryFrameDTO_t *frame, uint32_t sequence) {
-    if (frame == NULL) {
+void telemetry_build_frame(TelemetryFrameDTO_t *frame, uint32_t sequence, const TelemetryCoordinates_t *coordinates) {
+    if ((frame == NULL) || (coordinates == NULL)) {
         return;
     }
 
@@ -19,10 +19,10 @@ void telemetry_build_test_frame(TelemetryFrameDTO_t *frame, uint32_t sequence) {
         .payload =
             {
                 .sequence = sequence,
-                .x = TELEMETRY_TEST_COORDINATE_X,
-                .y = TELEMETRY_TEST_COORDINATE_Y,
-                .z = TELEMETRY_TEST_COORDINATE_Z,
-                .is_test_data = 1U,
+                .x = coordinates->x,
+                .y = coordinates->y,
+                .z = coordinates->z,
+                .is_test_data = 0U,
                 .reserved = {0U, 0U, 0U},
             },
     };

@@ -84,6 +84,7 @@ target_include_directories(telemetry_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/telemetry
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/ENC
 )
 
 target_include_directories(telemetry_task_unit_tests PRIVATE
@@ -91,6 +92,7 @@ target_include_directories(telemetry_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/telemetry
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/ENC
 )
 target_include_directories(command_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
