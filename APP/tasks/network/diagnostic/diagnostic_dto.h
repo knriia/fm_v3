@@ -5,6 +5,7 @@
 #include "ethernet_port.h"
 #include "ethernetif.h"
 #include "lwip_diagnostics.h"
+#include "startup_task.h"
 #include "system_diagnostics.h"
 
 #include <stdint.h>
@@ -38,6 +39,11 @@ typedef struct {
 
 typedef struct {
     TaskDiagnosticsDTO_t runtime;
+    StartupTaskDiagnostics startup;
+} StartupTaskDiagnosticsDTO_t;
+
+typedef struct {
+    TaskDiagnosticsDTO_t runtime;
     uint32_t port;
     uint32_t interval_ms;
     uint32_t send_timeout_ms;
@@ -60,6 +66,7 @@ typedef struct {
 typedef struct {
     uint32_t sequence;
     SystemDiagnostics system;
+    StartupTaskDiagnosticsDTO_t startup_task;
     DiagnosticTaskDiagnosticsDTO_t diagnostic_task;
     EthIfTaskDiagnosticsDTO_t eth_if;
     EthLinkTaskDiagnosticsDTO_t eth_link;
@@ -85,8 +92,9 @@ _Static_assert(sizeof(LwipMemoryPoolDiagnostics) == 24U, "Invalid LwIP memory po
 _Static_assert(sizeof(LwipMib2Diagnostics) == 192U, "Invalid LwIP MIB2 diagnostics size");
 _Static_assert(sizeof(LwipDiagnostics) == 916U, "Invalid LwIP diagnostics size");
 _Static_assert(sizeof(TcpipTaskDiagnosticsDTO_t) == 952U, "Invalid tcpip diagnostics size");
+_Static_assert(sizeof(StartupTaskDiagnosticsDTO_t) == 48U, "Invalid StartupTask diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1696U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1704U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1744U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1752U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

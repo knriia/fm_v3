@@ -13,4 +13,6 @@
 #define PBUF_POOL_SIZE 16U
 #define PBUF_POOL_BUFSIZE 1536U
 
+void MX_LWIP_Init(void);
+
 #endif /* FM_V3_TEST_LWIP_H */
