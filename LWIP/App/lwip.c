@@ -27,6 +27,7 @@
 #include "lwip/sio.h"
 #endif /* MDK ARM Compiler */
 #include "ethernetif.h"
+#include "task_names.h"
 #include <string.h>
 
 /* USER CODE BEGIN 0 */
@@ -120,7 +121,7 @@ void MX_LWIP_Init(void)
   /* Create the Ethernet link handler thread */
 /* USER CODE BEGIN H7_OS_THREAD_NEW_CMSIS_RTOS_V2 */
   memset(&attributes, 0x0, sizeof(osThreadAttr_t));
-  attributes.name = "EthLink";
+  attributes.name = ETHERNET_LINK_TASK_NAME;
   attributes.stack_size = ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES;
   attributes.priority = osPriorityBelowNormal;
   if (osThreadNew(ethernet_link_thread, &gnetif, &attributes) == NULL)
