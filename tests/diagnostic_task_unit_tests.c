@@ -83,6 +83,10 @@ void system_diagnostics_collect(SystemDiagnostics *diagnostics) { (void)memset(d
 
 void lwip_diagnostics_collect(LwipDiagnostics *diagnostics) { (void)memset(diagnostics, 0, sizeof(*diagnostics)); }
 
+void startup_task_get_diagnostics(StartupTaskDiagnostics *diagnostics) {
+    (void)memset(diagnostics, 0, sizeof(*diagnostics));
+}
+
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
     (void)event_flags_id;
     (void)flags;

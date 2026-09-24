@@ -16,8 +16,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 1696U
-#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 1704U
+#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 1744U
+#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 1752U
 
 struct netif gnetif;
 struct stats lwip_stats;

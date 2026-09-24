@@ -19,8 +19,14 @@ add_executable(diagnostic_task_unit_tests
     diagnostic_task_unit_tests.c
 )
 
+add_executable(startup_task_unit_tests
+    startup_task_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/startup_task.c
+)
+
 target_include_directories(diagnostic_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic
     ${CMAKE_CURRENT_LIST_DIR}/../LWIP/Target
@@ -28,6 +34,15 @@ target_include_directories(diagnostic_protocol_tests PRIVATE
 
 target_include_directories(diagnostic_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic
+    ${CMAKE_CURRENT_LIST_DIR}/../LWIP/Target
+)
+
+target_include_directories(startup_task_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic
     ${CMAKE_CURRENT_LIST_DIR}/../LWIP/Target
@@ -44,7 +59,15 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(startup_task_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
 endif ()
 
 add_test(NAME diagnostic_protocol_tests COMMAND diagnostic_protocol_tests)
 add_test(NAME diagnostic_task_unit_tests COMMAND diagnostic_task_unit_tests)
+add_test(NAME startup_task_success COMMAND startup_task_unit_tests success)
+add_test(NAME startup_task_event_error COMMAND startup_task_unit_tests event_error)
+add_test(NAME startup_task_null_context COMMAND startup_task_unit_tests null_context)

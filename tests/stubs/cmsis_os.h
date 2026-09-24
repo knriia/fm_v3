@@ -14,6 +14,7 @@ typedef uint32_t osStatus_t;
 #define osWaitForever 0xFFFFFFFFU
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout);
+uint32_t osEventFlagsSet(osEventFlagsId_t event_flags_id, uint32_t flags);
 uint32_t osDelay(uint32_t milliseconds);
 
 #endif /* FM_V3_TEST_CMSIS_OS_H */

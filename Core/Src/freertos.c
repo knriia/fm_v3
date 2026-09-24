@@ -52,7 +52,7 @@
 static osThreadId_t startup_task_handle;
 static const osThreadAttr_t startup_task_attr = {
   .name = "StartupTask",
-  .stack_size = 1024 * 4,
+  .stack_size = STARTUP_TASK_STACK_SIZE_BYTES,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
