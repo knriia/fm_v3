@@ -1,0 +1,8 @@
+#ifndef FM_V3_TEST_LWIP_OPT_H
+#define FM_V3_TEST_LWIP_OPT_H
+
+#define TCPIP_THREAD_STACKSIZE 1024U
+#define TCPIP_THREAD_PRIO 24U
+#define TCPIP_THREAD_NAME "tcpip_thread"
+
+#endif /* FM_V3_TEST_LWIP_OPT_H */

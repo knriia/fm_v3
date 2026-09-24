@@ -1,0 +1,6 @@
+#ifndef FM_V3_TEST_LWIP_MEMP_H
+#define FM_V3_TEST_LWIP_MEMP_H
+
+#define MEMP_MAX 12U
+
+#endif /* FM_V3_TEST_LWIP_MEMP_H */
