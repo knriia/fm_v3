@@ -27,6 +27,7 @@
 #include "lwip/ethip6.h"
 #include "lwip/snmp.h"
 #include "ethernetif.h"
+#include "task_names.h"
 /* USER CODE BEGIN Include for User BSP */
 #include "ethernet_port.h"
 
@@ -315,7 +316,7 @@ static void low_level_init(struct netif *netif)
   /* create the task that handles the ETH_MAC */
 /* USER CODE BEGIN OS_THREAD_NEW_CMSIS_RTOS_V2 */
   memset(&attributes, 0x0, sizeof(osThreadAttr_t));
-  attributes.name = "EthIf";
+  attributes.name = ETHERNET_IF_TASK_NAME;
   attributes.stack_size = INTERFACE_THREAD_STACK_SIZE;
   attributes.priority = osPriorityNormal1;
   if (osThreadNew(ethernetif_input, netif, &attributes) == NULL)

@@ -25,6 +25,8 @@
 #include "startup_task.h"
 #include "diagnostic_task.h"
 #include "task_context.h"
+#include "task_names.h"
+#include "telemetry_task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -51,20 +53,28 @@
 
 static osThreadId_t startup_task_handle;
 static const osThreadAttr_t startup_task_attr = {
-  .name = "StartupTask",
+  .name = STARTUP_TASK_NAME,
   .stack_size = STARTUP_TASK_STACK_SIZE_BYTES,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
 static osThreadId_t diagnostic_task_handle;
 static const osThreadAttr_t diagnostic_task_attr = {
-  .name = "DiagnosticTask",
+  .name = DIAGNOSTIC_TASK_NAME,
   .stack_size = DIAGNOSTIC_TASK_STACK_SIZE_BYTES,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+static osThreadId_t telemetry_task_handle;
+static const osThreadAttr_t telemetry_task_attr = {
+  .name = TELEMETRY_TASK_NAME,
+  .stack_size = TELEMETRY_TASK_STACK_SIZE_BYTES,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
 static osEventFlagsId_t lwip_ready_flags;
 static NetworkTaskContext diagnostic_task_context;
+static NetworkTaskContext telemetry_task_context;
 
 /* USER CODE END Variables */
 
@@ -95,6 +105,13 @@ void MX_FREERTOS_Init(void)
   diagnostic_task_context.lwip_flags = lwip_ready_flags;
   diagnostic_task_handle = osThreadNew(DiagnosticTask, &diagnostic_task_context, &diagnostic_task_attr);
   if (diagnostic_task_handle == NULL)
+  {
+    Error_Handler();
+  }
+
+  telemetry_task_context.lwip_flags = lwip_ready_flags;
+  telemetry_task_handle = osThreadNew(TelemetryTask, &telemetry_task_context, &telemetry_task_attr);
+  if (telemetry_task_handle == NULL)
   {
     Error_Handler();
   }

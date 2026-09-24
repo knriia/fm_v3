@@ -7,6 +7,8 @@
 #include "network_events.h"
 #include "startup_task.h"
 #include "task_context.h"
+#include "task_names.h"
+#include "telemetry_task.h"
 
 #include "cmsis_os.h"
 #include "ethernetif.h"
@@ -40,6 +42,7 @@ typedef struct {
 
 typedef struct {
     uint32_t startup_task_min_free_bytes;
+    uint32_t telemetry_task_min_free_bytes;
     uint32_t eth_if_min_free_bytes;
     uint32_t eth_link_min_free_bytes;
     uint32_t tcpip_thread_min_free_bytes;
@@ -55,6 +58,7 @@ typedef struct {
     uint8_t initialized;
     TaskRuntimeSample diagnostic_task;
     TaskRuntimeSample startup_task;
+    TaskRuntimeSample telemetry_task;
     TaskRuntimeSample eth_if;
     TaskRuntimeSample eth_link;
     TaskRuntimeSample tcpip_thread;
@@ -149,15 +153,23 @@ static void diagnostic_collect_network_tasks(
 ) {
     diagnostic_network_task_fill_stats(
         &payload->startup_task.runtime,
-        xTaskGetHandle("StartupTask"),
+        xTaskGetHandle(STARTUP_TASK_NAME),
         &runtime_percent_tracker.startup_task,
         STARTUP_TASK_STACK_SIZE_BYTES,
         &runtime->startup_task_min_free_bytes,
         total_runtime_ticks
     );
     diagnostic_network_task_fill_stats(
+        &payload->telemetry_task.runtime,
+        xTaskGetHandle(TELEMETRY_TASK_NAME),
+        &runtime_percent_tracker.telemetry_task,
+        TELEMETRY_TASK_STACK_SIZE_BYTES,
+        &runtime->telemetry_task_min_free_bytes,
+        total_runtime_ticks
+    );
+    diagnostic_network_task_fill_stats(
         &payload->eth_if.runtime,
-        xTaskGetHandle("EthIf"),
+        xTaskGetHandle(ETHERNET_IF_TASK_NAME),
         &runtime_percent_tracker.eth_if,
         ETHERNETIF_INPUT_THREAD_STACK_SIZE_BYTES,
         &runtime->eth_if_min_free_bytes,
@@ -165,7 +177,7 @@ static void diagnostic_collect_network_tasks(
     );
     diagnostic_network_task_fill_stats(
         &payload->eth_link.runtime,
-        xTaskGetHandle("EthLink"),
+        xTaskGetHandle(ETHERNET_LINK_TASK_NAME),
         &runtime_percent_tracker.eth_link,
         ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES,
         &runtime->eth_link_min_free_bytes,
@@ -173,7 +185,7 @@ static void diagnostic_collect_network_tasks(
     );
     diagnostic_network_task_fill_stats(
         &payload->tcpip_thread.runtime,
-        xTaskGetHandle(TCPIP_THREAD_NAME),
+        xTaskGetHandle(TCPIP_TASK_NAME),
         &runtime_percent_tracker.tcpip_thread,
         TCPIP_THREAD_STACKSIZE,
         &runtime->tcpip_thread_min_free_bytes,
@@ -247,6 +259,7 @@ void DiagnosticTask(void *argument) {
     DiagnosticTaskRuntime runtime = {0};
     NetworkTasksRuntime network_tasks_runtime = {
         .startup_task_min_free_bytes = UINT32_MAX,
+        .telemetry_task_min_free_bytes = UINT32_MAX,
         .eth_if_min_free_bytes = UINT32_MAX,
         .eth_link_min_free_bytes = UINT32_MAX,
         .tcpip_thread_min_free_bytes = UINT32_MAX,
@@ -318,6 +331,7 @@ void DiagnosticTask(void *argument) {
                 diagnostic_frame.payload.sequence = sequence;
                 system_diagnostics_collect(&diagnostic_frame.payload.system);
                 startup_task_get_diagnostics(&diagnostic_frame.payload.startup_task.startup);
+                telemetry_task_get_diagnostics(&diagnostic_frame.payload.telemetry_task.telemetry);
                 ethernetif_get_rx_diagnostics(&diagnostic_frame.payload.eth_if.ethernet_rx);
                 if (EthernetPort_GetDiagnostics(&diagnostic_frame.payload.eth_link.ethernet_port) != HAL_OK) {
                     diagnostic_counter_increment(&runtime.snapshot_errors);

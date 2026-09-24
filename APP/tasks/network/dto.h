@@ -7,6 +7,7 @@
 #define NETWORK_PROTOCOL_MAGIC 0x4447U
 #define NETWORK_PROTOCOL_VERSION 1U
 #define NETWORK_MESSAGE_TYPE_DIAGNOSTIC_SNAPSHOT 1U
+#define NETWORK_MESSAGE_TYPE_TELEMETRY 2U
 
 typedef struct __attribute__((packed)) {
     uint16_t magic;

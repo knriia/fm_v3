@@ -35,6 +35,7 @@ static err_t test_write_result;
 static size_t test_bytes_written;
 static size_t test_captured_write_size;
 static DiagnosticFrameDTO_t test_captured_frame;
+static TelemetryTaskDiagnostics test_telemetry_diagnostics;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -85,6 +86,10 @@ void lwip_diagnostics_collect(LwipDiagnostics *diagnostics) { (void)memset(diagn
 
 void startup_task_get_diagnostics(StartupTaskDiagnostics *diagnostics) {
     (void)memset(diagnostics, 0, sizeof(*diagnostics));
+}
+
+void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
+    *diagnostics = test_telemetry_diagnostics;
 }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
@@ -354,6 +359,7 @@ static void reset_network_fixture(void) {
     test_bytes_written = sizeof(DiagnosticFrameDTO_t);
     test_captured_write_size = 0U;
     (void)memset(&test_captured_frame, 0, sizeof(test_captured_frame));
+    test_telemetry_diagnostics = (TelemetryTaskDiagnostics){0};
 }
 
 static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
@@ -412,6 +418,30 @@ static void test_diagnostic_task_network_paths(void) {
 
     reset_network_fixture();
     test_stop_on_delay = 1U;
+    test_task_status.pxStackBase = (StackType_t *)(uintptr_t)0x12340000U;
+    test_task_status.uxCurrentPriority = 24U;
+    test_task_status.uxBasePriority = 23U;
+    test_task_status.eCurrentState = 2U;
+    test_task_status.usStackHighWaterMark = 100U;
+    test_task_status.ulRunTimeCounter = 500U;
+    test_telemetry_diagnostics = (TelemetryTaskDiagnostics){
+        .port = TELEMETRY_NETWORK_TASK_PORT,
+        .interval_ms = TELEMETRY_NETWORK_TASK_INTERVAL_MS,
+        .send_timeout_ms = TELEMETRY_NETWORK_SEND_TIMEOUT_MS,
+        .connections_accepted = 11U,
+        .connections_closed = 12U,
+        .active_connection = 13U,
+        .send_attempts = 14U,
+        .send_successes = 15U,
+        .send_errors = 16U,
+        .partial_writes = 17U,
+        .bytes_sent = 18U,
+        .netconn_alloc_errors = 19U,
+        .bind_errors = 20U,
+        .listen_errors = 21U,
+        .accept_errors = 22U,
+        .last_error = -23,
+    };
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
     expect_u32(test_captured_write_size, sizeof(DiagnosticFrameDTO_t), "diagnostic frame write size");
@@ -433,6 +463,112 @@ static void test_diagnostic_task_network_paths(void) {
         "diagnostic frame payload length"
     );
     expect_u32(test_captured_frame.payload.sequence, 1U, "first diagnostic frame sequence");
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.runtime.stack_size_bytes,
+        TELEMETRY_TASK_STACK_SIZE_BYTES,
+        "telemetry task diagnostic stack size"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.runtime.stack_free_bytes,
+        400U,
+        "telemetry task diagnostic free stack"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.runtime.stack_min_free_bytes,
+        400U,
+        "telemetry task diagnostic minimum free stack"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.runtime.stack_base_address,
+        0x12340000U,
+        "telemetry task diagnostic stack base"
+    );
+    expect_u32(
+        (uint32_t)test_captured_frame.payload.telemetry_task.runtime.priority,
+        24U,
+        "telemetry task diagnostic priority"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.runtime.runtime_ticks,
+        500U,
+        "telemetry task diagnostic runtime ticks"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.port,
+        TELEMETRY_NETWORK_TASK_PORT,
+        "telemetry diagnostic port"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.interval_ms,
+        TELEMETRY_NETWORK_TASK_INTERVAL_MS,
+        "telemetry diagnostic interval"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.send_timeout_ms,
+        TELEMETRY_NETWORK_SEND_TIMEOUT_MS,
+        "telemetry diagnostic timeout"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.connections_accepted,
+        11U,
+        "telemetry diagnostic accepted connections"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.connections_closed,
+        12U,
+        "telemetry diagnostic closed connections"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.active_connection,
+        13U,
+        "telemetry diagnostic active connection"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.send_attempts,
+        14U,
+        "telemetry diagnostic send attempts"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.send_successes,
+        15U,
+        "telemetry diagnostic send successes"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.send_errors,
+        16U,
+        "telemetry diagnostic send errors"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.partial_writes,
+        17U,
+        "telemetry diagnostic partial writes"
+    );
+    expect_u32(test_captured_frame.payload.telemetry_task.telemetry.bytes_sent, 18U, "telemetry diagnostic bytes sent");
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.netconn_alloc_errors,
+        19U,
+        "telemetry diagnostic allocation errors"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.bind_errors,
+        20U,
+        "telemetry diagnostic bind errors"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.listen_errors,
+        21U,
+        "telemetry diagnostic listen errors"
+    );
+    expect_u32(
+        test_captured_frame.payload.telemetry_task.telemetry.accept_errors,
+        22U,
+        "telemetry diagnostic accept errors"
+    );
+    expect_u32(
+        (uint32_t)test_captured_frame.payload.telemetry_task.telemetry.last_error,
+        (uint32_t)-23,
+        "telemetry diagnostic last error"
+    );
 
     reset_network_fixture();
     test_write_result = ERR_BUF;

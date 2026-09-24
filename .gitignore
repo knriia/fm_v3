@@ -13,6 +13,10 @@ Release/
 
 .idea/
 
+# Logs
+*.log
+logs/
+
 # Настройки IDE
 .settings/
 .metadata/
