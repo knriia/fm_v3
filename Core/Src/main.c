@@ -26,6 +26,7 @@
 #include "mpu_config.h"
 #include "phy_interrupt.h"
 #include "system_clock.h"
+#include "encoder.h"
 
 /* USER CODE END Includes */
 
@@ -95,6 +96,7 @@ int main(void)
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
 
+  encoder_init();
   PHY_INT_GPIO_Init();
 
   /* USER CODE END 2 */

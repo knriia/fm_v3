@@ -5,9 +5,11 @@
 
 #include <stdint.h>
 
-#define TELEMETRY_TEST_COORDINATE_X 5
-#define TELEMETRY_TEST_COORDINATE_Y 10
-#define TELEMETRY_TEST_COORDINATE_Z 15
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+} TelemetryCoordinates_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t sequence;
@@ -23,7 +25,7 @@ typedef struct __attribute__((packed)) {
     TelemetryPayloadDTO_t payload;
 } TelemetryFrameDTO_t;
 
-void telemetry_build_test_frame(TelemetryFrameDTO_t *frame, uint32_t sequence);
+void telemetry_build_frame(TelemetryFrameDTO_t *frame, uint32_t sequence, const TelemetryCoordinates_t *coordinates);
 
 _Static_assert(sizeof(TelemetryPayloadDTO_t) == 20U, "Invalid telemetry payload size");
 _Static_assert(sizeof(TelemetryFrameDTO_t) == 28U, "Invalid telemetry frame size");

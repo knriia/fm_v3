@@ -1,4 +1,5 @@
 #include "cmsis_os.h"
+#include "encoder.h"
 #include "task_context.h"
 #include "telemetry_dto.h"
 #include "telemetry_task.h"
@@ -33,6 +34,15 @@ static TelemetryFrameDTO_t test_first_frame;
 static TelemetryFrameDTO_t test_success_frame;
 static struct netconn test_listener = {.id = 1U};
 static struct netconn test_client = {.id = 2U};
+static const int32_t test_encoder_ox_coordinate = -100;
+static const int32_t test_encoder_oy_coordinate = 200;
+static const int32_t test_encoder_oz_coordinate = -300;
+
+int32_t encoder_ox_get_coordinate(void) { return test_encoder_ox_coordinate; }
+
+int32_t encoder_oy_get_coordinate(void) { return test_encoder_oy_coordinate; }
+
+int32_t encoder_oz_get_coordinate(void) { return test_encoder_oz_coordinate; }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
     (void)event_flags_id;
@@ -151,10 +161,10 @@ static void expect_frame(const TelemetryFrameDTO_t *frame, uint32_t sequence, co
     expect_u32(frame->header.message_type, NETWORK_MESSAGE_TYPE_TELEMETRY, prefix);
     expect_u32(frame->header.payload_length, sizeof(TelemetryPayloadDTO_t), "telemetry task payload length");
     expect_u32(frame->payload.sequence, sequence, "telemetry task sequence");
-    expect_u32((uint32_t)frame->payload.x, TELEMETRY_TEST_COORDINATE_X, "telemetry task x");
-    expect_u32((uint32_t)frame->payload.y, TELEMETRY_TEST_COORDINATE_Y, "telemetry task y");
-    expect_u32((uint32_t)frame->payload.z, TELEMETRY_TEST_COORDINATE_Z, "telemetry task z");
-    expect_u32(frame->payload.is_test_data, 1U, "telemetry task test data flag");
+    expect_i32(frame->payload.x, test_encoder_ox_coordinate, "telemetry task x");
+    expect_i32(frame->payload.y, test_encoder_oy_coordinate, "telemetry task y");
+    expect_i32(frame->payload.z, test_encoder_oz_coordinate, "telemetry task z");
+    expect_u32(frame->payload.is_test_data, 0U, "telemetry task test data flag");
 }
 
 static int run_reconnect_case(void) {

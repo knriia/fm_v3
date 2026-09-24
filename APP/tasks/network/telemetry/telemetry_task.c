@@ -1,4 +1,5 @@
 #include "telemetry_task.h"
+#include "encoder.h"
 #include "network_events.h"
 #include "task_context.h"
 #include "telemetry_dto.h"
@@ -109,8 +110,12 @@ void TelemetryTask(void *argument) {
             netconn_set_sendtimeout(client, TELEMETRY_NETWORK_SEND_TIMEOUT_MS);
             for (;;) {
                 TelemetryFrameDTO_t frame;
+                TelemetryCoordinates_t coordinates;
                 size_t bytes_written = 0U;
-                telemetry_build_test_frame(&frame, ++sequence);
+                coordinates.x = encoder_ox_get_coordinate();
+                coordinates.y = encoder_oy_get_coordinate();
+                coordinates.z = encoder_oz_get_coordinate();
+                telemetry_build_frame(&frame, ++sequence, &coordinates);
                 telemetry_counter_increment(&telemetry_task_diagnostics.send_attempts);
 
                 const err_t write_error =
