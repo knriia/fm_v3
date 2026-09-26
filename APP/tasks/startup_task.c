@@ -1,5 +1,7 @@
-#include "startup_task.h"
+#include <stddef.h>
+
 #include "network_events.h"
+#include "startup_task.h"
 
 #include "main.h"
 #include "cmsis_os.h"

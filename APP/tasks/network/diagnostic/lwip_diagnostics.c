@@ -1,3 +1,5 @@
+#include <stddef.h>
+
 #include "lwip_diagnostics.h"
 
 #include "lwip.h"
