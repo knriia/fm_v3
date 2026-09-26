@@ -3,6 +3,7 @@ Debug/
 Release/
 /cmake-build-debug
 /tests/build/
+cmake-build-*/
 *.elf
 *.bin
 *.hex

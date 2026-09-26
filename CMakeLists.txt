@@ -1,9 +1,18 @@
 #THIS FILE IS AUTO GENERATED FROM THE TEMPLATE! DO NOT CHANGE!
-set(CMAKE_SYSTEM_NAME Generic)
 set(CMAKE_SYSTEM_VERSION 1)
 cmake_minimum_required(VERSION 4.2)
 
+option(BUILD_TESTING "Build host-side unit tests instead of firmware" OFF)
+
+if(BUILD_TESTING)
+    project(fm_v3_tests C)
+    enable_testing()
+    add_subdirectory(tests)
+    return()
+endif()
+
 # specify cross-compilers and tools
+set(CMAKE_SYSTEM_NAME Generic)
 if(NOT DEFINED CMAKE_C_COMPILER)
     set(CMAKE_C_COMPILER arm-none-eabi-gcc)
 endif()
