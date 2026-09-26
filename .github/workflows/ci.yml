@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install test toolchain
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y clang ninja-build
+
+      - name: Configure tests
+        run: cmake -S . -B build-tests -G Ninja -DCMAKE_C_COMPILER=clang -DBUILD_TESTING=ON
+
+      - name: Build tests
+        run: cmake --build build-tests --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build-tests --output-on-failure
+
+  firmware-build:
+    name: Firmware build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y cmake ninja-build gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Configure firmware
+        run: cmake -S . -B build-firmware -G Ninja -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER=arm-none-eabi-gcc -DCMAKE_CXX_COMPILER=arm-none-eabi-g++ -DCMAKE_ASM_COMPILER=arm-none-eabi-gcc
+
+      - name: Build firmware
+        run: cmake --build build-firmware --parallel
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm_v3-firmware
+          if-no-files-found: error
+          path: |
+            build-firmware/fm_v3.elf
+            build-firmware/fm_v3.bin
+            build-firmware/fm_v3.hex
+            build-firmware/fm_v3.map
