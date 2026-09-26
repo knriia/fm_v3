@@ -1,6 +1,7 @@
 #ifndef FM_V3_DIAGNOSTIC_DTO_H
 #define FM_V3_DIAGNOSTIC_DTO_H
 
+#include "command_task.h"
 #include "dto.h"
 #include "ethernet_port.h"
 #include "ethernetif.h"
@@ -42,6 +43,10 @@ typedef struct {
     TaskDiagnosticsDTO_t runtime;
     StartupTaskDiagnostics startup;
 } StartupTaskDiagnosticsDTO_t;
+typedef struct {
+    TaskDiagnosticsDTO_t runtime;
+    CommandTaskDiagnostics command;
+} CommandTaskDiagnosticsDTO_t;
 
 typedef struct {
     TaskDiagnosticsDTO_t runtime;
@@ -73,6 +78,7 @@ typedef struct {
     uint32_t sequence;
     SystemDiagnostics system;
     StartupTaskDiagnosticsDTO_t startup_task;
+    CommandTaskDiagnosticsDTO_t command_task;
     TelemetryTaskDiagnosticsDTO_t telemetry_task;
     DiagnosticTaskDiagnosticsDTO_t diagnostic_task;
     EthIfTaskDiagnosticsDTO_t eth_if;
@@ -100,9 +106,10 @@ _Static_assert(sizeof(LwipMib2Diagnostics) == 192U, "Invalid LwIP MIB2 diagnosti
 _Static_assert(sizeof(LwipDiagnostics) == 916U, "Invalid LwIP diagnostics size");
 _Static_assert(sizeof(TcpipTaskDiagnosticsDTO_t) == 952U, "Invalid tcpip diagnostics size");
 _Static_assert(sizeof(StartupTaskDiagnosticsDTO_t) == 48U, "Invalid StartupTask diagnostics size");
+_Static_assert(sizeof(CommandTaskDiagnosticsDTO_t) == 136U, "Invalid CommandTask diagnostics size");
 _Static_assert(sizeof(TelemetryTaskDiagnosticsDTO_t) == 100U, "Invalid TelemetryTask diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1844U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1852U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1980U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1988U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

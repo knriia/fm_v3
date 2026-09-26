@@ -36,6 +36,7 @@ static size_t test_bytes_written;
 static size_t test_captured_write_size;
 static DiagnosticFrameDTO_t test_captured_frame;
 static TelemetryTaskDiagnostics test_telemetry_diagnostics;
+static CommandTaskDiagnostics test_command_diagnostics;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -91,6 +92,7 @@ void startup_task_get_diagnostics(StartupTaskDiagnostics *diagnostics) {
 void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
     *diagnostics = test_telemetry_diagnostics;
 }
+void command_task_get_diagnostics(CommandTaskDiagnostics *diagnostics) { *diagnostics = test_command_diagnostics; }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
     (void)event_flags_id;
@@ -360,6 +362,7 @@ static void reset_network_fixture(void) {
     test_captured_write_size = 0U;
     (void)memset(&test_captured_frame, 0, sizeof(test_captured_frame));
     test_telemetry_diagnostics = (TelemetryTaskDiagnostics){0};
+    test_command_diagnostics = (CommandTaskDiagnostics){0};
 }
 
 static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
@@ -441,6 +444,33 @@ static void test_diagnostic_task_network_paths(void) {
         .listen_errors = 21U,
         .accept_errors = 22U,
         .last_error = -23,
+    };
+    test_command_diagnostics = (CommandTaskDiagnostics){
+        .port = COMMAND_NETWORK_TASK_PORT,
+        .protocol_version = COMMAND_PROTOCOL_VERSION,
+        .max_payload_size = COMMAND_MAX_PAYLOAD_SIZE,
+        .max_frame_size = COMMAND_MAX_FRAME_SIZE,
+        .connections_accepted = 31U,
+        .connections_closed = 32U,
+        .active_connection = 1U,
+        .bytes_received = 38U,
+        .bytes_sent = 39U,
+        .frames_received = 40U,
+        .commands_received = 41U,
+        .commands_rejected = 35U,
+        .pings_received = 33U,
+        .pongs_sent = 34U,
+        .errors_sent = 42U,
+        .response_attempts = 43U,
+        .response_successes = 44U,
+        .response_send_errors = 36U,
+        .partial_writes = 45U,
+        .netconn_alloc_errors = 46U,
+        .bind_errors = 47U,
+        .listen_errors = 48U,
+        .accept_errors = 49U,
+        .recv_errors = 50U,
+        .last_error = -37,
     };
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
@@ -568,6 +598,59 @@ static void test_diagnostic_task_network_paths(void) {
         (uint32_t)test_captured_frame.payload.telemetry_task.telemetry.last_error,
         (uint32_t)-23,
         "telemetry diagnostic last error"
+    );
+
+    expect_u32(
+        test_captured_frame.payload.command_task.runtime.stack_size_bytes,
+        COMMAND_TASK_STACK_SIZE_BYTES,
+        "command task diagnostic stack size"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.runtime.stack_free_bytes,
+        400U,
+        "command task diagnostic free stack"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.port,
+        COMMAND_NETWORK_TASK_PORT,
+        "command diagnostic port"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.protocol_version,
+        COMMAND_PROTOCOL_VERSION,
+        "command diagnostic protocol version"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.max_payload_size,
+        COMMAND_MAX_PAYLOAD_SIZE,
+        "command diagnostic maximum payload"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.max_frame_size,
+        COMMAND_MAX_FRAME_SIZE,
+        "command diagnostic maximum frame"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.connections_accepted,
+        31U,
+        "command diagnostic accepted connections"
+    );
+    expect_u32(test_captured_frame.payload.command_task.command.pings_received, 33U, "command diagnostic pings");
+    expect_u32(test_captured_frame.payload.command_task.command.pongs_sent, 34U, "command diagnostic pongs");
+    expect_u32(
+        test_captured_frame.payload.command_task.command.commands_rejected,
+        35U,
+        "command diagnostic rejected commands"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.response_send_errors,
+        36U,
+        "command diagnostic response errors"
+    );
+    expect_u32(
+        (uint32_t)test_captured_frame.payload.command_task.command.last_error,
+        (uint32_t)-37,
+        "command diagnostic last error"
     );
 
     reset_network_fixture();
