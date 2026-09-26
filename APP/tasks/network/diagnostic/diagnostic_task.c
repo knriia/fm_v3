@@ -3,6 +3,7 @@
 //
 
 #include "diagnostic_task.h"
+#include "command_task.h"
 #include "diagnostic_dto.h"
 #include "network_events.h"
 #include "startup_task.h"
@@ -42,6 +43,7 @@ typedef struct {
 
 typedef struct {
     uint32_t startup_task_min_free_bytes;
+    uint32_t command_task_min_free_bytes;
     uint32_t telemetry_task_min_free_bytes;
     uint32_t eth_if_min_free_bytes;
     uint32_t eth_link_min_free_bytes;
@@ -58,6 +60,7 @@ typedef struct {
     uint8_t initialized;
     TaskRuntimeSample diagnostic_task;
     TaskRuntimeSample startup_task;
+    TaskRuntimeSample command_task;
     TaskRuntimeSample telemetry_task;
     TaskRuntimeSample eth_if;
     TaskRuntimeSample eth_link;
@@ -168,6 +171,14 @@ static void diagnostic_collect_network_tasks(
         total_runtime_ticks
     );
     diagnostic_network_task_fill_stats(
+        &payload->command_task.runtime,
+        xTaskGetHandle(COMMAND_TASK_NAME),
+        &runtime_percent_tracker.command_task,
+        COMMAND_TASK_STACK_SIZE_BYTES,
+        &runtime->command_task_min_free_bytes,
+        total_runtime_ticks
+    );
+    diagnostic_network_task_fill_stats(
         &payload->eth_if.runtime,
         xTaskGetHandle(ETHERNET_IF_TASK_NAME),
         &runtime_percent_tracker.eth_if,
@@ -259,6 +270,7 @@ void DiagnosticTask(void *argument) {
     DiagnosticTaskRuntime runtime = {0};
     NetworkTasksRuntime network_tasks_runtime = {
         .startup_task_min_free_bytes = UINT32_MAX,
+        .command_task_min_free_bytes = UINT32_MAX,
         .telemetry_task_min_free_bytes = UINT32_MAX,
         .eth_if_min_free_bytes = UINT32_MAX,
         .eth_link_min_free_bytes = UINT32_MAX,
@@ -331,6 +343,7 @@ void DiagnosticTask(void *argument) {
                 diagnostic_frame.payload.sequence = sequence;
                 system_diagnostics_collect(&diagnostic_frame.payload.system);
                 startup_task_get_diagnostics(&diagnostic_frame.payload.startup_task.startup);
+                command_task_get_diagnostics(&diagnostic_frame.payload.command_task.command);
                 telemetry_task_get_diagnostics(&diagnostic_frame.payload.telemetry_task.telemetry);
                 ethernetif_get_rx_diagnostics(&diagnostic_frame.payload.eth_if.ethernet_rx);
                 if (EthernetPort_GetDiagnostics(&diagnostic_frame.payload.eth_link.ethernet_port) != HAL_OK) {
