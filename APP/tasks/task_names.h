@@ -5,6 +5,7 @@
 #define DIAGNOSTIC_TASK_NAME "DiagnosticTask"
 #define TELEMETRY_TASK_NAME "TelemetryTask"
 #define COMMAND_TASK_NAME "CommandTask"
+#define COMMAND_DECODER_TASK_NAME "CommandDecoderTask"
 #define ETHERNET_IF_TASK_NAME "EthIf"
 #define ETHERNET_LINK_TASK_NAME "EthLink"
 #define TCPIP_TASK_NAME "tcpip_thread"

@@ -37,6 +37,7 @@ static size_t test_captured_write_size;
 static DiagnosticFrameDTO_t test_captured_frame;
 static TelemetryTaskDiagnostics test_telemetry_diagnostics;
 static CommandTaskDiagnostics test_command_diagnostics;
+static CommandDecoderTaskDiagnostics test_command_decoder_diagnostics;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -93,6 +94,9 @@ void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
     *diagnostics = test_telemetry_diagnostics;
 }
 void command_task_get_diagnostics(CommandTaskDiagnostics *diagnostics) { *diagnostics = test_command_diagnostics; }
+void command_decoder_get_diagnostics(CommandDecoderTaskDiagnostics *diagnostics) {
+    *diagnostics = test_command_decoder_diagnostics;
+}
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
     (void)event_flags_id;
@@ -363,6 +367,7 @@ static void reset_network_fixture(void) {
     (void)memset(&test_captured_frame, 0, sizeof(test_captured_frame));
     test_telemetry_diagnostics = (TelemetryTaskDiagnostics){0};
     test_command_diagnostics = (CommandTaskDiagnostics){0};
+    test_command_decoder_diagnostics = (CommandDecoderTaskDiagnostics){0};
 }
 
 static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
@@ -447,20 +452,17 @@ static void test_diagnostic_task_network_paths(void) {
     };
     test_command_diagnostics = (CommandTaskDiagnostics){
         .port = COMMAND_NETWORK_TASK_PORT,
-        .protocol_version = COMMAND_PROTOCOL_VERSION,
-        .max_payload_size = COMMAND_MAX_PAYLOAD_SIZE,
-        .max_frame_size = COMMAND_MAX_FRAME_SIZE,
         .connections_accepted = 31U,
         .connections_closed = 32U,
         .active_connection = 1U,
         .bytes_received = 38U,
+        .complete_frames_received = 40U,
+        .invalid_magic = 41U,
+        .invalid_frame_length = 42U,
+        .invalid_crc = 43U,
+        .buffer_current_bytes = 44U,
+        .buffer_max_bytes = 45U,
         .bytes_sent = 39U,
-        .frames_received = 40U,
-        .commands_received = 41U,
-        .commands_rejected = 35U,
-        .pings_received = 33U,
-        .pongs_sent = 34U,
-        .errors_sent = 42U,
         .response_attempts = 43U,
         .response_successes = 44U,
         .response_send_errors = 36U,
@@ -470,7 +472,30 @@ static void test_diagnostic_task_network_paths(void) {
         .listen_errors = 48U,
         .accept_errors = 49U,
         .recv_errors = 50U,
+        .decoder_queue_errors = 51U,
         .last_error = -37,
+    };
+    test_command_decoder_diagnostics = (CommandDecoderTaskDiagnostics){
+        .protocol_version = COMMAND_PROTOCOL_VERSION,
+        .max_payload_size = COMMAND_MAX_PAYLOAD_SIZE,
+        .max_frame_size = COMMAND_MAX_FRAME_SIZE,
+        .requests_received = 61U,
+        .request_queue_overflows = 63U,
+        .request_bytes_dropped = 64U,
+        .commands_received = 69U,
+        .commands_rejected = 70U,
+        .pings_received = 71U,
+        .responses_formed = 72U,
+        .pongs_queued = 73U,
+        .errors_queued = 74U,
+        .invalid_payload_length = 75U,
+        .unsupported_version = 77U,
+        .unexpected_type = 78U,
+        .invalid_sequence = 79U,
+        .unknown_commands = 80U,
+        .invalid_states = 81U,
+        .response_queue_overflows = 82U,
+        .last_error = -83,
     };
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
@@ -616,31 +641,19 @@ static void test_diagnostic_task_network_paths(void) {
         "command diagnostic port"
     );
     expect_u32(
-        test_captured_frame.payload.command_task.command.protocol_version,
-        COMMAND_PROTOCOL_VERSION,
-        "command diagnostic protocol version"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.max_payload_size,
-        COMMAND_MAX_PAYLOAD_SIZE,
-        "command diagnostic maximum payload"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.max_frame_size,
-        COMMAND_MAX_FRAME_SIZE,
-        "command diagnostic maximum frame"
-    );
-    expect_u32(
         test_captured_frame.payload.command_task.command.connections_accepted,
         31U,
         "command diagnostic accepted connections"
     );
-    expect_u32(test_captured_frame.payload.command_task.command.pings_received, 33U, "command diagnostic pings");
-    expect_u32(test_captured_frame.payload.command_task.command.pongs_sent, 34U, "command diagnostic pongs");
     expect_u32(
-        test_captured_frame.payload.command_task.command.commands_rejected,
-        35U,
-        "command diagnostic rejected commands"
+        test_captured_frame.payload.command_task.command.complete_frames_received,
+        40U,
+        "command diagnostic complete frames"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_task.command.invalid_crc,
+        43U,
+        "command diagnostic invalid CRC"
     );
     expect_u32(
         test_captured_frame.payload.command_task.command.response_send_errors,
@@ -648,11 +661,50 @@ static void test_diagnostic_task_network_paths(void) {
         "command diagnostic response errors"
     );
     expect_u32(
+        test_captured_frame.payload.command_task.command.decoder_queue_errors,
+        51U,
+        "command diagnostic decoder queue errors"
+    );
+    expect_u32(
         (uint32_t)test_captured_frame.payload.command_task.command.last_error,
         (uint32_t)-37,
         "command diagnostic last error"
     );
-
+    expect_u32(
+        test_captured_frame.payload.command_decoder_task.runtime.stack_size_bytes,
+        COMMAND_DECODER_TASK_STACK_SIZE_BYTES,
+        "command decoder task diagnostic stack size"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_decoder_task.runtime.stack_free_bytes,
+        400U,
+        "command decoder task diagnostic free stack"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_decoder_task.decoder.protocol_version,
+        COMMAND_PROTOCOL_VERSION,
+        "command decoder diagnostic protocol version"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_decoder_task.decoder.requests_received,
+        61U,
+        "command decoder diagnostic requests"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_decoder_task.decoder.responses_formed,
+        72U,
+        "command decoder diagnostic formed responses"
+    );
+    expect_u32(
+        test_captured_frame.payload.command_decoder_task.decoder.invalid_payload_length,
+        75U,
+        "command decoder diagnostic invalid payload length"
+    );
+    expect_u32(
+        (uint32_t)test_captured_frame.payload.command_decoder_task.decoder.last_error,
+        (uint32_t)-83,
+        "command decoder diagnostic last error"
+    );
     reset_network_fixture();
     test_write_result = ERR_BUF;
     test_bytes_written = 3U;

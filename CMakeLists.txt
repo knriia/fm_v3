@@ -1,5 +1,4 @@
 #THIS FILE IS AUTO GENERATED FROM THE TEMPLATE! DO NOT CHANGE!
-set(CMAKE_SYSTEM_VERSION 1)
 cmake_minimum_required(VERSION 3.20)
 
 option(BUILD_TESTING "Build host-side unit tests instead of firmware" OFF)
@@ -13,6 +12,7 @@ endif()
 
 # specify cross-compilers and tools
 set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_VERSION 1)
 if(NOT DEFINED CMAKE_C_COMPILER)
     set(CMAKE_C_COMPILER arm-none-eabi-gcc)
 endif()
@@ -105,6 +105,7 @@ else ()
 endif ()
 
 include_directories(Core/Inc APP APP/hooks APP/tasks APP/tasks/network APP/tasks/network/command APP/tasks/network/diagnostic APP/tasks/network/telemetry BSP BSP/MCU BSP/ETH Drivers/STM32H7xx_HAL_Driver/Inc Drivers/STM32H7xx_HAL_Driver/Inc/Legacy Drivers/CMSIS/Device/ST/STM32H7xx/Include Drivers/CMSIS/Include LWIP/App LWIP/Target Middlewares/Third_Party/LwIP/src/include Middlewares/Third_Party/LwIP/system Middlewares/Third_Party/LwIP/src/include/netif/ppp Middlewares/Third_Party/LwIP/src/include/lwip Middlewares/Third_Party/LwIP/src/include/lwip/apps Middlewares/Third_Party/LwIP/src/include/lwip/priv Middlewares/Third_Party/LwIP/src/include/lwip/prot Middlewares/Third_Party/LwIP/src/include/netif Middlewares/Third_Party/LwIP/src/include/compat/posix Middlewares/Third_Party/LwIP/src/include/compat/posix/arpa Middlewares/Third_Party/LwIP/src/include/compat/posix/net Middlewares/Third_Party/LwIP/src/include/compat/posix/sys Middlewares/Third_Party/LwIP/src/include/compat/stdc Middlewares/Third_Party/LwIP/system/arch Middlewares/Third_Party/FreeRTOS/Source/include Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2 Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F)
+include_directories(APP/protocol/command)
 
 add_definitions(-DDEBUG -DUSE_HAL_DRIVER -DSTM32H723xx -DDATA_IN_D2_SRAM)
 

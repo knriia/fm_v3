@@ -1,6 +1,7 @@
 #ifndef FM_V3_DIAGNOSTIC_DTO_H
 #define FM_V3_DIAGNOSTIC_DTO_H
 
+#include "command_decoder_task.h"
 #include "command_task.h"
 #include "dto.h"
 #include "ethernet_port.h"
@@ -50,6 +51,11 @@ typedef struct {
 
 typedef struct {
     TaskDiagnosticsDTO_t runtime;
+    CommandDecoderTaskDiagnostics decoder;
+} CommandDecoderTaskDiagnosticsDTO_t;
+
+typedef struct {
+    TaskDiagnosticsDTO_t runtime;
     TelemetryTaskDiagnostics telemetry;
 } TelemetryTaskDiagnosticsDTO_t;
 
@@ -79,6 +85,7 @@ typedef struct {
     SystemDiagnostics system;
     StartupTaskDiagnosticsDTO_t startup_task;
     CommandTaskDiagnosticsDTO_t command_task;
+    CommandDecoderTaskDiagnosticsDTO_t command_decoder_task;
     TelemetryTaskDiagnosticsDTO_t telemetry_task;
     DiagnosticTaskDiagnosticsDTO_t diagnostic_task;
     EthIfTaskDiagnosticsDTO_t eth_if;
@@ -106,10 +113,11 @@ _Static_assert(sizeof(LwipMib2Diagnostics) == 192U, "Invalid LwIP MIB2 diagnosti
 _Static_assert(sizeof(LwipDiagnostics) == 916U, "Invalid LwIP diagnostics size");
 _Static_assert(sizeof(TcpipTaskDiagnosticsDTO_t) == 952U, "Invalid tcpip diagnostics size");
 _Static_assert(sizeof(StartupTaskDiagnosticsDTO_t) == 48U, "Invalid StartupTask diagnostics size");
-_Static_assert(sizeof(CommandTaskDiagnosticsDTO_t) == 136U, "Invalid CommandTask diagnostics size");
+_Static_assert(sizeof(CommandTaskDiagnosticsDTO_t) == 128U, "Invalid CommandTask diagnostics size");
+_Static_assert(sizeof(CommandDecoderTaskDiagnosticsDTO_t) == 116U, "Invalid CommandDecoderTask diagnostics size");
 _Static_assert(sizeof(TelemetryTaskDiagnosticsDTO_t) == 100U, "Invalid TelemetryTask diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 1980U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 1988U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2088U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2096U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

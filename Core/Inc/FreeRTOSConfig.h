@@ -70,7 +70,7 @@
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
 #define configTOTAL_HEAP_SIZE                    ((size_t)32768)
-#define configMAX_TASK_NAME_LEN                  ( 16 )
+#define configMAX_TASK_NAME_LEN                  ( 24 )
 #define configUSE_TRACE_FACILITY                 1
 #define configGENERATE_RUN_TIME_STATS            1
 #define configRUN_TIME_COUNTER_TYPE              uint32_t

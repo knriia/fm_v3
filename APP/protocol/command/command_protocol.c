@@ -1,5 +1,4 @@
 #include "command_protocol.h"
-
 #include <string.h>
 
 static uint16_t command_read_u16_le(const uint8_t *data) { return (uint16_t)data[0] | ((uint16_t)data[1] << 8U); }
@@ -58,19 +57,31 @@ uint32_t command_protocol_crc32(const uint8_t *data, size_t data_length) {
 void command_frame_parser_init(CommandFrameParser_t *parser) {
     if (parser != NULL) {
         parser->length = 0U;
+        parser->max_length = 0U;
     }
 }
 
-static void command_frame_parser_process(CommandFrameParser_t *parser, CommandFrameCallback callback, void *context) {
+static void command_frame_parser_process(
+    CommandFrameParser_t *parser,
+    CommandFrameCallback callback,
+    CommandFrameErrorCallback error_callback,
+    void *context
+) {
     while (parser->length >= COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE) {
         const uint16_t magic = command_read_u16_le(&parser->buffer[0]);
         if (magic != COMMAND_PROTOCOL_MAGIC) {
+            if (error_callback != NULL) {
+                error_callback(COMMAND_FRAME_INVALID_MAGIC, context);
+            }
             command_discard_prefix(parser, 1U);
             continue;
         }
 
         const uint16_t payload_length = command_read_u16_le(&parser->buffer[4]);
         if (payload_length > COMMAND_MAX_PAYLOAD_SIZE) {
+            if (error_callback != NULL) {
+                error_callback(COMMAND_FRAME_INVALID_LENGTH, context);
+            }
             command_discard_prefix(parser, 1U);
             continue;
         }
@@ -83,6 +94,9 @@ static void command_frame_parser_process(CommandFrameParser_t *parser, CommandFr
         const uint32_t received_crc = command_read_u32_le(&parser->buffer[COMMAND_FRAME_HEADER_SIZE + payload_length]);
         const uint32_t calculated_crc = command_protocol_crc32(parser->buffer, frame_length - COMMAND_FRAME_CRC_SIZE);
         if (received_crc != calculated_crc) {
+            if (error_callback != NULL) {
+                error_callback(COMMAND_FRAME_INVALID_CRC, context);
+            }
             command_discard_prefix(parser, 1U);
             continue;
         }
@@ -94,14 +108,18 @@ static void command_frame_parser_process(CommandFrameParser_t *parser, CommandFr
     }
 }
 
-void command_frame_parser_feed(
+void command_frame_parser_feed_ex(
     CommandFrameParser_t *parser,
     const uint8_t *data,
     size_t data_length,
     CommandFrameCallback callback,
+    CommandFrameErrorCallback error_callback,
     void *context
 ) {
     if (parser == NULL || (data == NULL && data_length != 0U)) {
+        if (error_callback != NULL) {
+            error_callback(COMMAND_FRAME_INVALID_ARGUMENT, context);
+        }
         return;
     }
 
@@ -112,8 +130,46 @@ void command_frame_parser_feed(
 
         parser->buffer[parser->length] = data[index];
         ++parser->length;
-        command_frame_parser_process(parser, callback, context);
+        if (parser->length > parser->max_length) {
+            parser->max_length = parser->length;
+        }
+        command_frame_parser_process(parser, callback, error_callback, context);
     }
+}
+
+void command_frame_parser_feed(
+    CommandFrameParser_t *parser,
+    const uint8_t *data,
+    size_t data_length,
+    CommandFrameCallback callback,
+    void *context
+) {
+    command_frame_parser_feed_ex(parser, data, data_length, callback, NULL, context);
+}
+
+CommandFrameValidationResult_t
+command_protocol_decode_request(const uint8_t *frame, size_t frame_length, CommandRequestDTO_t *request) {
+    if (request == NULL) {
+        return COMMAND_FRAME_INVALID_ARGUMENT;
+    }
+
+    const CommandFrameValidationResult_t result =
+        command_protocol_validate_frame(frame, frame_length, &request->header);
+    if (result != COMMAND_FRAME_VALID) {
+        (void)memset(request->payload, 0, sizeof(request->payload));
+        return result;
+    }
+
+    (void)memset(request->payload, 0, sizeof(request->payload));
+    (void)memcpy(request->payload, &frame[COMMAND_FRAME_HEADER_SIZE], request->header.payload_length);
+    return COMMAND_FRAME_VALID;
+}
+
+uint16_t command_protocol_validate_request_dto(const CommandRequestDTO_t *request) {
+    if (request == NULL) {
+        return COMMAND_ERROR_INVALID_LENGTH;
+    }
+    return command_protocol_validate_request(&request->header, request->payload);
 }
 
 uint16_t command_protocol_validate_request(const CommandFrameHeaderDTO_t *header, const uint8_t *payload) {
@@ -210,20 +266,36 @@ size_t command_protocol_build_frame(
     return frame_length;
 }
 
+size_t command_protocol_build_response(uint8_t *frame, size_t frame_capacity, const CommandResponseDTO_t *response) {
+    if (response == NULL) {
+        return 0U;
+    }
+    return command_protocol_build_frame(
+        frame,
+        frame_capacity,
+        response->type,
+        response->sequence,
+        response->payload,
+        response->payload_length
+    );
+}
+
 size_t command_protocol_build_pong_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence) {
-    return command_protocol_build_frame(frame, frame_capacity, COMMAND_MESSAGE_TYPE_PONG, sequence, NULL, 0U);
+    const CommandResponseDTO_t response = {
+        .type = COMMAND_MESSAGE_TYPE_PONG,
+        .sequence = sequence,
+        .payload_length = 0U,
+    };
+    return command_protocol_build_response(frame, frame_capacity, &response);
 }
 
 size_t
 command_protocol_build_error_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t error_code) {
-    uint8_t payload[sizeof(CommandErrorPayloadDTO_t)];
-    command_write_u16_le(payload, error_code);
-    return command_protocol_build_frame(
-        frame,
-        frame_capacity,
-        COMMAND_MESSAGE_TYPE_ERROR,
-        sequence,
-        payload,
-        sizeof(payload)
-    );
+    CommandResponseDTO_t response = {
+        .type = COMMAND_MESSAGE_TYPE_ERROR,
+        .sequence = sequence,
+        .payload_length = sizeof(CommandErrorPayloadDTO_t),
+    };
+    command_write_u16_le(response.payload, error_code);
+    return command_protocol_build_response(frame, frame_capacity, &response);
 }
