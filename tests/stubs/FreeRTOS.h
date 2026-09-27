@@ -6,12 +6,20 @@
 #define configTOTAL_HEAP_SIZE 32768U
 #define pdFALSE 0
 #define pdTRUE 1
+#define pdPASS pdTRUE
+#define portMAX_DELAY UINT32_MAX
+#define pdMS_TO_TICKS(milliseconds) (milliseconds)
 #define eInvalid 0
 
 typedef uint32_t UBaseType_t;
 typedef uint32_t TickType_t;
 typedef uint32_t StackType_t;
 typedef void *TaskHandle_t;
+typedef void *QueueHandle_t;
+typedef int BaseType_t;
+typedef struct {
+    uint32_t unused;
+} StaticQueue_t;
 
 typedef struct {
     StackType_t *pxStackBase;

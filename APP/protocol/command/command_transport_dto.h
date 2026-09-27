@@ -1,5 +1,5 @@
-#ifndef FM_V3_COMMAND_DTO_H
-#define FM_V3_COMMAND_DTO_H
+#ifndef FM_V3_COMMAND_TRANSPORT_DTO_H
+#define FM_V3_COMMAND_TRANSPORT_DTO_H
 
 #include <stdint.h>
 
@@ -18,13 +18,15 @@
 #define COMMAND_MESSAGE_TYPE_PONG 0x06U
 #define COMMAND_MESSAGE_TYPE_CANCELLED 0x07U
 #define COMMAND_MESSAGE_TYPE_ERROR 0xFFU
-
-#define COMMAND_CODE_HOME 0x01U
-#define COMMAND_CODE_MOTION_OPERATION 0x02U
-#define COMMAND_CODE_SET_TEMPERATURE 0x07U
-#define COMMAND_CODE_SET_OUTPUT 0x08U
-#define COMMAND_CODE_CHANGE_TOOL 0x09U
-#define COMMAND_CODE_STOP 0x0AU
+/* Command identifiers encoded in a command request payload. */
+typedef enum {
+    COMMAND_CODE_HOME = 0x01U,
+    COMMAND_CODE_MOTION_OPERATION = 0x02U,
+    COMMAND_CODE_SET_TEMPERATURE = 0x07U,
+    COMMAND_CODE_SET_OUTPUT = 0x08U,
+    COMMAND_CODE_CHANGE_TOOL = 0x09U,
+    COMMAND_CODE_STOP = 0x0AU
+} CommandCode_t;
 
 #define COMMAND_ERROR_UNSUPPORTED_VERSION 0x0001U
 #define COMMAND_ERROR_UNEXPECTED_TYPE 0x0002U
@@ -46,7 +48,21 @@ typedef struct __attribute__((packed)) {
     uint16_t error_code;
 } CommandErrorPayloadDTO_t;
 
+/* Complete, transport-valid request copied out of the protocol parser buffer. */
+typedef struct {
+    CommandFrameHeaderDTO_t header;
+    uint8_t payload[COMMAND_MAX_PAYLOAD_SIZE];
+} CommandRequestDTO_t;
+
+/* Response model owned by the caller until it is serialized into a frame. */
+typedef struct {
+    uint8_t type;
+    uint32_t sequence;
+    uint16_t payload_length;
+    uint8_t payload[COMMAND_MAX_PAYLOAD_SIZE];
+} CommandResponseDTO_t;
+
 _Static_assert(sizeof(CommandFrameHeaderDTO_t) == COMMAND_FRAME_HEADER_SIZE, "Invalid command frame header size");
 _Static_assert(sizeof(CommandErrorPayloadDTO_t) == 2U, "Invalid command error payload size");
 
-#endif /* FM_V3_COMMAND_DTO_H */
+#endif /* FM_V3_COMMAND_TRANSPORT_DTO_H */

@@ -187,11 +187,39 @@ static void test_response_builders(void) {
     expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], COMMAND_ERROR_INVALID_LENGTH >> 8U, "ERROR code high byte");
 }
 
+static void test_transport_dtos(void) {
+    uint8_t frame[COMMAND_MAX_FRAME_SIZE];
+    const size_t request_length = build_ping(frame, 35U);
+    CommandRequestDTO_t request = {0};
+    expect_u32(
+        command_protocol_decode_request(frame, request_length, &request),
+        COMMAND_FRAME_VALID,
+        "transport request DTO is decoded"
+    );
+    expect_u32(request.header.sequence, 35U, "request DTO keeps sequence");
+    expect_u32(request.payload[0], 0U, "request DTO owns payload storage");
+    expect_u32(command_protocol_validate_request_dto(&request), 0U, "request DTO is validated");
+
+    const CommandResponseDTO_t response = {
+        .type = COMMAND_MESSAGE_TYPE_PONG,
+        .sequence = 36U,
+        .payload_length = 0U,
+    };
+    const size_t response_length = command_protocol_build_response(frame, sizeof(frame), &response);
+    CommandFrameHeaderDTO_t response_header;
+    expect_u32(
+        command_protocol_validate_frame(frame, response_length, &response_header),
+        COMMAND_FRAME_VALID,
+        "transport response DTO is serialized"
+    );
+    expect_u32(response_header.sequence, 36U, "response DTO keeps sequence");
+}
 int main(void) {
     test_crc();
     test_partial_and_compound_stream();
     test_crc_and_size_rejection();
     test_request_validation();
     test_response_builders();
+    test_transport_dtos();
     return test_failures == 0U ? 0 : 1;
 }
