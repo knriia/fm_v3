@@ -8,6 +8,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+option(FM_V3_ENABLE_LLVM_COVERAGE "Instrument host tests for LLVM source-based coverage" OFF)
+
 add_executable(diagnostic_protocol_tests
     diagnostic_protocol_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic/lwip_diagnostics.c
@@ -155,6 +157,33 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+endif ()
+
+if (FM_V3_ENABLE_LLVM_COVERAGE)
+    if (NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "FM_V3_ENABLE_LLVM_COVERAGE requires Clang")
+    endif ()
+
+    set(FM_V3_HOST_TEST_TARGETS
+        diagnostic_protocol_tests
+        diagnostic_task_unit_tests
+        startup_task_unit_tests
+        telemetry_protocol_tests
+        telemetry_task_unit_tests
+        command_protocol_tests
+        command_task_unit_tests
+        command_decoder_task_unit_tests
+    )
+
+    foreach (test_target IN LISTS FM_V3_HOST_TEST_TARGETS)
+        target_compile_options(${test_target} PRIVATE
+            -fprofile-instr-generate
+            -fcoverage-mapping
+        )
+        target_link_options(${test_target} PRIVATE
+            -fprofile-instr-generate
+        )
+    endforeach ()
 endif ()
 
 add_test(NAME diagnostic_protocol_tests COMMAND diagnostic_protocol_tests)
