@@ -145,6 +145,11 @@ static void test_ping_request(void) {
     expect_u32(diagnostics.responses_formed, 1U, "formed response counter");
     expect_u32(diagnostics.pongs_queued, 1U, "queued PONG counter");
     expect_u32(diagnostics.errors_queued, 0U, "no error response for valid PING");
+    expect_u32(diagnostics.commands_received, 0U, "PING is not counted as a command");
+    expect_u32(diagnostics.commands_rejected, 0U, "valid PING is not rejected");
+    expect_u32(diagnostics.request_queue_overflows, 0U, "valid PING does not overflow the request queue");
+    expect_u32(diagnostics.response_queue_overflows, 0U, "valid PING does not overflow the response queue");
+    expect_u32((uint32_t)diagnostics.last_error, 0U, "valid PING leaves decoder error clear");
 }
 
 static void test_rejected_command(void) {
