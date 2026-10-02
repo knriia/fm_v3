@@ -25,11 +25,24 @@ typedef struct {
     uint8_t frames[4][COMMAND_MAX_FRAME_SIZE];
 } FrameCapture;
 
+typedef struct {
+    uint32_t count;
+    CommandFrameValidationResult_t results[16];
+} ErrorCapture;
+
 static void capture_frame(const uint8_t *frame, size_t frame_length, void *context) {
     FrameCapture *capture = context;
     if (capture->count < 4U) {
         capture->lengths[capture->count] = frame_length;
         memcpy(capture->frames[capture->count], frame, frame_length);
+    }
+    ++capture->count;
+}
+
+static void capture_error(CommandFrameValidationResult_t result, void *context) {
+    ErrorCapture *capture = context;
+    if (capture->count < sizeof(capture->results) / sizeof(capture->results[0])) {
+        capture->results[capture->count] = result;
     }
     ++capture->count;
 }
@@ -41,6 +54,59 @@ static size_t build_ping(uint8_t *frame, uint32_t sequence) {
 static void test_crc(void) {
     const uint8_t text[] = "123456789";
     expect_u32(command_protocol_crc32(text, sizeof(text) - 1U), 0xCBF43926U, "CRC-32");
+    expect_u32(command_protocol_crc32(NULL, 0U), 0U, "empty CRC input");
+    expect_u32(command_protocol_crc32(NULL, 1U), 0U, "null CRC input is rejected");
+}
+
+static void test_parser_error_callbacks_and_arguments(void) {
+    CommandFrameParser_t parser;
+    ErrorCapture errors = {0};
+    command_frame_parser_init(NULL);
+    command_frame_parser_init(&parser);
+
+    command_frame_parser_feed_ex(NULL, NULL, 1U, NULL, capture_error, &errors);
+    command_frame_parser_feed_ex(&parser, NULL, 1U, NULL, capture_error, &errors);
+    command_frame_parser_feed_ex(&parser, NULL, 1U, NULL, NULL, &errors);
+    command_frame_parser_feed_ex(&parser, NULL, 0U, NULL, NULL, NULL);
+    expect_u32(errors.count, 2U, "invalid parser inputs notify a configured error callback");
+    expect_u32(errors.results[0], COMMAND_FRAME_INVALID_ARGUMENT, "null parser error code");
+    expect_u32(errors.results[1], COMMAND_FRAME_INVALID_ARGUMENT, "null data error code");
+
+    uint8_t invalid_magic[COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE] = {0};
+    command_frame_parser_init(&parser);
+    command_frame_parser_feed_ex(&parser, invalid_magic, sizeof(invalid_magic), NULL, capture_error, &errors);
+    expect_u32(errors.results[2], COMMAND_FRAME_INVALID_MAGIC, "parser reports invalid magic");
+
+    uint8_t invalid_length[COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE] = {
+        (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU),
+        (uint8_t)(COMMAND_PROTOCOL_MAGIC >> 8U),
+        COMMAND_PROTOCOL_VERSION,
+        COMMAND_MESSAGE_TYPE_PING,
+        (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) & 0xFFU),
+        (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) >> 8U),
+    };
+    command_frame_parser_init(&parser);
+    command_frame_parser_feed_ex(&parser, invalid_length, sizeof(invalid_length), NULL, capture_error, &errors);
+    expect_u32(errors.results[3], COMMAND_FRAME_INVALID_LENGTH, "parser reports oversized payload");
+
+    uint8_t invalid_crc[COMMAND_MAX_FRAME_SIZE];
+    const size_t valid_length = build_ping(invalid_crc, 19U);
+    invalid_crc[valid_length - 1U] ^= 1U;
+    command_frame_parser_init(&parser);
+    command_frame_parser_feed_ex(&parser, invalid_crc, valid_length, NULL, capture_error, &errors);
+    expect_u32(errors.results[4], COMMAND_FRAME_INVALID_CRC, "parser reports invalid CRC");
+
+    uint8_t valid_frame[COMMAND_MAX_FRAME_SIZE];
+    const size_t frame_length = build_ping(valid_frame, 20U);
+    command_frame_parser_init(&parser);
+    command_frame_parser_feed_ex(&parser, valid_frame, frame_length, NULL, capture_error, &errors);
+    expect_u32(errors.count, 5U, "valid frame with no callback is silently consumed");
+
+    command_frame_parser_init(&parser);
+    memset(parser.buffer, 0, sizeof(parser.buffer));
+    parser.length = COMMAND_MAX_FRAME_SIZE;
+    command_frame_parser_feed_ex(&parser, valid_frame, 1U, NULL, NULL, NULL);
+    expect_u32((uint32_t)parser.max_length, COMMAND_MAX_FRAME_SIZE, "full parser buffer updates high-water mark");
 }
 
 static void test_partial_and_compound_stream(void) {
@@ -165,6 +231,99 @@ static void test_request_validation(void) {
         COMMAND_ERROR_UNSUPPORTED_VERSION,
         "unsupported protocol version"
     );
+
+    expect_u32(command_protocol_validate_request(NULL, NULL), COMMAND_ERROR_INVALID_LENGTH, "null request header");
+    header.version = COMMAND_PROTOCOL_VERSION;
+    header.type = COMMAND_MESSAGE_TYPE_COMMAND;
+    header.payload_length = 1U;
+    expect_u32(command_protocol_validate_request(&header, NULL), COMMAND_ERROR_INVALID_LENGTH, "null request payload");
+    header.sequence = 1U;
+    const uint8_t reserved_codes[] = {
+        COMMAND_CODE_HOME,
+        COMMAND_CODE_MOTION_OPERATION,
+        COMMAND_CODE_SET_TEMPERATURE,
+        COMMAND_CODE_SET_OUTPUT,
+        COMMAND_CODE_CHANGE_TOOL,
+        COMMAND_CODE_STOP,
+    };
+    for (size_t index = 0U; index < sizeof(reserved_codes); ++index) {
+        expect_u32(
+            command_protocol_validate_request(&header, &reserved_codes[index]),
+            COMMAND_ERROR_INVALID_STATE,
+            "reserved command is rejected as unsupported state"
+        );
+    }
+}
+
+static void test_frame_validation_and_decode_errors(void) {
+    uint8_t frame[COMMAND_MAX_FRAME_SIZE];
+    const size_t frame_length = build_ping(frame, 27U);
+    CommandFrameHeaderDTO_t header;
+    expect_u32(command_protocol_validate_frame(NULL, frame_length, &header), COMMAND_FRAME_INVALID_ARGUMENT, "null frame");
+    expect_u32(
+        command_protocol_validate_frame(frame, COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE - 1U, &header),
+        COMMAND_FRAME_INVALID_LENGTH,
+        "frame shorter than its fixed header"
+    );
+
+    uint8_t altered[COMMAND_MAX_FRAME_SIZE];
+    memcpy(altered, frame, frame_length);
+    altered[0] ^= 1U;
+    expect_u32(command_protocol_validate_frame(altered, frame_length, &header), COMMAND_FRAME_INVALID_MAGIC, "invalid frame magic");
+
+    uint8_t oversized[COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE] = {
+        (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU),
+        (uint8_t)(COMMAND_PROTOCOL_MAGIC >> 8U),
+        COMMAND_PROTOCOL_VERSION,
+        COMMAND_MESSAGE_TYPE_PING,
+        (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) & 0xFFU),
+        (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) >> 8U),
+    };
+    expect_u32(command_protocol_validate_frame(oversized, sizeof(oversized), &header), COMMAND_FRAME_INVALID_LENGTH, "oversized frame payload");
+    expect_u32(command_protocol_validate_frame(frame, frame_length - 1U, &header), COMMAND_FRAME_INVALID_LENGTH, "truncated frame");
+    expect_u32(command_protocol_validate_frame(frame, frame_length + 1U, &header), COMMAND_FRAME_INVALID_LENGTH, "trailing frame data");
+
+    memcpy(altered, frame, frame_length);
+    altered[frame_length - 1U] ^= 1U;
+    expect_u32(command_protocol_validate_frame(altered, frame_length, NULL), COMMAND_FRAME_INVALID_CRC, "invalid frame CRC without header output");
+    expect_u32(command_protocol_validate_frame(frame, frame_length, NULL), COMMAND_FRAME_VALID, "valid frame without header output");
+
+    expect_u32(command_protocol_decode_request(frame, frame_length, NULL), COMMAND_FRAME_INVALID_ARGUMENT, "null decode output");
+    CommandRequestDTO_t request;
+    memset(&request, 0xFF, sizeof(request));
+    expect_u32(command_protocol_decode_request(altered, frame_length, &request), COMMAND_FRAME_INVALID_CRC, "decode rejects invalid CRC");
+    expect_u32(request.payload[0], 0U, "failed decode clears payload storage");
+    expect_u32(command_protocol_decode_request(frame, frame_length, &request), COMMAND_FRAME_VALID, "valid decode succeeds");
+    expect_u32(command_protocol_validate_request_dto(NULL), COMMAND_ERROR_INVALID_LENGTH, "null request DTO");
+}
+
+static void test_frame_build_errors(void) {
+    uint8_t frame[COMMAND_MAX_FRAME_SIZE];
+    const uint8_t payload[] = {1U};
+    expect_u32((uint32_t)command_protocol_build_frame(NULL, sizeof(frame), COMMAND_MESSAGE_TYPE_PING, 1U, NULL, 0U), 0U, "null frame output");
+    expect_u32((uint32_t)command_protocol_build_frame(frame, sizeof(frame), COMMAND_MESSAGE_TYPE_PING, 1U, NULL, 1U), 0U, "null payload with nonzero length");
+    expect_u32(
+        (uint32_t)command_protocol_build_frame(frame, sizeof(frame), COMMAND_MESSAGE_TYPE_PING, 1U, payload, (uint16_t)(COMMAND_MAX_PAYLOAD_SIZE + 1U)),
+        0U,
+        "payload above protocol maximum"
+    );
+    expect_u32(
+        (uint32_t)command_protocol_build_frame(frame, COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE - 1U, COMMAND_MESSAGE_TYPE_PING, 1U, NULL, 0U),
+        0U,
+        "insufficient frame capacity"
+    );
+    expect_u32((uint32_t)command_protocol_build_response(frame, sizeof(frame), NULL), 0U, "null response DTO");
+
+    const CommandResponseDTO_t invalid_response = {
+        .type = COMMAND_MESSAGE_TYPE_ERROR,
+        .sequence = 1U,
+        .payload_length = (uint16_t)(COMMAND_MAX_PAYLOAD_SIZE + 1U),
+    };
+    expect_u32(
+        (uint32_t)command_protocol_build_response(frame, sizeof(frame), &invalid_response),
+        0U,
+        "response payload above protocol maximum is rejected"
+    );
 }
 
 static void test_response_builders(void) {
@@ -216,9 +375,12 @@ static void test_transport_dtos(void) {
 }
 int main(void) {
     test_crc();
+    test_parser_error_callbacks_and_arguments();
     test_partial_and_compound_stream();
     test_crc_and_size_rejection();
     test_request_validation();
+    test_frame_validation_and_decode_errors();
+    test_frame_build_errors();
     test_response_builders();
     test_transport_dtos();
     return test_failures == 0U ? 0 : 1;

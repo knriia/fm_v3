@@ -20,6 +20,12 @@ static uint8_t test_stop_on_delay;
 static uint8_t test_stop_on_second_new;
 static uint8_t test_stop_on_second_accept;
 static uint8_t test_stop_on_third_accept;
+static uint8_t test_stop_on_second_recv;
+static uint8_t test_accept_returns_null;
+static uint8_t test_force_response_failure_on_timeout;
+static uint8_t test_recv_timeout_then_error;
+static uint8_t test_write_overreport_mode;
+static err_t test_netbuf_data_result;
 static uint32_t test_netconn_new_calls;
 static uint32_t test_netconn_bind_calls;
 static uint32_t test_netconn_listen_calls;
@@ -39,6 +45,9 @@ static err_t test_write_result;
 static size_t test_bytes_written;
 static uint8_t test_write_full_size;
 static uint8_t test_write_partial_then_ok;
+static uint8_t test_write_error_after_partial;
+static const uint8_t *test_netbuf_second_data;
+static u16_t test_netbuf_second_length;
 static const uint8_t *test_receive_data;
 static u16_t test_receive_length;
 static const uint8_t *test_receive_data_second;
@@ -140,7 +149,7 @@ err_t netconn_accept(struct netconn *connection, struct netconn **new_connection
         longjmp(test_jump_buffer, 1);
     }
     if (test_accept_result == ERR_OK) {
-        *new_connection = &test_client;
+        *new_connection = test_accept_returns_null != 0U ? NULL : &test_client;
     }
     return test_accept_result;
 }
@@ -148,6 +157,12 @@ err_t netconn_accept(struct netconn *connection, struct netconn **new_connection
 err_t netconn_recv(struct netconn *connection, struct netbuf **buffer) {
     (void)connection;
     ++test_netconn_recv_calls;
+    if (test_jump_active != 0U && test_stop_on_second_recv != 0U && test_netconn_recv_calls > 1U) {
+        longjmp(test_jump_buffer, 1);
+    }
+    if (test_recv_timeout_then_error != 0U) {
+        return test_netconn_recv_calls == 1U ? ERR_TIMEOUT : ERR_CONN;
+    }
     if (test_receive_data != NULL && test_netconn_recv_calls == 1U) {
         test_netbuf.data = test_receive_data;
         test_netbuf.length = test_receive_length;
@@ -170,6 +185,10 @@ err_t netconn_recv(struct netconn *connection, struct netbuf **buffer) {
         return ERR_OK;
     }
     *buffer = NULL;
+    if (test_force_response_failure_on_timeout != 0U && test_recv_result == ERR_TIMEOUT) {
+        test_decoder_diagnostics.response_queue_overflows = 1U;
+        test_decoder_failure_connection_id = 1U;
+    }
     return test_recv_result;
 }
 
@@ -194,12 +213,22 @@ err_t netconn_write_partly(
         reported_bytes = test_netconn_write_calls == 1U && size > 3U ? 3U : size;
         result = ERR_OK;
     }
-    if (reported_bytes > size) {
+    if (test_write_error_after_partial != 0U) {
+        reported_bytes = test_netconn_write_calls == 1U && size > 3U ? 3U : 0U;
+        result = test_netconn_write_calls == 1U ? ERR_OK : ERR_BUF;
+    }
+    if (test_write_overreport_mode == 1U) {
+        reported_bytes = size + 1U;
+    } else if (test_write_overreport_mode == 2U) {
+        reported_bytes = test_netconn_write_calls == 1U && size > 3U ? 3U : size + 1U;
+    }
+    if (reported_bytes > size && test_write_overreport_mode == 0U) {
         reported_bytes = size;
     }
-    if (reported_bytes <= sizeof(test_captured_response) - test_captured_response_length) {
-        memcpy(&test_captured_response[test_captured_response_length], data, reported_bytes);
-        test_captured_response_length += reported_bytes;
+    size_t captured_bytes = reported_bytes > size ? size : reported_bytes;
+    if (captured_bytes <= sizeof(test_captured_response) - test_captured_response_length) {
+        memcpy(&test_captured_response[test_captured_response_length], data, captured_bytes);
+        test_captured_response_length += captured_bytes;
     }
     *bytes_written = reported_bytes;
     return result;
@@ -296,16 +325,28 @@ void command_decoder_get_response_queue_failure(uint32_t *generation, uint32_t *
 void netbuf_first(struct netbuf *buffer) { buffer->current = 0; }
 
 int8_t netbuf_next(struct netbuf *buffer) {
+    if (buffer->current == 0 && test_netbuf_second_data != NULL) {
+        buffer->current = 1;
+        return 0;
+    }
     buffer->current = -1;
     return -1;
 }
 
 err_t netbuf_data(struct netbuf *buffer, void **data, u16_t *length) {
+    if (test_netbuf_data_result != ERR_OK) {
+        return test_netbuf_data_result;
+    }
     if (buffer->current < 0) {
         return ERR_BUF;
     }
-    *data = (void *)buffer->data;
-    *length = buffer->length;
+    if (buffer->current == 1) {
+        *data = (void *)test_netbuf_second_data;
+        *length = test_netbuf_second_length;
+    } else {
+        *data = (void *)buffer->data;
+        *length = buffer->length;
+    }
     return ERR_OK;
 }
 
@@ -325,6 +366,12 @@ static void reset_fixture(void) {
     test_stop_on_second_new = 0U;
     test_stop_on_second_accept = 0U;
     test_stop_on_third_accept = 0U;
+    test_stop_on_second_recv = 0U;
+    test_accept_returns_null = 0U;
+    test_force_response_failure_on_timeout = 0U;
+    test_recv_timeout_then_error = 0U;
+    test_write_overreport_mode = 0U;
+    test_netbuf_data_result = ERR_OK;
     test_netconn_new_calls = 0U;
     test_netconn_bind_calls = 0U;
     test_netconn_listen_calls = 0U;
@@ -344,6 +391,9 @@ static void reset_fixture(void) {
     test_bytes_written = 0U;
     test_write_full_size = 1U;
     test_write_partial_then_ok = 0U;
+    test_write_error_after_partial = 0U;
+    test_netbuf_second_data = NULL;
+    test_netbuf_second_length = 0U;
     test_receive_data = NULL;
     test_receive_length = 0U;
     test_receive_data_second = NULL;
@@ -744,6 +794,215 @@ static void test_response_error(void) {
     expect_u32(test_netconn_close_calls, 1U, "connection closes after incomplete response write");
 }
 
+static void test_command_task_internal_edges(void) {
+    volatile uint32_t counter = UINT32_MAX;
+    command_counter_increment(&counter);
+    expect_u32(counter, UINT32_MAX, "command counter increment saturates");
+    counter = UINT32_MAX - 1U;
+    command_counter_add(&counter, 2U);
+    expect_u32(counter, UINT32_MAX, "command counter addition saturates on overflow");
+    counter = 3U;
+    command_counter_add(&counter, 4U);
+    expect_u32(counter, 7U, "command counter addition succeeds below saturation");
+    if (SIZE_MAX > UINT32_MAX) {
+        counter = 0U;
+        command_counter_add(&counter, (size_t)UINT32_MAX + 1U);
+        expect_u32(counter, UINT32_MAX, "command counter addition saturates for oversized size_t");
+    }
+
+    reset_fixture();
+    command_task_next_connection_id = UINT32_MAX;
+    expect_u32(command_task_next_connection(), 1U, "connection id skips zero after wraparound");
+    command_task_record_frame_error(COMMAND_FRAME_VALID, NULL);
+    command_task_record_frame_error(COMMAND_FRAME_INVALID_MAGIC, NULL);
+    command_task_record_frame_error(COMMAND_FRAME_INVALID_LENGTH, NULL);
+    command_task_record_frame_error(COMMAND_FRAME_INVALID_CRC, NULL);
+    command_task_record_frame_error(COMMAND_FRAME_INVALID_ARGUMENT, NULL);
+    expect_u32(command_task_diagnostics.invalid_magic, 1U, "invalid magic callback counter");
+    expect_u32(command_task_diagnostics.invalid_frame_length, 1U, "invalid length callback counter");
+    expect_u32(command_task_diagnostics.invalid_crc, 1U, "invalid CRC callback counter");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, COMMAND_FRAME_INVALID_ARGUMENT, "unclassified frame error updates last error");
+
+    uint8_t frame[COMMAND_MAX_FRAME_SIZE];
+    const size_t frame_length = command_protocol_build_frame(
+        frame,
+        sizeof(frame),
+        COMMAND_MESSAGE_TYPE_PING,
+        60U,
+        NULL,
+        0U
+    );
+    command_task_active_connection_id = 91U;
+    command_task_process_frame(frame, frame_length, NULL);
+    expect_u32(test_decoder_response_count, 1U, "frame without parser context is submitted");
+    expect_u32(test_decoder_responses[0].connection_id, 91U, "frame without parser context uses active connection");
+
+    CommandTaskParserContext_t parser_context = {.connection_id = 92U, .disconnect_requested = 0U};
+    command_task_process_frame(frame, frame_length, &parser_context);
+    expect_u32(test_decoder_responses[1].connection_id, 92U, "frame parser context supplies connection id");
+    parser_context.disconnect_requested = 1U;
+    command_task_process_frame(frame, frame_length, &parser_context);
+    expect_u32(command_task_diagnostics.complete_frames_received, 3U, "frames after disconnect request are counted and ignored");
+
+    frame[0] ^= 1U;
+    parser_context.disconnect_requested = 0U;
+    command_task_process_frame(frame, frame_length, &parser_context);
+    expect_u32(command_task_diagnostics.invalid_magic, 2U, "invalid decoded frame is recorded");
+    command_task_get_diagnostics(NULL);
+    CommandTaskDiagnostics diagnostics;
+    command_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.port, COMMAND_NETWORK_TASK_PORT, "diagnostics getter copies configured port");
+
+    reset_fixture();
+    command_task_active_connection_id = 93U;
+    test_fail_request_queue = 1U;
+    (void)command_protocol_build_frame(frame, sizeof(frame), COMMAND_MESSAGE_TYPE_PING, 62U, NULL, 0U);
+    command_task_process_frame(frame, frame_length, NULL);
+    expect_u32(command_task_diagnostics.decoder_queue_errors, 1U, "request queue failure is counted without parser context");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_MEM, "request queue failure records memory error");
+}
+
+static void test_response_write_and_netbuf_edges(void) {
+    reset_fixture();
+    CommandTaskResponseDTO_t response = {.length = 1U};
+    expect_u32(command_task_send_response(NULL, &response), 0U, "null client is rejected");
+    expect_u32(command_task_send_response(&test_client, NULL), 0U, "null response is rejected");
+    response.length = 0U;
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "empty response is rejected");
+    response.length = (uint16_t)(sizeof(response.frame) + 1U);
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "oversized response is rejected");
+
+    response.length = 14U;
+    test_write_overreport_mode = 1U;
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "over-reported first write is rejected");
+    expect_u32(command_task_diagnostics.partial_writes, 0U, "first over-report is not marked partial");
+
+    reset_fixture();
+    response.length = 14U;
+    test_write_overreport_mode = 2U;
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "over-report after partial write is rejected");
+    expect_u32(command_task_diagnostics.partial_writes, 1U, "over-report after partial write increments partial counter");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ARG, "over-reported write records argument error");
+
+    reset_fixture();
+    response.length = 14U;
+    test_write_full_size = 0U;
+    test_bytes_written = 0U;
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "zero-progress successful write is rejected");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "zero-progress write maps to buffer error");
+
+    reset_fixture();
+    response.length = 14U;
+    test_write_result = ERR_BUF;
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "full-length write with error is rejected");
+    expect_u32(command_task_diagnostics.partial_writes, 0U, "full-length write error is not marked partial");
+
+    reset_fixture();
+    response.length = 14U;
+    test_write_error_after_partial = 1U;
+    expect_u32(command_task_send_response(&test_client, &response), 0U, "write error after partial progress is rejected");
+    expect_u32(command_task_diagnostics.partial_writes, 1U, "write error after progress is marked partial");
+
+    reset_fixture();
+    test_netbuf.data = NULL;
+    test_netbuf.length = 4U;
+    test_netbuf.current = 0;
+    expect_u32(command_task_process_netbuf(NULL, NULL), 1U, "null netbuf is ignored");
+    expect_u32(command_task_process_netbuf(&test_netbuf, NULL), 1U, "null netbuf data is skipped");
+    test_netbuf.data = (const uint8_t[]){1U};
+    test_netbuf.length = 0U;
+    expect_u32(command_task_process_netbuf(&test_netbuf, NULL), 1U, "empty netbuf data is skipped");
+    test_netbuf.length = 1U;
+    test_netbuf_data_result = ERR_BUF;
+    expect_u32(command_task_process_netbuf(&test_netbuf, NULL), 0U, "netbuf data extraction error is returned");
+    expect_u32(command_task_diagnostics.recv_errors, 1U, "netbuf extraction error increments receive counter");
+
+    reset_fixture();
+    uint8_t ping[COMMAND_MAX_FRAME_SIZE];
+    const size_t ping_length = command_protocol_build_frame(
+        ping,
+        sizeof(ping),
+        COMMAND_MESSAGE_TYPE_PING,
+        61U,
+        NULL,
+        0U
+    );
+    test_netbuf.data = ping;
+    test_netbuf.length = 3U;
+    test_netbuf.current = 0;
+    test_netbuf_second_data = &ping[3];
+    test_netbuf_second_length = (u16_t)(ping_length - 3U);
+    CommandTaskParserContext_t parser_context = {.connection_id = 94U, .disconnect_requested = 0U};
+    expect_u32(command_task_process_netbuf(&test_netbuf, &parser_context), 1U, "multi-part netbuf is fully processed");
+    expect_u32(test_decoder_response_count, 1U, "frame spanning netbuf parts is submitted once");
+
+    reset_fixture();
+    test_netbuf.data = ping;
+    test_netbuf.length = (u16_t)ping_length;
+    test_netbuf.current = 0;
+    expect_u32(command_task_process_netbuf(&test_netbuf, NULL), 1U, "netbuf with null parser context is processed");
+    test_netbuf.data = ping;
+    test_netbuf.length = 1U;
+    test_netbuf.current = 0;
+    expect_u32(command_task_process_netbuf(&test_netbuf, NULL), 1U, "short follow-up netbuf is processed");
+    expect_u32(command_task_diagnostics.buffer_max_bytes, (uint32_t)ping_length, "buffer high-water mark is not reduced");
+}
+
+static void test_listener_accept_and_receive_edges(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    test_accept_returns_null = 1U;
+    test_stop_on_second_new = 1U;
+    expect_u32((uint32_t)run_command_task_until_jump(&context), 1U, "null accepted client path");
+    expect_u32(command_task_diagnostics.accept_errors, 1U, "null accepted client increments accept counter");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_CONN, "null accepted client records connection error");
+
+    reset_fixture();
+    test_recv_timeout_then_error = 1U;
+    test_stop_on_second_accept = 1U;
+    expect_u32((uint32_t)run_command_task_until_jump(&context), 1U, "receive timeout keeps connection open");
+    expect_u32(test_netconn_recv_calls, 2U, "timeout path continues to receive");
+    expect_u32(test_netconn_close_calls, 1U, "receive error after timeout closes client");
+
+    reset_fixture();
+    test_recv_result = ERR_TIMEOUT;
+    test_force_response_failure_on_timeout = 1U;
+    test_stop_on_second_accept = 1U;
+    expect_u32((uint32_t)run_command_task_until_jump(&context), 1U, "timeout response queue failure closes client");
+    expect_u32(test_netconn_close_calls, 1U, "queue failure during timeout closes client");
+
+    reset_fixture();
+    test_recv_result = ERR_MEM;
+    test_stop_on_second_accept = 1U;
+    expect_u32((uint32_t)run_command_task_until_jump(&context), 1U, "receive error is handled");
+    expect_u32(command_task_diagnostics.recv_errors, 1U, "receive error increments diagnostic");
+
+    reset_fixture();
+    test_recv_result = ERR_OK;
+    test_stop_on_second_accept = 1U;
+    expect_u32((uint32_t)run_command_task_until_jump(&context), 1U, "successful receive with null buffer is handled");
+    expect_u32(command_task_diagnostics.recv_errors, 1U, "null receive buffer increments diagnostic");
+
+    reset_fixture();
+    CommandTask(NULL);
+    expect_u32(test_error_handler_calls, 1U, "null task context calls error handler");
+    reset_fixture();
+    NetworkTaskContext invalid_context = {.lwip_flags = NULL};
+    CommandTask(&invalid_context);
+    expect_u32(test_error_handler_calls, 1U, "null event flags call error handler");
+}
+
+static void test_stale_queued_response_is_discarded(void) {
+    reset_fixture();
+    test_decoder_responses[0].connection_id = 100U;
+    test_decoder_responses[0].length = 0U;
+    test_decoder_response_count = 1U;
+    expect_u32(command_task_drain_responses(&test_client, 101U), 1U, "stale connection response is discarded");
+    expect_u32(test_netconn_write_calls, 0U, "stale response is not sent to current connection");
+    expect_u32(test_decoder_response_count, 0U, "stale response is drained from queue");
+}
+
 int main(void) {
     test_wait_and_listener_errors();
     test_ping_receive_and_response();
@@ -757,6 +1016,10 @@ int main(void) {
     test_partial_frame_is_discarded_on_reconnect();
     test_rejected_command();
     test_response_error();
+    test_command_task_internal_edges();
+    test_response_write_and_netbuf_edges();
+    test_listener_accept_and_receive_edges();
+    test_stale_queued_response_is_discarded();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Command task unit tests failed: %u\n", test_failures);
