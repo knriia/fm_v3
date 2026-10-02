@@ -8,7 +8,7 @@ typedef struct {
 } EthernetRxDiagnostics;
 
 #define ETHERNETIF_INPUT_THREAD_STACK_SIZE_BYTES 1024U
-#define ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES 1024U
+#define ETHERNETIF_LINK_THREAD_STACK_SIZE_BYTES 2048U
 
 void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics);
 void Error_Handler(void);

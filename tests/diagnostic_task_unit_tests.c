@@ -551,6 +551,11 @@ static void test_diagnostic_task_network_paths(void) {
     );
     expect_u32(test_captured_frame.payload.sequence, 1U, "first diagnostic frame sequence");
     expect_u32(
+        test_captured_frame.payload.eth_link.runtime.stack_size_bytes,
+        2048U,
+        "EthLink diagnostic stack size"
+    );
+    expect_u32(
         test_captured_frame.payload.telemetry_task.runtime.stack_size_bytes,
         TELEMETRY_TASK_STACK_SIZE_BYTES,
         "telemetry task diagnostic stack size"
