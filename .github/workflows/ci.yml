@@ -18,16 +18,87 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install test toolchain
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y clang ninja-build
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y clang llvm ninja-build
 
       - name: Configure tests
-        run: cmake -S . -B build-tests -G Ninja -DCMAKE_C_COMPILER=clang -DBUILD_TESTING=ON
+        run: cmake -S . -B build-tests -G Ninja -DCMAKE_C_COMPILER=clang -DBUILD_TESTING=ON -DFM_V3_ENABLE_LLVM_COVERAGE=ON -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build tests
         run: cmake --build build-tests --parallel
 
+      - name: Prepare coverage profiles
+        run: mkdir -p build-tests/coverage/profiles
+
       - name: Run tests
+        env:
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/build-tests/coverage/profiles/%p.profraw
         run: ctest --test-dir build-tests --output-on-failure
+
+      - name: Generate LLVM coverage report
+        if: always()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          profiles=(build-tests/coverage/profiles/*.profraw)
+          if ((${#profiles[@]} == 0)); then
+            echo "::error::No LLVM coverage profiles were produced"
+            exit 1
+          fi
+
+          report_dir=build-tests/coverage/report
+          mkdir -p "$report_dir/html"
+          profile_data="$report_dir/coverage.profdata"
+          llvm-profdata merge -sparse "${profiles[@]}" -o "$profile_data"
+
+          test_binaries=(
+            build-tests/tests/diagnostic_protocol_tests
+            build-tests/tests/diagnostic_task_unit_tests
+            build-tests/tests/startup_task_unit_tests
+            build-tests/tests/telemetry_protocol_tests
+            build-tests/tests/telemetry_task_unit_tests
+            build-tests/tests/command_protocol_tests
+            build-tests/tests/command_task_unit_tests
+            build-tests/tests/command_decoder_task_unit_tests
+          )
+          object_args=()
+          for binary in "${test_binaries[@]:1}"; do
+            object_args+=("--object=$binary")
+          done
+          source_filter='[/\\](tests|Drivers|Middlewares|Core)[/\\]|[/\\]LWIP[/\\]App[/\\]'
+
+          llvm-cov report "${test_binaries[0]}" \
+            "-instr-profile=$profile_data" \
+            --show-branch-summary \
+            "--ignore-filename-regex=$source_filter" \
+            "${object_args[@]}" > "$report_dir/coverage-summary.txt"
+
+          llvm-cov show "${test_binaries[0]}" \
+            "-instr-profile=$profile_data" \
+            --format=html \
+            --output-dir="$report_dir/html" \
+            "--ignore-filename-regex=$source_filter" \
+            "${object_args[@]}"
+
+          {
+            echo '## Host test coverage'
+            echo
+            echo 'Detailed HTML report: artifact `fm_v3-llvm-coverage`.'
+            echo
+            echo '```text'
+            cat "$report_dir/coverage-summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload LLVM coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm_v3-llvm-coverage
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build-tests/coverage/report/coverage-summary.txt
+            build-tests/coverage/report/html
 
   firmware-build:
     name: Firmware build
