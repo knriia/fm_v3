@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define configTOTAL_HEAP_SIZE 32768U
+#define configTOTAL_HEAP_SIZE 65536U
 #define pdFALSE 0
 #define pdTRUE 1
 #define pdPASS pdTRUE

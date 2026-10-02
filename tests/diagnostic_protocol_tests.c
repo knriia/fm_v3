@@ -483,8 +483,8 @@ static void test_system_diagnostics_collection(void) {
     expect_memory_region_invariant(&diagnostics.memory.d2, "D2 memory conservation");
     expect_memory_region_invariant(&diagnostics.memory.d3, "D3 memory conservation");
 
-    expect_u32(diagnostics.freertos.total_heap, 32768U, "FreeRTOS total heap");
-    expect_u32(diagnostics.freertos.used_heap, 13304U, "FreeRTOS used heap");
+    expect_u32(diagnostics.freertos.total_heap, 65536U, "FreeRTOS total heap");
+    expect_u32(diagnostics.freertos.used_heap, 46072U, "FreeRTOS used heap");
     expect_u32(diagnostics.freertos.free_heap, test_free_heap, "FreeRTOS free heap");
     expect_u32(diagnostics.freertos.minimum_free_heap, test_minimum_free_heap, "FreeRTOS minimum heap");
     expect_u32(diagnostics.freertos.task_count, test_task_count, "FreeRTOS task count");
