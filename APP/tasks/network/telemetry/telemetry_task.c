@@ -30,6 +30,20 @@ static void telemetry_counter_add(volatile uint32_t *counter, size_t value) {
     }
 }
 
+#ifdef FM_V3_ENABLE_TEST_HOOKS
+void telemetry_task_test_seed_counters(
+    uint32_t connections_accepted,
+    uint32_t send_attempts,
+    uint32_t send_successes,
+    uint32_t bytes_sent
+) {
+    telemetry_task_diagnostics.connections_accepted = connections_accepted;
+    telemetry_task_diagnostics.send_attempts = send_attempts;
+    telemetry_task_diagnostics.send_successes = send_successes;
+    telemetry_task_diagnostics.bytes_sent = bytes_sent;
+}
+#endif
+
 static void telemetry_record_error(err_t error) { telemetry_task_diagnostics.last_error = (int32_t)error; }
 
 void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
