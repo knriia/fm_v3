@@ -50,7 +50,6 @@ add_executable(command_task_unit_tests
 add_executable(command_decoder_task_unit_tests
     command_decoder_task_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
-    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/command_decoder_task.c
 )
 
 target_include_directories(diagnostic_protocol_tests PRIVATE
