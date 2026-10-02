@@ -19,6 +19,7 @@ static uint8_t test_jump_active;
 static uint32_t test_stop_on_delay;
 static uint32_t test_stop_on_second_new;
 static uint32_t test_stop_on_second_accept;
+static uint32_t test_succeed_after_first_write;
 static uint32_t test_netconn_new_calls;
 static uint32_t test_netconn_bind_calls;
 static uint32_t test_netconn_listen_calls;
@@ -28,6 +29,7 @@ static uint32_t test_netconn_close_calls;
 static uint32_t test_netconn_delete_calls;
 static uint32_t test_event_flags_result;
 static uint32_t test_new_returns_null;
+static int test_ethernet_diagnostics_result;
 static err_t test_bind_result;
 static err_t test_listen_result;
 static err_t test_accept_result;
@@ -79,7 +81,7 @@ void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics) {
 
 int EthernetPort_GetDiagnostics(EthernetPortDiagnostics *diagnostics) {
     (void)memset(diagnostics, 0, sizeof(*diagnostics));
-    return HAL_OK;
+    return test_ethernet_diagnostics_result;
 }
 
 void system_diagnostics_collect(SystemDiagnostics *diagnostics) { (void)memset(diagnostics, 0, sizeof(*diagnostics)); }
@@ -174,6 +176,10 @@ err_t netconn_write_partly(
     test_captured_write_size = size;
     if (size == sizeof(test_captured_frame)) {
         (void)memcpy(&test_captured_frame, data, sizeof(test_captured_frame));
+    }
+    if (test_succeed_after_first_write != 0U && test_netconn_write_calls > 1U) {
+        *bytes_written = size;
+        return ERR_OK;
     }
     *bytes_written = test_bytes_written;
     return test_write_result;
@@ -274,6 +280,13 @@ static void test_task_diagnostics_mapping(void) {
     expect_u32(diagnostics.state, 2U, "task state");
     expect_u32(diagnostics.runtime_ticks, 500U, "task runtime ticks");
 
+    minimum_free_bytes = 500U;
+    diagnostic_network_task_fill_stats(&diagnostics, test_current_task, &sample, 1024U, &minimum_free_bytes, 1000U);
+    expect_u32(diagnostics.stack_min_free_bytes, 400U, "task minimum free stack decreases");
+
+    diagnostic_network_task_fill_stats(&diagnostics, test_current_task, &sample, 1024U, &minimum_free_bytes, 1000U);
+    expect_u32(diagnostics.stack_min_free_bytes, 400U, "task minimum free stack remains unchanged");
+
     diagnostic_network_task_fill_stats(&diagnostics, NULL, &sample, 1024U, &minimum_free_bytes, 1000U);
     expect_u32((uint32_t)diagnostics.priority, (uint32_t)osPriorityError, "missing task priority");
     expect_u32(diagnostics.state, (uint32_t)osThreadError, "missing task state");
@@ -339,6 +352,13 @@ static void test_diagnostic_task_stats_mapping(void) {
     expect_u32(payload.diagnostic_task.snapshot_errors, 12U, "diagnostic snapshot errors");
     expect_u32((uint32_t)payload.diagnostic_task.last_error, (uint32_t)-4, "diagnostic last error");
 
+    runtime.stack_min_free_bytes = 500U;
+    diagnostic_task_fill_stats(&payload, &runtime);
+    expect_u32(payload.diagnostic_task.runtime.stack_min_free_bytes, 400U, "diagnostic task minimum free stack decreases");
+
+    diagnostic_task_fill_stats(&payload, &runtime);
+    expect_u32(payload.diagnostic_task.runtime.stack_min_free_bytes, 400U, "diagnostic task minimum free stack remains unchanged");
+
     diagnostic_record_error(&runtime, ERR_BUF);
     expect_u32((uint32_t)runtime.last_error, (uint32_t)ERR_BUF, "diagnostic error recording");
 }
@@ -349,6 +369,7 @@ static void reset_network_fixture(void) {
     test_stop_on_delay = 0U;
     test_stop_on_second_new = 0U;
     test_stop_on_second_accept = 0U;
+    test_succeed_after_first_write = 0U;
     test_netconn_new_calls = 0U;
     test_netconn_bind_calls = 0U;
     test_netconn_listen_calls = 0U;
@@ -358,6 +379,7 @@ static void reset_network_fixture(void) {
     test_netconn_delete_calls = 0U;
     test_event_flags_result = 0U;
     test_new_returns_null = 0U;
+    test_ethernet_diagnostics_result = HAL_OK;
     test_bind_result = ERR_OK;
     test_listen_result = ERR_OK;
     test_accept_result = ERR_OK;
@@ -382,11 +404,21 @@ static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
 
 static void test_diagnostic_task_network_paths(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    NetworkTaskContext context_without_lwip_flags = {.lwip_flags = NULL};
 
     reset_network_fixture();
     test_stop_on_delay = 1U;
     expect_u32((uint32_t)run_diagnostic_task_until_jump(NULL), 1U, "null task context must stop the task");
     expect_u32(test_error_handler_calls, 1U, "null task context error");
+
+    reset_network_fixture();
+    expect_u32(
+        (uint32_t)run_diagnostic_task_until_jump(&context_without_lwip_flags),
+        1U,
+        "null LwIP event flags must stop the task"
+    );
+    expect_u32(test_error_handler_calls, 1U, "null LwIP event flags error");
+    expect_u32(test_netconn_new_calls, 0U, "no socket without LwIP event flags");
 
     reset_network_fixture();
     test_event_flags_result = osFlagsErrorParameter;
@@ -705,6 +737,18 @@ static void test_diagnostic_task_network_paths(void) {
         (uint32_t)-83,
         "command decoder diagnostic last error"
     );
+
+    reset_network_fixture();
+    test_stop_on_delay = 1U;
+    test_ethernet_diagnostics_result = -1;
+    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "Ethernet snapshot error path");
+    expect_u32(test_captured_frame.payload.diagnostic_task.snapshot_errors, 1U, "Ethernet snapshot error count");
+    expect_u32(
+        test_captured_frame.payload.eth_link.ethernet_port.values[0],
+        0U,
+        "Ethernet diagnostics cleared after snapshot error"
+    );
+
     reset_network_fixture();
     test_write_result = ERR_BUF;
     test_bytes_written = 3U;
@@ -715,6 +759,34 @@ static void test_diagnostic_task_network_paths(void) {
     expect_u32(test_netconn_close_calls, 1U, "client closed after partial frame");
     expect_u32(test_netconn_delete_calls, 1U, "client deleted after partial frame");
     expect_u32(test_netconn_accept_calls, 2U, "accept retried after partial frame");
+
+    reset_network_fixture();
+    test_write_result = ERR_BUF;
+    test_succeed_after_first_write = 1U;
+    test_stop_on_delay = 1U;
+    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "full-length write error path");
+    expect_u32(test_netconn_write_calls, 2U, "write retried after full-length write error");
+    expect_u32(test_captured_frame.payload.diagnostic_task.send_errors, 1U, "full-length write error count");
+    expect_u32(test_captured_frame.payload.diagnostic_task.partial_writes, 0U, "full-length write is not partial");
+    expect_u32(
+        (uint32_t)test_captured_frame.payload.diagnostic_task.last_error,
+        (uint32_t)ERR_BUF,
+        "full-length write error recorded"
+    );
+
+    reset_network_fixture();
+    test_bytes_written = 3U;
+    test_succeed_after_first_write = 1U;
+    test_stop_on_delay = 1U;
+    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "short successful write path");
+    expect_u32(test_netconn_write_calls, 2U, "write retried after short successful write");
+    expect_u32(test_captured_frame.payload.diagnostic_task.send_errors, 1U, "short successful write error count");
+    expect_u32(test_captured_frame.payload.diagnostic_task.partial_writes, 1U, "short successful write is partial");
+    expect_u32(
+        (uint32_t)test_captured_frame.payload.diagnostic_task.last_error,
+        (uint32_t)ERR_BUF,
+        "short successful write normalized to buffer error"
+    );
 }
 
 int main(void) {

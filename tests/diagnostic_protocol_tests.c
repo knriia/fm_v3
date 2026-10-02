@@ -8,6 +8,7 @@
 #include "lwip/stats.h"
 #include "lwip_diagnostics.h"
 #include "lwip_udp_diagnostics.h"
+#include "lwipopts.h"
 #include "stm32h723xx.h"
 #include "stm32h7xx_hal.h"
 #include "system_diagnostics.h"
@@ -18,6 +19,8 @@
 
 #define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 2088U
 #define EXPECTED_DIAGNOSTIC_FRAME_SIZE 2096U
+
+_Static_assert(TCPIP_THREAD_STACKSIZE == 2048U, "Unexpected TCP/IP thread stack size");
 
 struct netif gnetif;
 struct stats lwip_stats;
@@ -334,7 +337,7 @@ static void test_lwip_diagnostics_collection(void) {
     expect_protocol_stats(&diagnostics.tcp, &lwip_stats.tcp, "TCP protocol statistics");
     expect_true(memcmp(&diagnostics.mib2, &lwip_stats.mib2, sizeof(diagnostics.mib2)) == 0, "MIB2 statistics");
 
-    expect_u32(diagnostics.tcpip_thread_stack_size, 1024U, "TCP/IP thread stack size");
+    expect_u32(diagnostics.tcpip_thread_stack_size, 2048U, "TCP/IP thread stack size");
     expect_u32(diagnostics.tcpip_thread_priority, 24U, "TCP/IP thread priority");
     expect_u32(diagnostics.tcpip_mbox_size, 6U, "TCP/IP mailbox size");
     expect_u32(diagnostics.tcp_mss, 1460U, "TCP MSS");

@@ -3,7 +3,7 @@
 
 #include "lwip/netif.h"
 
-#define TCPIP_THREAD_STACKSIZE 1024U
+#define TCPIP_THREAD_STACKSIZE 2048U
 #define TCPIP_THREAD_PRIO 24U
 #define TCPIP_MBOX_SIZE 6U
 #define TCP_MSS 1460U
