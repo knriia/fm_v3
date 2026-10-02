@@ -326,7 +326,7 @@ static void test_diagnostic_task_stats_mapping(void) {
 
     expect_u32(
         payload.diagnostic_task.runtime.stack_size_bytes,
-        DIAGNOSTIC_TASK_STACK_SIZE_BYTES,
+        5120U,
         "diagnostic task stack size"
     );
     expect_u32(payload.diagnostic_task.runtime.stack_free_bytes, 400U, "diagnostic task free stack");
