@@ -50,16 +50,12 @@ jobs:
           profile_data="$report_dir/coverage.profdata"
           llvm-profdata merge -sparse "${profiles[@]}" -o "$profile_data"
 
-          test_binaries=(
-            build-tests/tests/diagnostic_protocol_tests
-            build-tests/tests/diagnostic_task_unit_tests
-            build-tests/tests/startup_task_unit_tests
-            build-tests/tests/telemetry_protocol_tests
-            build-tests/tests/telemetry_task_unit_tests
-            build-tests/tests/command_protocol_tests
-            build-tests/tests/command_task_unit_tests
-            build-tests/tests/command_decoder_task_unit_tests
-          )
+          mapfile -t test_binaries < <(find build-tests/tests -maxdepth 1 -type f -executable -print | sort)
+          if ((${#test_binaries[@]} == 0)); then
+            echo "::error::No host test binaries were found"
+            exit 1
+          fi
+
           object_args=()
           for binary in "${test_binaries[@]:1}"; do
             object_args+=("--object=$binary")
@@ -71,6 +67,17 @@ jobs:
             --show-branch-summary \
             "--ignore-filename-regex=$source_filter" \
             "${object_args[@]}" > "$report_dir/coverage-summary.txt"
+
+          llvm-cov export "${test_binaries[0]}" \
+            "-instr-profile=$profile_data" \
+            --summary-only \
+            "--ignore-filename-regex=$source_filter" \
+            "${object_args[@]}" > "$report_dir/coverage.json"
+
+          set +e
+          python3 tests/check_coverage.py "$report_dir/coverage.json" 2>&1 | tee "$report_dir/coverage-gate.txt"
+          coverage_gate_status=${PIPESTATUS[0]}
+          set -e
 
           llvm-cov show "${test_binaries[0]}" \
             "-instr-profile=$profile_data" \
@@ -84,10 +91,14 @@ jobs:
             echo
             echo 'Detailed HTML report: artifact `fm_v3-llvm-coverage`.'
             echo
+            cat "$report_dir/coverage-gate.txt"
+            echo
             echo '```text'
             cat "$report_dir/coverage-summary.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$coverage_gate_status"
 
       - name: Upload LLVM coverage report
         if: always()
@@ -98,6 +109,7 @@ jobs:
           retention-days: 14
           path: |
             build-tests/coverage/report/coverage-summary.txt
+            build-tests/coverage/report/coverage-gate.txt
             build-tests/coverage/report/html
 
   firmware-build:

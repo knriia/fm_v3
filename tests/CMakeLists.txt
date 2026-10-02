@@ -165,25 +165,20 @@ if (FM_V3_ENABLE_LLVM_COVERAGE)
         message(FATAL_ERROR "FM_V3_ENABLE_LLVM_COVERAGE requires Clang")
     endif ()
 
-    set(FM_V3_HOST_TEST_TARGETS
-        diagnostic_protocol_tests
-        diagnostic_task_unit_tests
-        startup_task_unit_tests
-        telemetry_protocol_tests
-        telemetry_task_unit_tests
-        command_protocol_tests
-        command_task_unit_tests
-        command_decoder_task_unit_tests
-    )
-
+    get_property(FM_V3_HOST_TEST_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
     foreach (test_target IN LISTS FM_V3_HOST_TEST_TARGETS)
-        target_compile_options(${test_target} PRIVATE
-            -fprofile-instr-generate
-            -fcoverage-mapping
-        )
-        target_link_options(${test_target} PRIVATE
-            -fprofile-instr-generate
-        )
+        get_target_property(test_target_type ${test_target} TYPE)
+        if (test_target_type MATCHES "^(EXECUTABLE|STATIC_LIBRARY|OBJECT_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY)$")
+            target_compile_options(${test_target} PRIVATE
+                -fprofile-instr-generate
+                -fcoverage-mapping
+            )
+        endif ()
+        if (test_target_type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+            target_link_options(${test_target} PRIVATE
+                -fprofile-instr-generate
+            )
+        endif ()
     endforeach ()
 endif ()
 

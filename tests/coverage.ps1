@@ -75,28 +75,15 @@ if ($LASTEXITCODE -ne 0) {
     throw "llvm-profdata failed with exit code $LASTEXITCODE"
 }
 
-$testTargetNames = @(
-    'diagnostic_protocol_tests',
-    'diagnostic_task_unit_tests',
-    'startup_task_unit_tests',
-    'telemetry_protocol_tests',
-    'telemetry_task_unit_tests',
-    'command_protocol_tests',
-    'command_task_unit_tests',
-    'command_decoder_task_unit_tests'
-)
 $testDirectory = Join-Path $buildRoot 'tests'
 $testBinaries = @(
-    foreach ($targetName in $testTargetNames) {
-        $binary = Get-ChildItem -LiteralPath $testDirectory -Filter "$targetName.exe" -File -Recurse |
-            Where-Object { $_.BaseName -eq $targetName } |
-            Select-Object -First 1
-        if ($null -eq $binary) {
-            throw "Could not find the built test executable '$targetName'"
-        }
-        $binary.FullName
-    }
+    Get-ChildItem -LiteralPath $testDirectory -Filter '*_tests.exe' -File -Recurse |
+        Sort-Object FullName |
+        Select-Object -ExpandProperty FullName
 )
+if ($testBinaries.Count -eq 0) {
+    throw "Could not find any host test executables in '$testDirectory'"
+}
 
 $objectArguments = @(
     foreach ($binary in ($testBinaries | Select-Object -Skip 1)) {
