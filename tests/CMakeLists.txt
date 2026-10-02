@@ -16,6 +16,7 @@ add_executable(diagnostic_protocol_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic/system_diagnostics.c
     ${CMAKE_CURRENT_LIST_DIR}/../LWIP/Target/lwip_udp_diagnostics.c
 )
+target_compile_definitions(diagnostic_protocol_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
 
 add_executable(diagnostic_task_unit_tests
     diagnostic_task_unit_tests.c
@@ -191,6 +192,7 @@ add_test(NAME diagnostic_task_unit_tests COMMAND diagnostic_task_unit_tests)
 add_test(NAME startup_task_success COMMAND startup_task_unit_tests success)
 add_test(NAME startup_task_event_error COMMAND startup_task_unit_tests event_error)
 add_test(NAME startup_task_null_context COMMAND startup_task_unit_tests null_context)
+add_test(NAME startup_task_null_flag_handle COMMAND startup_task_unit_tests null_flag_handle)
 add_test(NAME telemetry_protocol_tests COMMAND telemetry_protocol_tests)
 add_test(NAME telemetry_task_reconnect COMMAND telemetry_task_unit_tests reconnect)
 add_test(NAME telemetry_task_wait_error COMMAND telemetry_task_unit_tests wait_error)

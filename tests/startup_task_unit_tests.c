@@ -73,6 +73,8 @@ static int run_success_case(void) {
     StartupTaskDiagnostics diagnostics = {0};
     osEventFlagsId_t lwip_flags = (osEventFlagsId_t)(uintptr_t)1U;
 
+    startup_task_get_diagnostics(NULL);
+
     test_jump_active = 1U;
     if (setjmp(test_jump_buffer) == 0) {
         StartStartupTask(&lwip_flags);
@@ -126,6 +128,25 @@ static int run_null_context_case(void) {
     return test_failures == 0U ? 0 : 1;
 }
 
+static int run_null_flag_handle_case(void) {
+    StartupTaskDiagnostics diagnostics = {0};
+    osEventFlagsId_t lwip_flags = NULL;
+
+    test_jump_active = 1U;
+    if (setjmp(test_jump_buffer) == 0) {
+        StartStartupTask(&lwip_flags);
+    }
+    test_jump_active = 0U;
+
+    startup_task_get_diagnostics(&diagnostics);
+    expect_u32(test_lwip_init_calls, 1U, "MX_LWIP_Init calls");
+    expect_u32(test_event_flags_set_calls, 0U, "osEventFlagsSet calls");
+    expect_u32(test_gpio_toggle_calls, 0U, "LED toggle calls");
+    expect_u32(test_error_handler_calls, 1U, "Error_Handler calls");
+    expect_diagnostics(&diagnostics, 1U, 0U, 0U);
+    return test_failures == 0U ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         (void)fprintf(stderr, "Expected one test case argument\n");
@@ -140,6 +161,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "null_context") == 0) {
         return run_null_context_case();
+    }
+    if (strcmp(argv[1], "null_flag_handle") == 0) {
+        return run_null_flag_handle_case();
     }
 
     (void)fprintf(stderr, "Unknown test case: %s\n", argv[1]);

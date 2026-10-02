@@ -12,6 +12,7 @@
 #include "stm32h723xx.h"
 #include "stm32h7xx_hal.h"
 #include "system_diagnostics.h"
+#include "diagnostics_test_hooks.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -271,6 +272,11 @@ static void test_udp_packet_counter(void) {
 
     lwip_udp_diagnostics_record_packet();
     expect_u32(lwip_udp_diagnostics_get_packet_count(), 2U, "UDP packet counter after second packet");
+
+    lwip_udp_diagnostics_test_set_packet_count(UINT32_MAX);
+    lwip_udp_diagnostics_record_packet();
+    expect_u32(lwip_udp_diagnostics_get_packet_count(), UINT32_MAX, "UDP packet counter saturation");
+    lwip_udp_diagnostics_test_set_packet_count(2U);
 }
 
 static void test_lwip_diagnostics_collection(void) {
@@ -372,6 +378,30 @@ static void test_lwip_diagnostics_collection(void) {
 
 static void expect_memory_region_invariant(const MemoryRegionDiagnostics *region, const char *name) {
     expect_u32(region->used_bytes + region->reserved_bytes + region->free_bytes, region->total_bytes, name);
+}
+
+static void test_system_diagnostics_memory_clamping(void) {
+    MemoryRegionDiagnostics region = {0};
+
+    system_diagnostics_test_collect_memory(NULL);
+
+    system_diagnostics_test_fill_memory_region(&region, 1000U, 100U, 900U, 25U);
+    expect_u32(region.used_bytes, 0U, "memory usage below region base is clamped to zero");
+    expect_u32(region.reserved_bytes, 25U, "memory reservation below available capacity");
+    expect_u32(region.free_bytes, 75U, "free memory after reservation below region base");
+    expect_memory_region_invariant(&region, "memory conservation below region base");
+
+    system_diagnostics_test_fill_memory_region(&region, 1000U, 100U, 1050U, 20U);
+    expect_u32(region.used_bytes, 50U, "memory usage within region");
+    expect_u32(region.reserved_bytes, 20U, "memory reservation within available capacity");
+    expect_u32(region.free_bytes, 30U, "free memory within region");
+    expect_memory_region_invariant(&region, "memory conservation within region");
+
+    system_diagnostics_test_fill_memory_region(&region, 1000U, 100U, 1100U, 5U);
+    expect_u32(region.used_bytes, 100U, "memory usage is capped at region end");
+    expect_u32(region.reserved_bytes, 0U, "memory reservation is capped at remaining capacity");
+    expect_u32(region.free_bytes, 0U, "no free memory after region end");
+    expect_memory_region_invariant(&region, "memory conservation at region end");
 }
 
 static void test_system_diagnostics_collection(void) {
@@ -514,12 +544,26 @@ static void test_system_diagnostics_collection(void) {
     system_diagnostics_collect(&diagnostics);
     expect_u32(diagnostics.freertos.idle_runtime_ticks, 0U, "missing idle task runtime");
     expect_u32(diagnostics.freertos.cpu_usage_percent, 0U, "CPU usage without idle task");
+
+    test_idle_task_handle = (TaskHandle_t)(uintptr_t)1U;
+    test_total_runtime_ticks = 3100U;
+    test_idle_runtime_ticks = 100U;
+    system_diagnostics_collect(&diagnostics);
+    test_total_runtime_ticks = 3200U;
+    test_idle_runtime_ticks = 300U;
+    system_diagnostics_collect(&diagnostics);
+    expect_u32(diagnostics.freertos.cpu_usage_percent, 0U, "idle runtime delta above total runtime delta");
+
+    test_free_heap = 65537U;
+    system_diagnostics_collect(&diagnostics);
+    expect_u32(diagnostics.freertos.used_heap, 0U, "used heap is clamped when free heap exceeds total heap");
 }
 
 int main(void) {
     test_network_frame_header_contract();
     test_udp_packet_counter();
     test_lwip_diagnostics_collection();
+    test_system_diagnostics_memory_clamping();
     test_system_diagnostics_collection();
 
     if (test_failures != 0U) {
