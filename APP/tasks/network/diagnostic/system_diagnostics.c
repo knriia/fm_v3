@@ -93,6 +93,22 @@ static void system_diagnostics_collect_memory(MemoryDiagnostics *diagnostics) {
     );
 }
 
+#ifdef FM_V3_ENABLE_TEST_HOOKS
+void system_diagnostics_test_collect_memory(MemoryDiagnostics *diagnostics) {
+    system_diagnostics_collect_memory(diagnostics);
+}
+
+void system_diagnostics_test_fill_memory_region(
+    MemoryRegionDiagnostics *diagnostics,
+    uint32_t base_address,
+    uint32_t total_bytes,
+    uintptr_t used_end,
+    uint32_t reserved_bytes
+) {
+    system_diagnostics_fill_memory_region(diagnostics, base_address, total_bytes, used_end, reserved_bytes);
+}
+#endif
+
 static void system_diagnostics_collect_freertos(FreeRtosDiagnostics *diagnostics) {
     static TaskStatus_t task_statuses[SYSTEM_DIAGNOSTICS_MAX_TASKS];
     uint32_t total_runtime_ticks = 0U;
