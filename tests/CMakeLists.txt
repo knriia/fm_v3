@@ -37,6 +37,7 @@ add_executable(telemetry_task_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/telemetry/telemetry_dto.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/telemetry/telemetry_task.c
 )
+target_compile_definitions(telemetry_task_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
 add_executable(command_protocol_tests
     command_protocol_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
@@ -197,6 +198,15 @@ add_test(NAME telemetry_protocol_tests COMMAND telemetry_protocol_tests)
 add_test(NAME telemetry_task_reconnect COMMAND telemetry_task_unit_tests reconnect)
 add_test(NAME telemetry_task_wait_error COMMAND telemetry_task_unit_tests wait_error)
 add_test(NAME telemetry_task_null_context COMMAND telemetry_task_unit_tests null_context)
+add_test(NAME telemetry_task_null_flag_handle COMMAND telemetry_task_unit_tests null_flag_handle)
+add_test(NAME telemetry_task_allocation_error COMMAND telemetry_task_unit_tests allocation_error)
+add_test(NAME telemetry_task_bind_error COMMAND telemetry_task_unit_tests bind_error)
+add_test(NAME telemetry_task_listen_error COMMAND telemetry_task_unit_tests listen_error)
+add_test(NAME telemetry_task_accept_error COMMAND telemetry_task_unit_tests accept_error)
+add_test(NAME telemetry_task_short_write COMMAND telemetry_task_unit_tests short_write)
+add_test(NAME telemetry_task_full_write_error COMMAND telemetry_task_unit_tests full_write_error)
+add_test(NAME telemetry_task_counter_saturation COMMAND telemetry_task_unit_tests counter_saturation)
+add_test(NAME telemetry_task_oversized_write_count COMMAND telemetry_task_unit_tests oversized_write_count)
 add_test(NAME command_protocol_tests COMMAND command_protocol_tests)
 add_test(NAME command_task_unit_tests COMMAND command_task_unit_tests)
 add_test(NAME command_decoder_task_unit_tests COMMAND command_decoder_task_unit_tests)

@@ -40,10 +40,17 @@ int main(void) {
     expect_i32(frame.payload.y, coordinates.y, "telemetry y");
     expect_i32(frame.payload.z, coordinates.z, "telemetry z");
     expect_u32(frame.payload.is_test_data, 0U, "telemetry test data flag");
+    expect_u32(frame.payload.reserved[0], 0U, "telemetry reserved byte 0");
+    expect_u32(frame.payload.reserved[1], 0U, "telemetry reserved byte 1");
+    expect_u32(frame.payload.reserved[2], 0U, "telemetry reserved byte 2");
     expect_u32(sizeof(frame), 28U, "telemetry frame size");
 
     telemetry_build_frame(&frame, UINT32_MAX, &coordinates);
     expect_u32(frame.payload.sequence, UINT32_MAX, "telemetry sequence maximum");
+
+    telemetry_build_frame(NULL, 7U, &coordinates);
+    telemetry_build_frame(&frame, 7U, NULL);
+    expect_u32(frame.payload.sequence, UINT32_MAX, "null coordinates leave telemetry frame unchanged");
 
     return test_failures == 0U ? 0 : 1;
 }
