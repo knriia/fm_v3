@@ -45,10 +45,11 @@ add_executable(command_protocol_tests
 add_executable(command_task_unit_tests
     command_task_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_decoder.c
 )
 
-add_executable(command_decoder_task_unit_tests
-    command_decoder_task_unit_tests.c
+add_executable(command_decoder_unit_tests
+    command_decoder_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
 )
 
@@ -108,7 +109,7 @@ target_include_directories(command_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
 )
 
-target_include_directories(command_decoder_task_unit_tests PRIVATE
+target_include_directories(command_decoder_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
@@ -153,7 +154,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wpedantic
     )
 
-    target_compile_options(command_decoder_task_unit_tests PRIVATE
+    target_compile_options(command_decoder_unit_tests PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -203,4 +204,4 @@ add_test(NAME telemetry_task_counter_saturation COMMAND telemetry_task_unit_test
 add_test(NAME telemetry_task_oversized_write_count COMMAND telemetry_task_unit_tests oversized_write_count)
 add_test(NAME command_protocol_tests COMMAND command_protocol_tests)
 add_test(NAME command_task_unit_tests COMMAND command_task_unit_tests)
-add_test(NAME command_decoder_task_unit_tests COMMAND command_decoder_task_unit_tests)
+add_test(NAME command_decoder_unit_tests COMMAND command_decoder_unit_tests)

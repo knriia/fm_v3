@@ -6,6 +6,7 @@
 #define COMMAND_NETWORK_TASK_PORT 2628
 #define COMMAND_TASK_STACK_SIZE_BYTES (1024U * 4U)
 #define COMMAND_TASK_RECEIVE_TIMEOUT_MS 10U
+#define COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS 1000U
 
 typedef struct {
     uint32_t port;
@@ -29,7 +30,7 @@ typedef struct {
     uint32_t listen_errors;
     uint32_t accept_errors;
     uint32_t recv_errors;
-    uint32_t decoder_queue_errors;
+    uint32_t decoder_errors;
     int32_t last_error;
 } CommandTaskDiagnostics;
 

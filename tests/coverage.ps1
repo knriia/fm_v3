@@ -106,6 +106,31 @@ if ($LASTEXITCODE -ne 0) {
 $report | Set-Content -LiteralPath $reportPath -Encoding UTF8
 $report
 
+$coverageJsonPath = Join-Path $runDirectory 'coverage.json'
+$exportArguments = @(
+    'export',
+    $testBinaries[0],
+    "-instr-profile=$profileData",
+    '--summary-only',
+    "--ignore-filename-regex=$sourceFilter"
+) + $objectArguments
+$coverageJson = & $llvmCov @exportArguments
+if ($LASTEXITCODE -ne 0) {
+    throw "llvm-cov export failed with exit code $LASTEXITCODE"
+}
+[System.IO.File]::WriteAllText(
+    $coverageJsonPath,
+    [string]::Join([Environment]::NewLine, $coverageJson),
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+$python = (Get-Command python -ErrorAction Stop).Source
+$coverageGatePath = Join-Path $runDirectory 'coverage-gate.txt'
+$coverageGateOutput = & $python (Join-Path $PSScriptRoot 'check_coverage.py') $coverageJsonPath
+$coverageGateExitCode = $LASTEXITCODE
+$coverageGateOutput | Set-Content -LiteralPath $coverageGatePath -Encoding UTF8
+$coverageGateOutput
+
 New-Item -ItemType Directory -Path $htmlDirectory -Force | Out-Null
 $htmlArguments = @(
     'show',
@@ -121,7 +146,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Text report: $reportPath"
+Write-Host "Coverage gate: $coverageGatePath"
 Write-Host "HTML report: $(Join-Path $htmlDirectory 'index.html')"
 if ($testExitCode -ne 0) {
     throw "CTest failed with exit code $testExitCode; coverage reports were still generated."
+}
+if ($coverageGateExitCode -ne 0) {
+    throw "100% line, function, and branch coverage gate failed with exit code $coverageGateExitCode."
 }
