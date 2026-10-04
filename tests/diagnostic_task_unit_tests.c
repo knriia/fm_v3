@@ -40,6 +40,7 @@ static DiagnosticFrameDTO_t test_captured_frame;
 static TelemetryTaskDiagnostics test_telemetry_diagnostics;
 static CommandTaskDiagnostics test_command_diagnostics;
 static CommandDecoderDiagnostics test_command_decoder_diagnostics;
+static CommandQueueDiagnostics_t test_command_queue_diagnostics;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -98,6 +99,9 @@ void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
 void command_task_get_diagnostics(CommandTaskDiagnostics *diagnostics) { *diagnostics = test_command_diagnostics; }
 void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
     *diagnostics = test_command_decoder_diagnostics;
+}
+void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
+    *diagnostics = test_command_queue_diagnostics;
 }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
@@ -390,6 +394,7 @@ static void reset_network_fixture(void) {
     test_telemetry_diagnostics = (TelemetryTaskDiagnostics){0};
     test_command_diagnostics = (CommandTaskDiagnostics){0};
     test_command_decoder_diagnostics = (CommandDecoderDiagnostics){0};
+    test_command_queue_diagnostics = (CommandQueueDiagnostics_t){0};
 }
 
 static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
@@ -528,6 +533,16 @@ static void test_diagnostic_task_network_paths(void) {
         .invalid_states = 81U,
         .response_queue_overflows = 82U,
         .last_error = -83,
+    };
+    test_command_queue_diagnostics = (CommandQueueDiagnostics_t){
+        .initialized = 1U,
+        .capacity = COMMAND_QUEUE_CAPACITY,
+        .queued = 73U,
+        .available = COMMAND_QUEUE_CAPACITY - 73U,
+        .max_queued = 91U,
+        .enqueued_total = 123U,
+        .full_rejections = 4U,
+        .enqueue_errors = 5U,
     };
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
@@ -742,6 +757,18 @@ static void test_diagnostic_task_network_paths(void) {
         (uint32_t)-83,
         "command decoder diagnostic last error"
     );
+    expect_u32(test_captured_frame.payload.command_queue.initialized, 1U, "command queue initialized diagnostic");
+    expect_u32(test_captured_frame.payload.command_queue.capacity, COMMAND_QUEUE_CAPACITY, "command queue capacity diagnostic");
+    expect_u32(test_captured_frame.payload.command_queue.queued, 73U, "command queue current occupancy diagnostic");
+    expect_u32(
+        test_captured_frame.payload.command_queue.available,
+        COMMAND_QUEUE_CAPACITY - 73U,
+        "command queue available slots diagnostic"
+    );
+    expect_u32(test_captured_frame.payload.command_queue.max_queued, 91U, "command queue maximum occupancy diagnostic");
+    expect_u32(test_captured_frame.payload.command_queue.enqueued_total, 123U, "command queue accepted total diagnostic");
+    expect_u32(test_captured_frame.payload.command_queue.full_rejections, 4U, "command queue full rejections diagnostic");
+    expect_u32(test_captured_frame.payload.command_queue.enqueue_errors, 5U, "command queue enqueue errors diagnostic");
 
     reset_network_fixture();
     test_stop_on_delay = 1U;

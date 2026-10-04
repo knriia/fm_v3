@@ -28,6 +28,7 @@
 #include "task_names.h"
 #include "telemetry_task.h"
 #include "command_task.h"
+#include "command/command_queue.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -99,6 +100,11 @@ void MX_FREERTOS_Init(void);
 
 void MX_FREERTOS_Init(void)
 {
+  if (command_queue_init() != osOK)
+  {
+    Error_Handler();
+  }
+
   lwip_ready_flags = osEventFlagsNew(NULL);
   if (lwip_ready_flags == NULL)
   {

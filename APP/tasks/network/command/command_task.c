@@ -1,5 +1,6 @@
 #include "command_task.h"
 
+#include "command/command_queue.h"
 #include "command_decoder.h"
 #include "command_protocol.h"
 #include "network_events.h"
@@ -537,8 +538,15 @@ void CommandTask(void *argument) {
                     if (decoder_result.type == COMMAND_DECODER_RESULT_COMMAND_READY) {
                         const CommandDTO_t *decoded_command = &decoder_result.command;
                         response_sequence = decoded_command->sequence;
-                        response_type = COMMAND_MESSAGE_TYPE_ACK;
-                        error_code = 0U;
+                        const CommandQueuePutResult_t queue_result = command_queue_try_send(decoded_command);
+                        if (queue_result == COMMAND_QUEUE_PUT_OK) {
+                            response_type = COMMAND_MESSAGE_TYPE_ACK;
+                            error_code = 0U;
+                        } else {
+                            response_type = COMMAND_MESSAGE_TYPE_ERROR;
+                            error_code = queue_result == COMMAND_QUEUE_PUT_FULL ? COMMAND_ERROR_QUEUE_FULL
+                                                                                : COMMAND_ERROR_INVALID_STATE;
+                        }
                     }
                     if (command_task_send_protocol_response(client, response_type, response_sequence, error_code) ==
                         0U) {

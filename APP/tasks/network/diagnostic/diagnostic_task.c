@@ -3,6 +3,7 @@
 //
 
 #include "diagnostic_task.h"
+#include "command/command_queue.h"
 #include "command_decoder.h"
 #include "command_task.h"
 #include "diagnostic_dto.h"
@@ -358,6 +359,7 @@ void DiagnosticTask(void *argument) {
                     diagnostic_frame.payload.eth_link.ethernet_port = (EthernetPortDiagnostics){0};
                 }
                 lwip_diagnostics_collect(&diagnostic_frame.payload.tcpip_thread.lwip);
+                command_queue_get_diagnostics(&diagnostic_frame.payload.command_queue);
                 diagnostic_collect_network_tasks(
                     &diagnostic_frame.payload,
                     &network_tasks_runtime,

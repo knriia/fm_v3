@@ -1,5 +1,6 @@
 #include "command_decoder.h"
 #include "command_protocol.h"
+#include "command/command_queue.h"
 #include "command_task.h"
 #include "FreeRTOS.h"
 #include "cmsis_os.h"
@@ -50,6 +51,9 @@ static uint8_t test_force_assembler_next;
 static uint8_t test_force_assembler_append_failure;
 static uint8_t test_force_assembler_consume_failure;
 static uint8_t test_force_decoder_invalid_argument;
+static CommandQueuePutResult_t test_command_queue_put_result;
+static uint32_t test_command_queue_put_calls;
+static CommandDTO_t test_queued_command;
 
 enum {
     TEST_WRITE_FULL = 0U,
@@ -316,6 +320,15 @@ static CommandDecoderResult_t test_command_decoder_decode_request(const CommandR
 #undef command_frame_assembler_append
 #undef command_frame_assembler_next
 
+CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command) {
+    ++test_command_queue_put_calls;
+    if (command == NULL) {
+        return COMMAND_QUEUE_PUT_ERROR;
+    }
+    test_queued_command = *command;
+    return test_command_queue_put_result;
+}
+
 static CommandFrameAssemblerEvent_t test_command_frame_assembler_next(const CommandFrameAssembler_t *assembler) {
     if (test_force_assembler_next == TEST_ASSEMBLER_NEXT_NEED_MORE) {
         test_force_assembler_next = TEST_ASSEMBLER_NEXT_REAL;
@@ -413,6 +426,9 @@ static void reset_fixture(void) {
     test_force_assembler_append_failure = 0U;
     test_force_assembler_consume_failure = 0U;
     test_force_decoder_invalid_argument = 0U;
+    test_command_queue_put_result = COMMAND_QUEUE_PUT_OK;
+    test_command_queue_put_calls = 0U;
+    test_queued_command = (CommandDTO_t){0};
     memset(test_receives, 0, sizeof(test_receives));
     memset(test_buffers, 0, sizeof(test_buffers));
     memset(test_captured_response, 0, sizeof(test_captured_response));
@@ -579,6 +595,7 @@ static void test_ping_ack_and_error_responses(void) {
     run_one_receive(frame, frame_length);
     expect_single_response(COMMAND_MESSAGE_TYPE_PONG, 41U, 0U);
     expect_u32(test_netconn_write_calls, 1U, "PING receives only one PONG");
+    expect_u32(test_command_queue_put_calls, 0U, "PING is not placed in the command queue");
     expect_u32(command_task_diagnostics.complete_frames_received, 1U, "complete PING is counted");
 
     reset_fixture();
@@ -586,6 +603,22 @@ static void test_ping_ack_and_error_responses(void) {
     run_one_receive(frame, frame_length);
     expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 42U, 0U);
     expect_u32(test_netconn_write_calls, 1U, "accepted command receives only one ACK");
+    expect_u32(test_command_queue_put_calls, 1U, "decoded command is submitted to the queue once");
+    expect_u32(test_queued_command.sequence, 42U, "queued command preserves sequence");
+    expect_u32(test_queued_command.code, COMMAND_CODE_STOP, "queued command preserves command code");
+
+    reset_fixture();
+    test_command_queue_put_result = COMMAND_QUEUE_PUT_FULL;
+    frame_length = build_stop_command(frame, 46U);
+    run_one_receive(frame, frame_length);
+    expect_single_response(COMMAND_MESSAGE_TYPE_ERROR, 46U, COMMAND_ERROR_QUEUE_FULL);
+    expect_u32(test_netconn_write_calls, 1U, "full queue returns one ERROR response");
+
+    reset_fixture();
+    test_command_queue_put_result = COMMAND_QUEUE_PUT_ERROR;
+    frame_length = build_stop_command(frame, 47U);
+    run_one_receive(frame, frame_length);
+    expect_single_response(COMMAND_MESSAGE_TYPE_ERROR, 47U, COMMAND_ERROR_INVALID_STATE);
 
     reset_fixture();
     const uint8_t unknown_payload[] = {0xFEU};

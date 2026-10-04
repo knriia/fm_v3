@@ -53,6 +53,12 @@ add_executable(command_decoder_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
 )
 
+add_executable(command_queue_unit_tests
+    command_queue_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/command/command_queue.c
+)
+target_compile_definitions(command_queue_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
+
 target_include_directories(diagnostic_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
@@ -117,6 +123,12 @@ target_include_directories(command_decoder_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
 )
 
+target_include_directories(command_queue_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
+)
+
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(diagnostic_protocol_tests PRIVATE
         -Wall
@@ -155,6 +167,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     )
 
     target_compile_options(command_decoder_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+    target_compile_options(command_queue_unit_tests PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -205,3 +222,4 @@ add_test(NAME telemetry_task_oversized_write_count COMMAND telemetry_task_unit_t
 add_test(NAME command_protocol_tests COMMAND command_protocol_tests)
 add_test(NAME command_task_unit_tests COMMAND command_task_unit_tests)
 add_test(NAME command_decoder_unit_tests COMMAND command_decoder_unit_tests)
+add_test(NAME command_queue_unit_tests COMMAND command_queue_unit_tests)
