@@ -28,7 +28,6 @@
 #include "task_names.h"
 #include "telemetry_task.h"
 #include "command_task.h"
-#include "command_decoder_task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -74,12 +73,6 @@ static const osThreadAttr_t telemetry_task_attr = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 
-static osThreadId_t command_decoder_task_handle;
-static const osThreadAttr_t command_decoder_task_attr = {
-  .name = COMMAND_DECODER_TASK_NAME,
-  .stack_size = COMMAND_DECODER_TASK_STACK_SIZE_BYTES,
-  .priority = (osPriority_t) osPriorityNormal,
-};
 static osThreadId_t command_task_handle;
 static const osThreadAttr_t command_task_attr = {
   .name = COMMAND_TASK_NAME,
@@ -125,16 +118,6 @@ void MX_FREERTOS_Init(void)
     Error_Handler();
   }
 
-  if (command_decoder_initialize() == 0U)
-  {
-    Error_Handler();
-  }
-
-  command_decoder_task_handle = osThreadNew(CommandDecoderTask, NULL, &command_decoder_task_attr);
-  if (command_decoder_task_handle == NULL)
-  {
-    Error_Handler();
-  }
   command_task_context.lwip_flags = lwip_ready_flags;
   command_task_handle = osThreadNew(CommandTask, &command_task_context, &command_task_attr);
   if (command_task_handle == NULL)

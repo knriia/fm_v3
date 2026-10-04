@@ -27,14 +27,14 @@ static void command_decode_header(const uint8_t *frame, CommandFrameHeaderDTO_t 
     header->sequence = command_read_u32_le(&frame[6]);
 }
 
-static void command_discard_prefix(CommandFrameParser_t *parser, size_t count) {
-    if (count >= parser->length) {
-        parser->length = 0U;
+static void command_assembler_discard_prefix(CommandFrameAssembler_t *assembler, size_t count) {
+    if (count >= assembler->length) {
+        assembler->length = 0U;
         return;
     }
 
-    memmove(parser->buffer, &parser->buffer[count], parser->length - count);
-    parser->length -= count;
+    memmove(assembler->buffer, &assembler->buffer[count], assembler->length - count);
+    assembler->length -= count;
 }
 
 uint32_t command_protocol_crc32(const uint8_t *data, size_t data_length) {
@@ -54,97 +54,90 @@ uint32_t command_protocol_crc32(const uint8_t *data, size_t data_length) {
     return crc ^ UINT32_MAX;
 }
 
-void command_frame_parser_init(CommandFrameParser_t *parser) {
-    if (parser != NULL) {
-        parser->length = 0U;
-        parser->max_length = 0U;
+void command_frame_assembler_init(CommandFrameAssembler_t *assembler) {
+    if (assembler != NULL) {
+        assembler->length = 0U;
+        assembler->max_length = 0U;
     }
 }
 
-static void command_frame_parser_process(
-    CommandFrameParser_t *parser,
-    CommandFrameCallback callback,
-    CommandFrameErrorCallback error_callback,
-    void *context
-) {
-    while (parser->length >= COMMAND_FRAME_HEADER_SIZE + COMMAND_FRAME_CRC_SIZE) {
-        const uint16_t magic = command_read_u16_le(&parser->buffer[0]);
-        if (magic != COMMAND_PROTOCOL_MAGIC) {
-            if (error_callback != NULL) {
-                error_callback(COMMAND_FRAME_INVALID_MAGIC, context);
-            }
-            command_discard_prefix(parser, 1U);
-            continue;
-        }
-
-        const uint16_t payload_length = command_read_u16_le(&parser->buffer[4]);
-        if (payload_length > COMMAND_MAX_PAYLOAD_SIZE) {
-            if (error_callback != NULL) {
-                error_callback(COMMAND_FRAME_INVALID_LENGTH, context);
-            }
-            command_discard_prefix(parser, 1U);
-            continue;
-        }
-
-        const size_t frame_length = COMMAND_FRAME_HEADER_SIZE + payload_length + COMMAND_FRAME_CRC_SIZE;
-        if (parser->length < frame_length) {
-            return;
-        }
-
-        const uint32_t received_crc = command_read_u32_le(&parser->buffer[COMMAND_FRAME_HEADER_SIZE + payload_length]);
-        const uint32_t calculated_crc = command_protocol_crc32(parser->buffer, frame_length - COMMAND_FRAME_CRC_SIZE);
-        if (received_crc != calculated_crc) {
-            if (error_callback != NULL) {
-                error_callback(COMMAND_FRAME_INVALID_CRC, context);
-            }
-            command_discard_prefix(parser, 1U);
-            continue;
-        }
-
-        if (callback != NULL) {
-            callback(parser->buffer, frame_length, context);
-        }
-        command_discard_prefix(parser, frame_length);
+size_t command_frame_assembler_append(CommandFrameAssembler_t *assembler, const uint8_t *data, size_t data_length) {
+    if (assembler == NULL || assembler->length > COMMAND_MAX_FRAME_SIZE || (data == NULL && data_length != 0U)) {
+        return 0U;
     }
+
+    const size_t available = COMMAND_MAX_FRAME_SIZE - assembler->length;
+    const size_t appended = data_length < available ? data_length : available;
+    if (appended != 0U) {
+        memcpy(&assembler->buffer[assembler->length], data, appended);
+        assembler->length += appended;
+        if (assembler->length > assembler->max_length) {
+            assembler->max_length = assembler->length;
+        }
+    }
+    return appended;
 }
 
-void command_frame_parser_feed_ex(
-    CommandFrameParser_t *parser,
-    const uint8_t *data,
-    size_t data_length,
-    CommandFrameCallback callback,
-    CommandFrameErrorCallback error_callback,
-    void *context
-) {
-    if (parser == NULL || (data == NULL && data_length != 0U)) {
-        if (error_callback != NULL) {
-            error_callback(COMMAND_FRAME_INVALID_ARGUMENT, context);
-        }
-        return;
+CommandFrameAssemblerEvent_t command_frame_assembler_next(const CommandFrameAssembler_t *assembler) {
+    CommandFrameAssemblerEvent_t event = {
+        .result = COMMAND_FRAME_ASSEMBLER_INVALID_ARGUMENT,
+        .validation = COMMAND_FRAME_INVALID_ARGUMENT,
+    };
+    if (assembler == NULL || assembler->length > COMMAND_MAX_FRAME_SIZE) {
+        return event;
     }
 
-    for (size_t index = 0U; index < data_length; ++index) {
-        if (parser->length == COMMAND_MAX_FRAME_SIZE) {
-            command_discard_prefix(parser, 1U);
-        }
-
-        parser->buffer[parser->length] = data[index];
-        ++parser->length;
-        if (parser->length > parser->max_length) {
-            parser->max_length = parser->length;
-        }
-        command_frame_parser_process(parser, callback, error_callback, context);
+    event.result = COMMAND_FRAME_ASSEMBLER_NEED_MORE;
+    event.validation = COMMAND_FRAME_VALID;
+    if (assembler->length < COMMAND_FRAME_HEADER_SIZE) {
+        return event;
     }
+
+    const uint16_t magic = command_read_u16_le(&assembler->buffer[0]);
+    if (magic != COMMAND_PROTOCOL_MAGIC) {
+        event.result = COMMAND_FRAME_ASSEMBLER_INVALID_FRAME;
+        event.frame = assembler->buffer;
+        event.frame_length = assembler->length;
+        event.consume_length = 1U;
+        event.validation = COMMAND_FRAME_INVALID_MAGIC;
+        return event;
+    }
+
+    const uint16_t payload_length = command_read_u16_le(&assembler->buffer[4]);
+    if (payload_length > COMMAND_MAX_PAYLOAD_SIZE) {
+        event.result = COMMAND_FRAME_ASSEMBLER_INVALID_FRAME;
+        event.frame = assembler->buffer;
+        event.frame_length = assembler->length;
+        event.consume_length = 1U;
+        event.validation = COMMAND_FRAME_INVALID_LENGTH;
+        return event;
+    }
+
+    const size_t expected_length = COMMAND_FRAME_HEADER_SIZE + payload_length + COMMAND_FRAME_CRC_SIZE;
+    if (assembler->length < expected_length) {
+        return event;
+    }
+
+    event.frame = assembler->buffer;
+    event.frame_length = expected_length;
+    event.consume_length = expected_length;
+    event.validation = command_protocol_decode_request(assembler->buffer, expected_length, &event.command);
+    if (event.validation != COMMAND_FRAME_VALID) {
+        event.result = COMMAND_FRAME_ASSEMBLER_INVALID_FRAME;
+        event.consume_length = 1U;
+        return event;
+    }
+
+    event.result = COMMAND_FRAME_ASSEMBLER_COMMAND_READY;
+    return event;
 }
 
-void command_frame_parser_feed(
-    CommandFrameParser_t *parser,
-    const uint8_t *data,
-    size_t data_length,
-    CommandFrameCallback callback,
-    void *context
-) {
-    command_frame_parser_feed_ex(parser, data, data_length, callback, NULL, context);
+uint8_t command_frame_assembler_consume(CommandFrameAssembler_t *assembler, size_t length) {
+    if (assembler == NULL || length > assembler->length) {
+        return 0U;
+    }
+    command_assembler_discard_prefix(assembler, length);
+    return 1U;
 }
 
 CommandFrameValidationResult_t
@@ -176,6 +169,9 @@ uint16_t command_protocol_validate_request(const CommandFrameHeaderDTO_t *header
     if (header == NULL || (payload == NULL && header->payload_length != 0U)) {
         return COMMAND_ERROR_INVALID_LENGTH;
     }
+    if (header->payload_length > COMMAND_MAX_PAYLOAD_SIZE) {
+        return COMMAND_ERROR_INVALID_LENGTH;
+    }
     if (header->version != COMMAND_PROTOCOL_VERSION) {
         return COMMAND_ERROR_UNSUPPORTED_VERSION;
     }
@@ -200,7 +196,7 @@ uint16_t command_protocol_validate_request(const CommandFrameHeaderDTO_t *header
     case COMMAND_CODE_SET_OUTPUT:
     case COMMAND_CODE_CHANGE_TOOL:
     case COMMAND_CODE_STOP:
-        /* The command codes are reserved, but their executors are not part of this task yet. */
+        /* The command is recognized; routing and execution are handled after decoding. */
         return COMMAND_ERROR_INVALID_STATE;
     default:
         return COMMAND_ERROR_UNKNOWN_COMMAND;
@@ -236,6 +232,25 @@ command_protocol_validate_frame(const uint8_t *frame, size_t frame_length, Comma
     const uint32_t received_crc = command_read_u32_le(&frame[expected_length - COMMAND_FRAME_CRC_SIZE]);
     const uint32_t calculated_crc = command_protocol_crc32(frame, expected_length - COMMAND_FRAME_CRC_SIZE);
     return received_crc == calculated_crc ? COMMAND_FRAME_VALID : COMMAND_FRAME_INVALID_CRC;
+}
+
+CommandFrameValidationResult_t
+command_protocol_parse_header(const uint8_t *frame, size_t available_length, CommandFrameHeaderDTO_t *header) {
+    if (frame == NULL || header == NULL) {
+        return COMMAND_FRAME_INVALID_ARGUMENT;
+    }
+    if (available_length < COMMAND_FRAME_HEADER_SIZE) {
+        return COMMAND_FRAME_INVALID_LENGTH;
+    }
+
+    command_decode_header(frame, header);
+    if (header->magic != COMMAND_PROTOCOL_MAGIC) {
+        return COMMAND_FRAME_INVALID_MAGIC;
+    }
+    if (header->payload_length > COMMAND_MAX_PAYLOAD_SIZE) {
+        return COMMAND_FRAME_INVALID_LENGTH;
+    }
+    return COMMAND_FRAME_VALID;
 }
 
 size_t command_protocol_build_frame(
@@ -283,6 +298,15 @@ size_t command_protocol_build_response(uint8_t *frame, size_t frame_capacity, co
 size_t command_protocol_build_pong_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence) {
     const CommandResponseDTO_t response = {
         .type = COMMAND_MESSAGE_TYPE_PONG,
+        .sequence = sequence,
+        .payload_length = 0U,
+    };
+    return command_protocol_build_response(frame, frame_capacity, &response);
+}
+
+size_t command_protocol_build_ack_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence) {
+    const CommandResponseDTO_t response = {
+        .type = COMMAND_MESSAGE_TYPE_ACK,
         .sequence = sequence,
         .payload_length = 0U,
     };
