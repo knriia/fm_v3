@@ -1,6 +1,7 @@
 #ifndef FM_V3_DIAGNOSTIC_DTO_H
 #define FM_V3_DIAGNOSTIC_DTO_H
 
+#include "command/command_queue.h"
 #include "command_decoder.h"
 #include "command_task.h"
 #include "dto.h"
@@ -91,6 +92,7 @@ typedef struct {
     EthIfTaskDiagnosticsDTO_t eth_if;
     EthLinkTaskDiagnosticsDTO_t eth_link;
     TcpipTaskDiagnosticsDTO_t tcpip_thread;
+    CommandQueueDiagnostics_t command_queue;
 } DiagnosticPayloadDTO_t;
 
 typedef struct {
@@ -117,7 +119,8 @@ _Static_assert(sizeof(CommandTaskDiagnosticsDTO_t) == 128U, "Invalid CommandTask
 _Static_assert(sizeof(CommandDecoderDiagnosticsDTO_t) == 116U, "Invalid CommandDecoder diagnostics size");
 _Static_assert(sizeof(TelemetryTaskDiagnosticsDTO_t) == 100U, "Invalid TelemetryTask diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2088U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2096U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(CommandQueueDiagnostics_t) == 32U, "Invalid CommandQueue diagnostics size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2120U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2128U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */
