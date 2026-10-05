@@ -6,7 +6,14 @@
 
 #include <stddef.h>
 
-static volatile MotionTaskDiagnostics motion_task_diagnostics;
+static volatile MotionTaskDiagnostics motion_task_diagnostics = {
+    .last_planner_status = MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
+};
+
+#ifdef FM_V3_ENABLE_TEST_HOOKS
+static uint32_t motion_task_test_planner_call_count;
+static MotionPlannerResult_t motion_task_test_last_planner_result;
+#endif
 
 static void motion_task_counter_increment(volatile uint32_t *counter) {
     if (*counter != UINT32_MAX) {
@@ -14,8 +21,29 @@ static void motion_task_counter_increment(volatile uint32_t *counter) {
     }
 }
 
+static int motion_task_is_xyz_move(const CommandDTO_t *command) {
+    return command->code == COMMAND_CODE_MOTION_OPERATION &&
+           (command->parameters.motion_operation.operation_flags & COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE) != 0U;
+}
+
+static MotionPlannerResult_t
+motion_task_plan_xyz_move(const CommandDTO_t *command, const MotionTaskContext_t *context) {
+    const CommandMotionOperationParameters_t *motion = &command->parameters.motion_operation;
+    const MotionPlannerRequest_t request = {
+        .sequence = command->sequence,
+        .target_um = {motion->x, motion->y, motion->z},
+        .feedrate_um_per_s = motion->speed,
+    };
+
+    return motion_planner_plan_linear(
+        &request,
+        context == NULL ? NULL : &context->machine_state,
+        context == NULL ? NULL : &context->planner_config
+    );
+}
+
 void MotionTask(void *argument) {
-    (void)argument;
+    MotionTaskContext_t *context = argument;
 
     for (;;) {
         CommandDTO_t command = {0};
@@ -26,10 +54,28 @@ void MotionTask(void *argument) {
             continue;
         }
 
-        /* This stage drains and records commands; execution dispatch is added with the motion pipeline. */
         motion_task_counter_increment(&motion_task_diagnostics.commands_dequeued);
         motion_task_diagnostics.last_sequence = command.sequence;
         motion_task_diagnostics.last_command_code = (uint32_t)command.code;
+
+        if (motion_task_is_xyz_move(&command)) {
+            motion_task_counter_increment(&motion_task_diagnostics.planner_calls);
+            const MotionPlannerResult_t result = motion_task_plan_xyz_move(&command, context);
+            motion_task_diagnostics.last_planner_status = (uint32_t)result.status;
+            motion_task_diagnostics.last_planner_sequence = command.sequence;
+            if (result.status == MOTION_PLANNER_STATUS_OK) {
+                motion_task_counter_increment(&motion_task_diagnostics.planner_blocks_created);
+            } else if (result.status == MOTION_PLANNER_STATUS_NO_MOVEMENT) {
+                motion_task_counter_increment(&motion_task_diagnostics.planner_no_motion);
+            } else {
+                motion_task_counter_increment(&motion_task_diagnostics.planner_errors);
+            }
+#ifdef FM_V3_ENABLE_TEST_HOOKS
+            ++motion_task_test_planner_call_count;
+            motion_task_test_last_planner_result = result;
+#endif
+            /* The returned plan block will be handed to PlanBuffer when that stage is added. */
+        }
     }
 }
 
@@ -42,6 +88,19 @@ void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) {
     diagnostics->queue_receive_errors = motion_task_diagnostics.queue_receive_errors;
     diagnostics->last_sequence = motion_task_diagnostics.last_sequence;
     diagnostics->last_command_code = motion_task_diagnostics.last_command_code;
+    diagnostics->planner_calls = motion_task_diagnostics.planner_calls;
+    diagnostics->planner_blocks_created = motion_task_diagnostics.planner_blocks_created;
+    diagnostics->planner_no_motion = motion_task_diagnostics.planner_no_motion;
+    diagnostics->planner_errors = motion_task_diagnostics.planner_errors;
+    diagnostics->last_planner_status = motion_task_diagnostics.last_planner_status;
+    diagnostics->last_planner_sequence = motion_task_diagnostics.last_planner_sequence;
+}
+
+MotionPlannerStatus_t motion_task_get_last_planner_status(void) {
+    if (motion_task_diagnostics.planner_calls == 0U) {
+        return MOTION_PLANNER_STATUS_INVALID_ARGUMENT;
+    }
+    return (MotionPlannerStatus_t)motion_task_diagnostics.last_planner_status;
 }
 
 #ifdef FM_V3_ENABLE_TEST_HOOKS
@@ -51,4 +110,15 @@ void motion_task_test_seed_diagnostics(const MotionTaskDiagnostics *diagnostics)
     }
     motion_task_diagnostics = *diagnostics;
 }
+
+void motion_task_test_reset_planner(void) {
+    motion_task_test_planner_call_count = 0U;
+    motion_task_test_last_planner_result = (MotionPlannerResult_t){0};
+    motion_task_diagnostics.last_planner_status = MOTION_PLANNER_STATUS_INVALID_ARGUMENT;
+    motion_task_diagnostics.last_planner_sequence = 0U;
+}
+
+uint32_t motion_task_test_get_planner_call_count(void) { return motion_task_test_planner_call_count; }
+
+MotionPlannerResult_t motion_task_test_get_last_planner_result(void) { return motion_task_test_last_planner_result; }
 #endif

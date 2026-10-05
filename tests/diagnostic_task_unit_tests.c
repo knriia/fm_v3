@@ -552,6 +552,12 @@ static void test_diagnostic_task_network_paths(void) {
         .queue_receive_errors = 0U,
         .last_sequence = 104U,
         .last_command_code = COMMAND_CODE_HOME,
+        .planner_calls = 3U,
+        .planner_blocks_created = 1U,
+        .planner_no_motion = 1U,
+        .planner_errors = 1U,
+        .last_planner_status = MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
+        .last_planner_sequence = 103U,
     };
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
@@ -720,6 +726,36 @@ static void test_diagnostic_task_network_paths(void) {
         test_captured_frame.payload.motion_task.motion.last_command_code,
         COMMAND_CODE_HOME,
         "motion task diagnostic last command code"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.planner_calls,
+        3U,
+        "motion task diagnostic planner calls"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.planner_blocks_created,
+        1U,
+        "motion task diagnostic planner blocks"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.planner_no_motion,
+        1U,
+        "motion task diagnostic planner no-motion results"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.planner_errors,
+        1U,
+        "motion task diagnostic planner errors"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.last_planner_status,
+        MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
+        "motion task diagnostic last planner status"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.last_planner_sequence,
+        103U,
+        "motion task diagnostic last planner sequence"
     );
     expect_u32(
         test_captured_frame.payload.command_task.command.port,
