@@ -8,6 +8,7 @@
 #include "ethernet_port.h"
 #include "ethernetif.h"
 #include "lwip_diagnostics.h"
+#include "motion/plan_buffer.h"
 #include "motion_task.h"
 #include "startup_task.h"
 #include "system_diagnostics.h"
@@ -100,6 +101,7 @@ typedef struct {
     TcpipTaskDiagnosticsDTO_t tcpip_thread;
     CommandQueueDiagnostics_t command_queue;
     MotionTaskDiagnosticsDTO_t motion_task;
+    PlanBufferDiagnostics_t plan_buffer;
 } DiagnosticPayloadDTO_t;
 
 typedef struct {
@@ -128,7 +130,8 @@ _Static_assert(sizeof(TelemetryTaskDiagnosticsDTO_t) == 100U, "Invalid Telemetry
 _Static_assert(sizeof(MotionTaskDiagnosticsDTO_t) == 76U, "Invalid MotionTask diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
 _Static_assert(sizeof(CommandQueueDiagnostics_t) == 32U, "Invalid CommandQueue diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2196U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2204U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(PlanBufferDiagnostics_t) == 48U, "Invalid PlanBuffer diagnostics size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2244U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2252U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

@@ -373,6 +373,7 @@ void DiagnosticTask(void *argument) {
                 }
                 lwip_diagnostics_collect(&diagnostic_frame.payload.tcpip_thread.lwip);
                 command_queue_get_diagnostics(&diagnostic_frame.payload.command_queue);
+                (void)plan_buffer_get_diagnostics(&diagnostic_frame.payload.plan_buffer);
                 diagnostic_collect_network_tasks(
                     &diagnostic_frame.payload,
                     &network_tasks_runtime,
