@@ -5,6 +5,8 @@
 
 #include <stdint.h>
 
+#define COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE 0x01U
+
 typedef struct {
     uint8_t axes;
 } CommandHomeParameters_t;

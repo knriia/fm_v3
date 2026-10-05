@@ -83,6 +83,7 @@ static const osThreadAttr_t command_task_attr = {
 };
 
 static osThreadId_t motion_task_handle;
+static MotionTaskContext_t motion_task_context;
 static const osThreadAttr_t motion_task_attr = {
   .name = MOTION_TASK_NAME,
   .stack_size = MOTION_TASK_STACK_SIZE_BYTES,
@@ -113,7 +114,7 @@ void MX_FREERTOS_Init(void)
     Error_Handler();
   }
 
-  motion_task_handle = osThreadNew(MotionTask, NULL, &motion_task_attr);
+  motion_task_handle = osThreadNew(MotionTask, &motion_task_context, &motion_task_attr);
   if (motion_task_handle == NULL)
   {
     Error_Handler();

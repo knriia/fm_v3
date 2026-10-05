@@ -110,7 +110,7 @@ include_directories(BSP/ENC)
 
 add_definitions(-DDEBUG -DUSE_HAL_DRIVER -DSTM32H723xx -DDATA_IN_D2_SRAM)
 
-file(GLOB_RECURSE SOURCES "APP/*.*" "BSP/*.*" "Core/*.*" "Drivers/*.*" "LWIP/*.*" "Middlewares/*.*")
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "APP/*.*" "BSP/*.*" "Core/*.*" "Drivers/*.*" "LWIP/*.*" "Middlewares/*.*")
 
 set(LINKER_SCRIPT ${CMAKE_SOURCE_DIR}/STM32H723ZGTX_FLASH.ld)
 

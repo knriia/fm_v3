@@ -62,11 +62,18 @@ target_compile_definitions(command_queue_unit_tests PRIVATE FM_V3_ENABLE_TEST_HO
 add_executable(motion_task_unit_tests
     motion_task_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/motion_task.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
 )
 target_compile_definitions(motion_task_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
 
+add_executable(motion_planner_unit_tests
+    motion_planner_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
+)
+
 target_include_directories(diagnostic_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic
@@ -78,6 +85,7 @@ target_include_directories(diagnostic_protocol_tests PRIVATE
 
 target_include_directories(diagnostic_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network/diagnostic
@@ -137,9 +145,15 @@ target_include_directories(command_queue_unit_tests PRIVATE
 
 target_include_directories(motion_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/command
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
+)
+
+target_include_directories(motion_planner_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
 )
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -194,6 +208,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(motion_planner_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
 endif ()
 
 if (FM_V3_ENABLE_LLVM_COVERAGE)
@@ -242,3 +261,4 @@ add_test(NAME command_task_unit_tests COMMAND command_task_unit_tests)
 add_test(NAME command_decoder_unit_tests COMMAND command_decoder_unit_tests)
 add_test(NAME command_queue_unit_tests COMMAND command_queue_unit_tests)
 add_test(NAME motion_task_unit_tests COMMAND motion_task_unit_tests)
+add_test(NAME motion_planner_unit_tests COMMAND motion_planner_unit_tests)

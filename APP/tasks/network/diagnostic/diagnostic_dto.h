@@ -125,10 +125,10 @@ _Static_assert(sizeof(StartupTaskDiagnosticsDTO_t) == 48U, "Invalid StartupTask 
 _Static_assert(sizeof(CommandTaskDiagnosticsDTO_t) == 128U, "Invalid CommandTask diagnostics size");
 _Static_assert(sizeof(CommandDecoderDiagnosticsDTO_t) == 116U, "Invalid CommandDecoder diagnostics size");
 _Static_assert(sizeof(TelemetryTaskDiagnosticsDTO_t) == 100U, "Invalid TelemetryTask diagnostics size");
-_Static_assert(sizeof(MotionTaskDiagnosticsDTO_t) == 52U, "Invalid MotionTask diagnostics size");
+_Static_assert(sizeof(MotionTaskDiagnosticsDTO_t) == 76U, "Invalid MotionTask diagnostics size");
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
 _Static_assert(sizeof(CommandQueueDiagnostics_t) == 32U, "Invalid CommandQueue diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2172U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2180U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2196U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2204U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */
