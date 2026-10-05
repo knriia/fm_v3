@@ -42,6 +42,7 @@ static CommandTaskDiagnostics test_command_diagnostics;
 static CommandDecoderDiagnostics test_command_decoder_diagnostics;
 static MotionTaskDiagnostics test_motion_task_diagnostics;
 static CommandQueueDiagnostics_t test_command_queue_diagnostics;
+static PlanBufferDiagnostics_t test_plan_buffer_diagnostics;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -104,6 +105,10 @@ void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) { *diagnostics = test_motion_task_diagnostics; }
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     *diagnostics = test_command_queue_diagnostics;
+}
+PlanBufferStatus_t plan_buffer_get_diagnostics(PlanBufferDiagnostics_t *diagnostics) {
+    *diagnostics = test_plan_buffer_diagnostics;
+    return PLAN_BUFFER_STATUS_OK;
 }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
@@ -398,6 +403,7 @@ static void reset_network_fixture(void) {
     test_command_decoder_diagnostics = (CommandDecoderDiagnostics){0};
     test_motion_task_diagnostics = (MotionTaskDiagnostics){0};
     test_command_queue_diagnostics = (CommandQueueDiagnostics_t){0};
+    test_plan_buffer_diagnostics = (PlanBufferDiagnostics_t){0};
 }
 
 static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
@@ -546,6 +552,20 @@ static void test_diagnostic_task_network_paths(void) {
         .enqueued_total = 123U,
         .full_rejections = 4U,
         .enqueue_errors = 5U,
+    };
+    test_plan_buffer_diagnostics = (PlanBufferDiagnostics_t){
+        .initialized = 1U,
+        .capacity = PLAN_BUFFER_CAPACITY,
+        .queued = 37U,
+        .available = PLAN_BUFFER_CAPACITY - 37U,
+        .max_queued = 80U,
+        .enqueued_total = 1234U,
+        .dequeued_total = 1197U,
+        .full_rejections = 2U,
+        .empty_reads = 3U,
+        .rejected_operations = 1U,
+        .clear_calls = 4U,
+        .cancelled_blocks = 5U,
     };
     test_motion_task_diagnostics = (MotionTaskDiagnostics){
         .commands_dequeued = 14U,
@@ -839,6 +859,26 @@ static void test_diagnostic_task_network_paths(void) {
     expect_u32(test_captured_frame.payload.command_queue.enqueued_total, 123U, "command queue accepted total diagnostic");
     expect_u32(test_captured_frame.payload.command_queue.full_rejections, 4U, "command queue full rejections diagnostic");
     expect_u32(test_captured_frame.payload.command_queue.enqueue_errors, 5U, "command queue enqueue errors diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.initialized, 1U, "plan buffer initialized diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.capacity, PLAN_BUFFER_CAPACITY, "plan buffer capacity diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.queued, 37U, "plan buffer current occupancy diagnostic");
+    expect_u32(
+        test_captured_frame.payload.plan_buffer.available,
+        PLAN_BUFFER_CAPACITY - 37U,
+        "plan buffer available slots diagnostic"
+    );
+    expect_u32(test_captured_frame.payload.plan_buffer.max_queued, 80U, "plan buffer maximum occupancy diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.enqueued_total, 1234U, "plan buffer accepted total diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.dequeued_total, 1197U, "plan buffer consumed total diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.full_rejections, 2U, "plan buffer full rejections diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.empty_reads, 3U, "plan buffer empty reads diagnostic");
+    expect_u32(
+        test_captured_frame.payload.plan_buffer.rejected_operations,
+        1U,
+        "plan buffer rejected operations diagnostic"
+    );
+    expect_u32(test_captured_frame.payload.plan_buffer.clear_calls, 4U, "plan buffer clear calls diagnostic");
+    expect_u32(test_captured_frame.payload.plan_buffer.cancelled_blocks, 5U, "plan buffer cancelled blocks diagnostic");
 
     reset_network_fixture();
     test_stop_on_delay = 1U;

@@ -30,6 +30,7 @@
 #include "command_task.h"
 #include "command/command_queue.h"
 #include "motion_task.h"
+#include "motion/plan_buffer.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -110,6 +111,11 @@ void MX_FREERTOS_Init(void);
 void MX_FREERTOS_Init(void)
 {
   if (command_queue_init() != osOK)
+  {
+    Error_Handler();
+  }
+
+  if (plan_buffer_init() != PLAN_BUFFER_STATUS_OK)
   {
     Error_Handler();
   }

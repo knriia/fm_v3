@@ -1,4 +1,5 @@
 #include "command/command_queue.h"
+#include "motion/plan_buffer.h"
 #include "motion_task.h"
 
 #include <setjmp.h>
@@ -91,6 +92,8 @@ static void reset_receive_script(void) {
     motion_task_test_seed_diagnostics(NULL);
     motion_task_test_seed_diagnostics(&diagnostics);
     motion_task_test_reset_planner();
+    plan_buffer_test_reset();
+    (void)plan_buffer_init();
 }
 
 static void script_read(uint32_t index, osStatus_t status, const CommandDTO_t *command) {
@@ -181,10 +184,27 @@ static void test_successful_receive_marks_dequeue(void) {
     expect_i64(planner_result.block.step_delta[1], -45, "planner receives the signed Y target");
     expect_i64(planner_result.block.step_delta[2], 71, "planner receives the Z target");
     expect_u32(planner_result.block.feedrate_um_per_s, 12000U, "planner receives the XYZ feedrate");
+
+    PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
+    expect_u32(
+        plan_buffer_get_diagnostics(&plan_buffer_diagnostics),
+        PLAN_BUFFER_STATUS_OK,
+        "plan buffer diagnostics are available"
+    );
+    expect_u32(plan_buffer_diagnostics.queued, 1U, "successful plan is queued");
+    expect_u32(plan_buffer_diagnostics.enqueued_total, 1U, "successful plan enqueue is counted");
+    MotionPlanBlock_t buffered_block = {0};
+    expect_u32(plan_buffer_try_pop(&buffered_block), PLAN_BUFFER_STATUS_OK, "plan is available to the next pipeline block");
+    expect_u32(buffered_block.sequence, 101U, "plan buffer preserves source command sequence");
+    expect_i64(buffered_block.step_delta[0], 99, "plan buffer preserves planner X output");
+    expect_i64(buffered_block.step_delta[1], -45, "plan buffer preserves planner Y output");
+    expect_i64(buffered_block.step_delta[2], 71, "plan buffer preserves planner Z output");
 }
 
 static void test_fifo_commands_are_dequeued_once(void) {
     reset_receive_script();
+    const MotionPlanBlock_t pending_plan = {.sequence = 90U};
+    expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before STOP");
     const CommandDTO_t commands[] = {
         {.sequence = 102U, .code = COMMAND_CODE_HOME, .parameters.home = {.axes = 5U}},
         {.sequence = 103U, .code = COMMAND_CODE_STOP},
@@ -215,6 +235,10 @@ static void test_fifo_commands_are_dequeued_once(void) {
     expect_u32(diagnostics.last_command_code, COMMAND_CODE_CHANGE_TOOL, "last dequeued command code is retained");
     expect_u32(motion_task_test_get_planner_call_count(), 0U, "non-XYZ commands do not invoke MotionPlanner");
     expect_u32(diagnostics.planner_calls, 0U, "non-XYZ commands do not increment planner calls");
+    PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    expect_u32(plan_buffer_diagnostics.queued, 0U, "STOP clears pending plans");
+    expect_u32(plan_buffer_diagnostics.cancelled_blocks, 1U, "STOP counts cancelled plans");
 }
 
 static void test_receive_error_does_not_count_as_dequeue(void) {
@@ -272,6 +296,8 @@ static void test_diagnostic_counters_saturate(void) {
 
 static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     reset_receive_script();
+    const MotionPlanBlock_t pending_plan = {.sequence = 91U};
+    expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before planner error");
     MotionTaskContext_t context = {0};
     const CommandDTO_t command = {
         .sequence = 108U,
@@ -307,10 +333,16 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     expect_u32(diagnostics.planner_errors, 1U, "unconfigured XYZ command increments planner errors");
     expect_u32(diagnostics.last_planner_status, MOTION_PLANNER_STATUS_INVALID_CONFIGURATION, "invalid configuration status is recorded");
     expect_u32(diagnostics.last_planner_sequence, 108U, "failed planner sequence is recorded");
+    PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    expect_u32(plan_buffer_diagnostics.queued, 0U, "planner error clears pending plans");
+    expect_u32(plan_buffer_diagnostics.cancelled_blocks, 1U, "planner error counts cancelled plans");
 }
 
 static void test_xyz_command_without_position_change_counts_no_motion(void) {
     reset_receive_script();
+    const MotionPlanBlock_t pending_plan = {.sequence = 92U};
+    expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before no-motion command");
     MotionTaskContext_t context = valid_motion_context();
     const CommandDTO_t command = {
         .sequence = 111U,
@@ -336,6 +368,47 @@ static void test_xyz_command_without_position_change_counts_no_motion(void) {
     expect_u32(diagnostics.planner_errors, 0U, "no movement is not counted as a planner error");
     expect_u32(diagnostics.last_planner_status, MOTION_PLANNER_STATUS_NO_MOVEMENT, "no-movement status is recorded");
     expect_u32(diagnostics.last_planner_sequence, 111U, "no-movement sequence is recorded");
+    PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    expect_u32(plan_buffer_diagnostics.queued, 1U, "no-motion result preserves earlier plans");
+}
+
+static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plans(void) {
+    reset_receive_script();
+    for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
+        const MotionPlanBlock_t block = {.sequence = sequence};
+        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "plan buffer fills before integration check");
+    }
+
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t command = {
+        .sequence = 112U,
+        .code = COMMAND_CODE_MOTION_OPERATION,
+        .parameters.motion_operation = {
+            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+            .x = 1234,
+            .y = 0,
+            .z = 0,
+            .speed = 12000U,
+        },
+    };
+    script_read(0U, osOK, &command);
+    script_read(1U, osErrorResource, NULL);
+    test_jump_on_delay = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+
+    MotionTaskDiagnostics motion_diagnostics = {0};
+    motion_task_get_diagnostics(&motion_diagnostics);
+    expect_u32(motion_diagnostics.planner_blocks_created, 1U, "planner output remains distinct from buffer acceptance");
+    PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    expect_u32(plan_buffer_diagnostics.queued, PLAN_BUFFER_CAPACITY, "full buffer retains existing plans");
+    expect_u32(plan_buffer_diagnostics.enqueued_total, PLAN_BUFFER_CAPACITY, "rejected plan is not counted as enqueued");
+    expect_u32(plan_buffer_diagnostics.full_rejections, 1U, "full plan buffer rejection is visible");
+
+    MotionPlanBlock_t first_block = {0};
+    expect_u32(plan_buffer_try_pop(&first_block), PLAN_BUFFER_STATUS_OK, "existing plans remain consumable after full rejection");
+    expect_u32(first_block.sequence, 1U, "full rejection does not replace earlier plans");
 }
 
 static void test_xyz_command_with_null_context_reaches_planner_as_invalid_input(void) {
@@ -400,6 +473,7 @@ int main(void) {
     test_diagnostic_counters_saturate();
     test_xyz_command_reports_unconfigured_planner_inputs();
     test_xyz_command_without_position_change_counts_no_motion();
+    test_full_plan_buffer_rejects_new_block_without_losing_existing_plans();
     test_xyz_command_with_null_context_reaches_planner_as_invalid_input();
     test_motion_operation_without_xyz_flag_does_not_call_planner();
 

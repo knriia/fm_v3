@@ -63,8 +63,15 @@ add_executable(motion_task_unit_tests
     motion_task_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/motion_task.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/plan_buffer.c
 )
 target_compile_definitions(motion_task_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
+
+add_executable(plan_buffer_unit_tests
+    plan_buffer_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/plan_buffer.c
+)
+target_compile_definitions(plan_buffer_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
 
 add_executable(motion_planner_unit_tests
     motion_planner_unit_tests.c
@@ -156,6 +163,11 @@ target_include_directories(motion_planner_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
 )
 
+target_include_directories(plan_buffer_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
+)
+
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(diagnostic_protocol_tests PRIVATE
         -Wall
@@ -213,6 +225,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(plan_buffer_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
 endif ()
 
 if (FM_V3_ENABLE_LLVM_COVERAGE)
@@ -261,4 +278,5 @@ add_test(NAME command_task_unit_tests COMMAND command_task_unit_tests)
 add_test(NAME command_decoder_unit_tests COMMAND command_decoder_unit_tests)
 add_test(NAME command_queue_unit_tests COMMAND command_queue_unit_tests)
 add_test(NAME motion_task_unit_tests COMMAND motion_task_unit_tests)
+add_test(NAME plan_buffer_unit_tests COMMAND plan_buffer_unit_tests)
 add_test(NAME motion_planner_unit_tests COMMAND motion_planner_unit_tests)
