@@ -18,8 +18,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 2120U
-#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 2128U
+#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 2172U
+#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 2180U
 
 _Static_assert(TCPIP_THREAD_STACKSIZE == 2048U, "Unexpected TCP/IP thread stack size");
 
