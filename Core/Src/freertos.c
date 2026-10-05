@@ -29,6 +29,7 @@
 #include "telemetry_task.h"
 #include "command_task.h"
 #include "command/command_queue.h"
+#include "motion_task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -81,6 +82,13 @@ static const osThreadAttr_t command_task_attr = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 
+static osThreadId_t motion_task_handle;
+static const osThreadAttr_t motion_task_attr = {
+  .name = MOTION_TASK_NAME,
+  .stack_size = MOTION_TASK_STACK_SIZE_BYTES,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
 static osEventFlagsId_t lwip_ready_flags;
 static NetworkTaskContext diagnostic_task_context;
 static NetworkTaskContext telemetry_task_context;
@@ -101,6 +109,12 @@ void MX_FREERTOS_Init(void);
 void MX_FREERTOS_Init(void)
 {
   if (command_queue_init() != osOK)
+  {
+    Error_Handler();
+  }
+
+  motion_task_handle = osThreadNew(MotionTask, NULL, &motion_task_attr);
+  if (motion_task_handle == NULL)
   {
     Error_Handler();
   }

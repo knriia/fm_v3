@@ -20,6 +20,7 @@
 #include "lwip/err.h"
 #include "lwip/ip_addr.h"
 #include "lwip/opt.h"
+#include "motion_task.h"
 #include "task.h"
 
 #include <stddef.h>
@@ -50,6 +51,7 @@ typedef struct {
     uint32_t eth_if_min_free_bytes;
     uint32_t eth_link_min_free_bytes;
     uint32_t tcpip_thread_min_free_bytes;
+    uint32_t motion_task_min_free_bytes;
 } NetworkTasksRuntime;
 
 typedef struct {
@@ -67,6 +69,7 @@ typedef struct {
     TaskRuntimeSample eth_if;
     TaskRuntimeSample eth_link;
     TaskRuntimeSample tcpip_thread;
+    TaskRuntimeSample motion_task;
 } RuntimePercentTracker;
 
 static RuntimePercentTracker runtime_percent_tracker;
@@ -186,6 +189,15 @@ static void diagnostic_collect_network_tasks(
         total_runtime_ticks
     );
     diagnostic_network_task_fill_stats(
+        &payload->motion_task.runtime,
+        xTaskGetHandle(MOTION_TASK_NAME),
+        &runtime_percent_tracker.motion_task,
+        MOTION_TASK_STACK_SIZE_BYTES,
+        &runtime->motion_task_min_free_bytes,
+        total_runtime_ticks
+    );
+    motion_task_get_diagnostics(&payload->motion_task.motion);
+    diagnostic_network_task_fill_stats(
         &payload->eth_if.runtime,
         xTaskGetHandle(ETHERNET_IF_TASK_NAME),
         &runtime_percent_tracker.eth_if,
@@ -282,6 +294,7 @@ void DiagnosticTask(void *argument) {
         .eth_if_min_free_bytes = UINT32_MAX,
         .eth_link_min_free_bytes = UINT32_MAX,
         .tcpip_thread_min_free_bytes = UINT32_MAX,
+        .motion_task_min_free_bytes = UINT32_MAX,
     };
 
     if ((context == NULL) || (context->lwip_flags == NULL)) {

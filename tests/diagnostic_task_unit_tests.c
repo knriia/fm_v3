@@ -40,6 +40,7 @@ static DiagnosticFrameDTO_t test_captured_frame;
 static TelemetryTaskDiagnostics test_telemetry_diagnostics;
 static CommandTaskDiagnostics test_command_diagnostics;
 static CommandDecoderDiagnostics test_command_decoder_diagnostics;
+static MotionTaskDiagnostics test_motion_task_diagnostics;
 static CommandQueueDiagnostics_t test_command_queue_diagnostics;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
@@ -100,6 +101,7 @@ void command_task_get_diagnostics(CommandTaskDiagnostics *diagnostics) { *diagno
 void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
     *diagnostics = test_command_decoder_diagnostics;
 }
+void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) { *diagnostics = test_motion_task_diagnostics; }
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     *diagnostics = test_command_queue_diagnostics;
 }
@@ -394,6 +396,7 @@ static void reset_network_fixture(void) {
     test_telemetry_diagnostics = (TelemetryTaskDiagnostics){0};
     test_command_diagnostics = (CommandTaskDiagnostics){0};
     test_command_decoder_diagnostics = (CommandDecoderDiagnostics){0};
+    test_motion_task_diagnostics = (MotionTaskDiagnostics){0};
     test_command_queue_diagnostics = (CommandQueueDiagnostics_t){0};
 }
 
@@ -544,6 +547,12 @@ static void test_diagnostic_task_network_paths(void) {
         .full_rejections = 4U,
         .enqueue_errors = 5U,
     };
+    test_motion_task_diagnostics = (MotionTaskDiagnostics){
+        .commands_dequeued = 14U,
+        .queue_receive_errors = 0U,
+        .last_sequence = 104U,
+        .last_command_code = COMMAND_CODE_HOME,
+    };
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
     expect_u32(test_captured_write_size, sizeof(DiagnosticFrameDTO_t), "diagnostic frame write size");
@@ -686,6 +695,31 @@ static void test_diagnostic_task_network_paths(void) {
         test_captured_frame.payload.command_task.runtime.stack_free_bytes,
         400U,
         "command task diagnostic free stack"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.runtime.stack_size_bytes,
+        MOTION_TASK_STACK_SIZE_BYTES,
+        "motion task diagnostic stack size"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.runtime.stack_free_bytes,
+        400U,
+        "motion task diagnostic free stack"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.commands_dequeued,
+        14U,
+        "motion task diagnostic dequeued commands"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.last_sequence,
+        104U,
+        "motion task diagnostic last sequence"
+    );
+    expect_u32(
+        test_captured_frame.payload.motion_task.motion.last_command_code,
+        COMMAND_CODE_HOME,
+        "motion task diagnostic last command code"
     );
     expect_u32(
         test_captured_frame.payload.command_task.command.port,
