@@ -154,6 +154,50 @@ static void test_home_command_validation_and_decode(void) {
     );
 }
 
+static CommandRequestDTO_t make_x_jog_request(uint32_t sequence, int32_t signed_steps, uint32_t step_rate_hz) {
+    uint8_t payload[9] = {0};
+    payload[0] = COMMAND_CODE_X_JOG;
+    write_u32_le(&payload[1], (uint32_t)signed_steps);
+    write_u32_le(&payload[5], step_rate_hz);
+    return make_request(COMMAND_MESSAGE_TYPE_COMMAND, sequence, payload, sizeof(payload));
+}
+
+static void test_x_jog_validation_and_decode(void) {
+    reset_decoder();
+    CommandRequestDTO_t request = make_x_jog_request(211U, -1000, COMMAND_X_JOG_MAX_STEP_RATE_HZ);
+    expect_u32(command_decoder_validate_command(&request), 0U, "X_JOG accepts the maximum step rate");
+    const CommandDTO_t command = command_decoder_decode_command(&request);
+    expect_u32(command.code, COMMAND_CODE_X_JOG, "X_JOG preserves command code");
+    expect_u32((uint32_t)command.parameters.x_jog.signed_steps, (uint32_t)-1000, "X_JOG decodes signed steps");
+    expect_u32(command.parameters.x_jog.step_rate_hz, COMMAND_X_JOG_MAX_STEP_RATE_HZ, "X_JOG decodes step rate");
+
+    request = make_x_jog_request(212U, 1, COMMAND_X_JOG_MAX_STEP_RATE_HZ + 1U);
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "X_JOG rejects a step rate above the protocol cap"
+    );
+
+    request = make_x_jog_request(213U, 1, 0U);
+    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_PARAMETER, "X_JOG rejects zero rate");
+
+    request = make_x_jog_request(214U, 0, 100U);
+    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_PARAMETER, "X_JOG rejects zero steps");
+
+    request = make_x_jog_request(215U, (int32_t)COMMAND_X_JOG_MAX_STEPS + 1, 100U);
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "X_JOG rejects too many steps"
+    );
+
+    request = make_x_jog_request(216U, INT32_MIN, 100U);
+    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_PARAMETER, "X_JOG rejects INT32_MIN");
+
+    request.header.payload_length = 8U;
+    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_LENGTH, "X_JOG requires 9 bytes");
+}
+
 static CommandRequestDTO_t make_motion_request(uint32_t sequence) {
     uint8_t payload[30] = {0};
     payload[0] = COMMAND_CODE_MOTION_OPERATION;
@@ -377,6 +421,7 @@ static void test_decoder_diagnostics_and_error_mapping(void) {
 int main(void) {
     test_ping_and_protocol_errors();
     test_home_command_validation_and_decode();
+    test_x_jog_validation_and_decode();
     test_motion_operation_validation_and_decode();
     test_temperature_output_tool_and_stop_commands();
     test_decoder_diagnostics_and_error_mapping();

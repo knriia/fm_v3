@@ -23,6 +23,7 @@
 #include "ethernetif.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "motion_hardware_x.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -202,5 +203,30 @@ void EXTI0_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+void TIM4_IRQHandler(void)
+{
+  motion_hardware_x_timer_irq();
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+  const uint32_t pending = EXTI->PR1 & (1UL << 9U);
+  if (pending != 0U)
+  {
+    EXTI->PR1 = pending;
+    motion_hardware_x_limit_irq(pending);
+  }
+}
+
+void EXTI15_10_IRQHandler(void)
+{
+  const uint32_t pending = EXTI->PR1 & (1UL << 10U);
+  if (pending != 0U)
+  {
+    EXTI->PR1 = pending;
+    motion_hardware_x_limit_irq(pending);
+  }
+}
 
 /* USER CODE END 1 */

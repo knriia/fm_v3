@@ -14,6 +14,7 @@ typedef int32_t osStatus_t;
 #define osFlagsWaitAll 0x00000001U
 #define osWaitForever 0xFFFFFFFFU
 #define osOK ((osStatus_t)0)
+#define osErrorTimeout ((osStatus_t)-2)
 #define osErrorResource ((osStatus_t)-3)
 #define osErrorParameter ((osStatus_t)-4)
 #define osErrorNoMemory ((osStatus_t)-5)
