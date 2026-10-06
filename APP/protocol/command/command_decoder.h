@@ -6,10 +6,18 @@
 #include <stdint.h>
 
 #define COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE 0x01U
+#define COMMAND_X_JOG_MAX_STEPS 1000000U
+/* Protocol cap; it matches the fastest rate already used by X homing on the bench. */
+#define COMMAND_X_JOG_MAX_STEP_RATE_HZ 50000U
 
 typedef struct {
     uint8_t axes;
 } CommandHomeParameters_t;
+
+typedef struct {
+    int32_t signed_steps;
+    uint32_t step_rate_hz;
+} CommandXAxisJogParameters_t;
 
 typedef struct {
     uint8_t operation_flags;
@@ -42,6 +50,7 @@ typedef struct {
     CommandCode_t code;
     union {
         CommandHomeParameters_t home;
+        CommandXAxisJogParameters_t x_jog;
         CommandMotionOperationParameters_t motion_operation;
         CommandSetTemperatureParameters_t set_temperature;
         CommandSetOutputParameters_t set_output;

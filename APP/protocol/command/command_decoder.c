@@ -65,6 +65,20 @@ static uint16_t command_decoder_validate_command(const CommandRequestDTO_t *requ
         }
         return payload[1] != 0U && (payload[1] & 0xF8U) == 0U ? 0U : COMMAND_ERROR_INVALID_PARAMETER;
 
+    case COMMAND_CODE_X_JOG: {
+        if (payload_length != 9U) {
+            return COMMAND_ERROR_INVALID_LENGTH;
+        }
+        const int32_t signed_steps = command_decoder_read_i32_le(&payload[1]);
+        const uint64_t step_count = signed_steps < 0 ? (uint64_t)(-(int64_t)signed_steps) : (uint64_t)signed_steps;
+        const uint32_t step_rate_hz = command_decoder_read_u32_le(&payload[5]);
+        if (step_count == 0U || step_count > COMMAND_X_JOG_MAX_STEPS || step_rate_hz == 0U ||
+            step_rate_hz > COMMAND_X_JOG_MAX_STEP_RATE_HZ) {
+            return COMMAND_ERROR_INVALID_PARAMETER;
+        }
+        return 0U;
+    }
+
     case COMMAND_CODE_MOTION_OPERATION: {
         if (payload_length != 30U) {
             return COMMAND_ERROR_INVALID_LENGTH;
@@ -114,6 +128,11 @@ static CommandDTO_t command_decoder_decode_command(const CommandRequestDTO_t *re
     switch (command.code) {
     case COMMAND_CODE_HOME:
         command.parameters.home.axes = payload[1];
+        break;
+
+    case COMMAND_CODE_X_JOG:
+        command.parameters.x_jog.signed_steps = command_decoder_read_i32_le(&payload[1]);
+        command.parameters.x_jog.step_rate_hz = command_decoder_read_u32_le(&payload[5]);
         break;
 
     case COMMAND_CODE_MOTION_OPERATION:

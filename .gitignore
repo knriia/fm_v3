@@ -4,6 +4,7 @@ Release/
 /cmake-build-debug
 /tests/build/
 cmake-build-*/
+.clangd
 *.elf
 *.bin
 *.hex

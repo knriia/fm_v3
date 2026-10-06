@@ -265,6 +265,7 @@ static void test_header_frame_and_request_validation(void) {
         COMMAND_CODE_SET_OUTPUT,
         COMMAND_CODE_CHANGE_TOOL,
         COMMAND_CODE_STOP,
+        COMMAND_CODE_X_JOG,
     };
     for (size_t index = 0U; index < sizeof(known_commands); ++index) {
         expect_u32(

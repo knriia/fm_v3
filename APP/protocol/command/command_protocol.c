@@ -196,6 +196,7 @@ uint16_t command_protocol_validate_request(const CommandFrameHeaderDTO_t *header
     case COMMAND_CODE_SET_OUTPUT:
     case COMMAND_CODE_CHANGE_TOOL:
     case COMMAND_CODE_STOP:
+    case COMMAND_CODE_X_JOG:
         /* The command is recognized; routing and execution are handled after decoding. */
         return COMMAND_ERROR_INVALID_STATE;
     default:
