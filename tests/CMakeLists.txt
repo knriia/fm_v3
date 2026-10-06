@@ -78,6 +78,11 @@ add_executable(motion_planner_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
 )
 
+add_executable(motion_event_generator_unit_tests
+    motion_event_generator_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_event_generator.c
+)
+
 target_include_directories(diagnostic_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../APP
@@ -163,6 +168,11 @@ target_include_directories(motion_planner_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
 )
 
+target_include_directories(motion_event_generator_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
+)
+
 target_include_directories(plan_buffer_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
@@ -225,6 +235,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(motion_event_generator_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
     target_compile_options(plan_buffer_unit_tests PRIVATE
         -Wall
         -Wextra
@@ -280,3 +295,4 @@ add_test(NAME command_queue_unit_tests COMMAND command_queue_unit_tests)
 add_test(NAME motion_task_unit_tests COMMAND motion_task_unit_tests)
 add_test(NAME plan_buffer_unit_tests COMMAND plan_buffer_unit_tests)
 add_test(NAME motion_planner_unit_tests COMMAND motion_planner_unit_tests)
+add_test(NAME motion_event_generator_unit_tests COMMAND motion_event_generator_unit_tests)
