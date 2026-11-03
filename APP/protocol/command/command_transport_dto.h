@@ -26,7 +26,9 @@ typedef enum {
     COMMAND_CODE_SET_OUTPUT = 0x08U,
     COMMAND_CODE_CHANGE_TOOL = 0x09U,
     COMMAND_CODE_STOP = 0x0AU,
-    COMMAND_CODE_X_JOG = 0x0BU
+    COMMAND_CODE_X_JOG = 0x0BU,
+    /* Payload: axes mask (u8). Homes the axes, measures travel and steps per micrometre. */
+    COMMAND_CODE_CALIBRATE = 0x0CU
 } CommandCode_t;
 
 #define COMMAND_ERROR_UNSUPPORTED_VERSION 0x0001U

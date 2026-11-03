@@ -58,7 +58,8 @@ StepExecutorStatus_t step_executor_pulse_complete(MotionExecutionEvent_t *next_e
         return step_executor_state == STEP_EXECUTOR_STATE_COMPLETE ? STEP_EXECUTOR_STATUS_COMPLETE
                                                                    : STEP_EXECUTOR_STATUS_NOT_RUNNING;
     }
-    if (step_executor_current_is_last != 0U) {
+    /* A finished block is the end of motion only when no next block is queued; otherwise motion continues. */
+    if (step_executor_current_is_last != 0U && execution_buffer_count() == 0U) {
         step_executor_state = STEP_EXECUTOR_STATE_COMPLETE;
         return STEP_EXECUTOR_STATUS_COMPLETE;
     }

@@ -73,6 +73,12 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
     return status;
 }
 
+void command_queue_discard_all(void) {
+    if (command_queue_handle != NULL) {
+        (void)osMessageQueueReset(command_queue_handle);
+    }
+}
+
 uint32_t command_queue_free_slots(void) {
     return command_queue_handle == NULL ? 0U : osMessageQueueGetSpace(command_queue_handle);
 }

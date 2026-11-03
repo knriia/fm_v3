@@ -1,9 +1,56 @@
 #include "motion/plan_buffer.h"
 
+#include "cmsis_os.h"
+
 #include <stdint.h>
 #include <stdio.h>
 
 static uint32_t test_failures;
+static uint8_t test_mutex_object;
+static uint8_t test_mutex_new_fails;
+static uint32_t test_mutex_new_calls;
+static uint32_t test_mutex_attr_bits;
+static uint32_t test_mutex_acquire_calls;
+static uint32_t test_mutex_release_calls;
+static uint32_t test_mutex_depth;
+static uint32_t test_mutex_max_depth;
+static uint32_t test_mutex_last_timeout;
+static uint8_t test_mutex_wrong_handle;
+static osStatus_t test_mutex_acquire_result;
+static osStatus_t test_mutex_release_result;
+static uint32_t test_error_handler_calls;
+
+osMutexId_t osMutexNew(const osMutexAttr_t *attr) {
+    ++test_mutex_new_calls;
+    test_mutex_attr_bits = attr != NULL ? attr->attr_bits : 0U;
+    return test_mutex_new_fails != 0U ? NULL : &test_mutex_object;
+}
+
+osStatus_t osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout) {
+    ++test_mutex_acquire_calls;
+    test_mutex_last_timeout = timeout;
+    if (mutex_id != &test_mutex_object) {
+        test_mutex_wrong_handle = 1U;
+    }
+    ++test_mutex_depth;
+    if (test_mutex_depth > test_mutex_max_depth) {
+        test_mutex_max_depth = test_mutex_depth;
+    }
+    return test_mutex_acquire_result;
+}
+
+osStatus_t osMutexRelease(osMutexId_t mutex_id) {
+    ++test_mutex_release_calls;
+    if (mutex_id != &test_mutex_object) {
+        test_mutex_wrong_handle = 1U;
+    }
+    if (test_mutex_depth != 0U) {
+        --test_mutex_depth;
+    }
+    return test_mutex_release_result;
+}
+
+void Error_Handler(void) { ++test_error_handler_calls; }
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -78,6 +125,57 @@ static void expect_block_equal(const MotionPlanBlock_t *actual, uint32_t sequenc
 
 static void reset_buffer(void) {
     plan_buffer_test_reset();
+    test_mutex_new_fails = 0U;
+    test_mutex_new_calls = 0U;
+    test_mutex_attr_bits = 0U;
+    test_mutex_acquire_calls = 0U;
+    test_mutex_release_calls = 0U;
+    test_mutex_depth = 0U;
+    test_mutex_max_depth = 0U;
+    test_mutex_last_timeout = 0U;
+    test_mutex_wrong_handle = 0U;
+    test_mutex_acquire_result = osOK;
+    test_mutex_release_result = osOK;
+    test_error_handler_calls = 0U;
+}
+
+static void test_mutex_guards_every_operation(void) {
+    reset_buffer();
+    test_mutex_new_fails = 1U;
+    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_NO_MEMORY, "missing mutex fails initialization");
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.initialized, 0U, "buffer stays uninitialized without a mutex");
+    expect_u32(test_mutex_acquire_calls, 0U, "uninitialized buffer does not lock");
+
+    test_mutex_new_fails = 0U;
+    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_OK, "buffer initializes once the mutex is created");
+    expect_u32(test_mutex_new_calls, 2U, "mutex creation is retried on the next init");
+    expect_u32(test_mutex_attr_bits, osMutexPrioInherit, "mutex uses priority inheritance");
+
+    MotionPlanBlock_t block = make_block(1U);
+    MotionPlanBlock_t output = {0};
+    (void)plan_buffer_try_push(&block);
+    (void)plan_buffer_try_push(NULL);
+    (void)plan_buffer_try_pop(&output);
+    (void)plan_buffer_try_pop(&output);
+    (void)plan_buffer_try_pop(NULL);
+    (void)plan_buffer_clear();
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(test_mutex_acquire_calls, 7U, "every operation on an initialized buffer locks");
+    expect_u32(test_mutex_release_calls, 7U, "every lock is released");
+    expect_u32(test_mutex_max_depth, 1U, "operations never nest locks");
+    expect_u32(test_mutex_last_timeout, osWaitForever, "operations wait for the mutex holder");
+    expect_u32(test_mutex_wrong_handle, 0U, "operations use the buffer mutex");
+    expect_u32(test_error_handler_calls, 0U, "successful locking raises no fault");
+
+    test_mutex_acquire_result = osErrorParameter;
+    (void)plan_buffer_clear();
+    expect_u32(test_error_handler_calls, 1U, "failed lock is a fatal error");
+    test_mutex_acquire_result = osOK;
+    test_mutex_release_result = osErrorResource;
+    (void)plan_buffer_clear();
+    expect_u32(test_error_handler_calls, 2U, "failed unlock is a fatal error");
 }
 
 static void test_initialization_and_preinit_results(void) {
@@ -89,6 +187,8 @@ static void test_initialization_and_preinit_results(void) {
     expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "push before init is rejected");
     expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "pop before init is rejected");
     expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "clear before init is rejected");
+    expect_u32(plan_buffer_try_push(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null push before init is rejected");
+    expect_u32(plan_buffer_try_pop(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null pop before init is rejected");
     plan_buffer_get_diagnostics(NULL);
     expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "preinit diagnostics are available");
     expect_u32(diagnostics.initialized, 0U, "diagnostics report uninitialized buffer");
@@ -242,6 +342,7 @@ int main(void) {
     test_clear_cancels_only_pending_blocks();
     test_invalid_arguments_are_reported();
     test_diagnostic_counters_saturate();
+    test_mutex_guards_every_operation();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Plan buffer unit tests failed: %u\n", (unsigned int)test_failures);

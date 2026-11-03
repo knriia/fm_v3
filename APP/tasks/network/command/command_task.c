@@ -3,6 +3,7 @@
 #include "command/command_queue.h"
 #include "command_decoder.h"
 #include "command_protocol.h"
+#include "motion_stop.h"
 #include "network_events.h"
 #include "task_context.h"
 
@@ -551,6 +552,10 @@ static uint8_t command_task_handle_assembly_event(
     if (decoder_result.type == COMMAND_DECODER_RESULT_COMMAND_READY) {
         const CommandDTO_t *decoded_command = &decoder_result.command;
         response_sequence = decoded_command->sequence;
+        if (decoded_command->code == COMMAND_CODE_STOP) {
+            /* STOP may not wait behind the commands it cancels. */
+            motion_task_request_stop();
+        }
         const CommandQueuePutResult_t queue_result = command_queue_try_send(decoded_command);
         if (queue_result == COMMAND_QUEUE_PUT_OK) {
             /* The command fitted, so space was freed: the older held ACK goes first to keep the order. */

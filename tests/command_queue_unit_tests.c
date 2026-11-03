@@ -100,6 +100,16 @@ uint32_t osMessageQueueGetCount(osMessageQueueId_t queue_id) {
     return test_queue.count;
 }
 
+static uint32_t test_reset_calls;
+
+osStatus_t osMessageQueueReset(osMessageQueueId_t queue_id) {
+    ++test_reset_calls;
+    if (queue_id == &test_queue) {
+        test_queue.count = 0U;
+    }
+    return osOK;
+}
+
 uint32_t osMessageQueueGetSpace(osMessageQueueId_t queue_id) {
     (void)queue_id;
     return test_queue.capacity - test_queue.count;
@@ -131,6 +141,8 @@ static void test_command_queue_initialization_and_arguments(void) {
     expect_u32(command_queue_try_send(NULL), COMMAND_QUEUE_PUT_ERROR, "null command cannot be queued");
     expect_u32(command_queue_receive(NULL, 0U), (uint32_t)osErrorParameter, "null receive output is rejected");
     expect_u32(command_queue_free_slots(), 0U, "uninitialized queue has no free slots");
+    command_queue_discard_all();
+    expect_u32(test_reset_calls, 0U, "uninitialized queue has nothing to discard");
     command_queue_get_diagnostics(NULL);
     command_queue_get_diagnostics(&diagnostics);
     expect_u32(diagnostics.initialized, 0U, "diagnostics report queue is not initialized");
@@ -170,6 +182,11 @@ static void test_command_queue_space_listener(void) {
     expect_u32(command_queue_free_slots(), free_before, "received command frees its slot");
     expect_u32(command_queue_receive(&output, 0U), (uint32_t)osErrorResource, "empty queue has nothing to take");
     expect_u32(test_space_listener_calls, 1U, "failed receive does not report free space");
+
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "command is queued before a discard");
+    command_queue_discard_all();
+    expect_u32(test_reset_calls, 1U, "discard resets the RTOS queue");
+    expect_u32(command_queue_free_slots(), free_before, "discard frees every slot");
 
     command_queue_set_space_listener(NULL);
     expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "command is queued without a listener");

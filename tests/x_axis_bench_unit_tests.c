@@ -1,5 +1,7 @@
 #include "motion/x_axis_bench.h"
 
+#include "cmsis_os.h"
+
 #include <assert.h>
 #include <stdio.h>
 
@@ -12,6 +14,20 @@ static int32_t fake_last_signed_steps;
 static uint32_t fake_last_initial_rate_hz;
 static uint32_t fake_last_target_rate_hz;
 static uint32_t fake_last_acceleration;
+static uint32_t fake_kernel_lock_depth;
+static uint32_t fake_kernel_lock_calls;
+static uint32_t fake_started_unlocked;
+
+int32_t osKernelLock(void) {
+    ++fake_kernel_lock_calls;
+    ++fake_kernel_lock_depth;
+    return 0;
+}
+
+int32_t osKernelUnlock(void) {
+    --fake_kernel_lock_depth;
+    return 1;
+}
 
 MotionHardwareXStatus_t motion_hardware_x_init(const MotionHardwareXConfig_t *config) {
     assert(config != NULL);
@@ -29,6 +45,9 @@ MotionHardwareXStatus_t motion_hardware_x_start_jog_profile(
     uint32_t acceleration_steps_per_s2
 ) {
     ++fake_start_calls;
+    if (fake_kernel_lock_depth == 0U) {
+        ++fake_started_unlocked;
+    }
     fake_last_signed_steps = signed_steps;
     fake_last_initial_rate_hz = initial_step_rate_hz;
     fake_last_target_rate_hz = target_step_rate_hz;
@@ -186,6 +205,9 @@ int main(void) {
     test_rate_is_limited_by_driver_timing();
     test_zero_driver_timing_rejects_any_rate();
     test_busy_fault_and_start_error();
+    assert(fake_kernel_lock_calls > 0U);
+    assert(fake_kernel_lock_depth == 0U);
+    assert(fake_started_unlocked == 0U);
     puts("X-axis bench unit tests passed");
     return 0;
 }

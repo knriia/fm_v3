@@ -102,6 +102,8 @@ typedef struct {
     CommandQueueDiagnostics_t command_queue;
     MotionTaskDiagnosticsDTO_t motion_task;
     PlanBufferDiagnostics_t plan_buffer;
+    /* Appended last so the offsets of all earlier fields stay the same for existing clients. */
+    MotionAxisDiagnostics x_axis;
 } DiagnosticPayloadDTO_t;
 
 typedef struct {
@@ -131,7 +133,8 @@ _Static_assert(sizeof(MotionTaskDiagnosticsDTO_t) == 76U, "Invalid MotionTask di
 _Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
 _Static_assert(sizeof(CommandQueueDiagnostics_t) == 32U, "Invalid CommandQueue diagnostics size");
 _Static_assert(sizeof(PlanBufferDiagnostics_t) == 48U, "Invalid PlanBuffer diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2244U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2252U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(MotionAxisDiagnostics) == 48U, "Invalid axis diagnostics size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2292U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2300U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

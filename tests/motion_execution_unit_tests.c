@@ -208,6 +208,40 @@ static void test_execution_buffer_capacity_wrap_and_clear(void) {
     assert(execution_buffer_try_pop(&output) == EXECUTION_BUFFER_STATUS_EMPTY);
 }
 
+static uint32_t test_space_listener_calls;
+
+static void test_space_listener(void) { ++test_space_listener_calls; }
+
+static void test_execution_buffer_space_listener(void) {
+    execution_buffer_init();
+    test_space_listener_calls = 0U;
+    execution_buffer_set_space_listener(test_space_listener);
+    MotionExecutionEvent_t event = {.interval_ns = 1000U, .sequence = 1U, .step_mask = 1U};
+    MotionExecutionEvent_t output = {0};
+
+    for (uint32_t index = 0U; index < EXECUTION_BUFFER_CAPACITY; ++index) {
+        assert(execution_buffer_try_push(&event) == EXECUTION_BUFFER_STATUS_OK);
+    }
+    while (execution_buffer_count() > EXECUTION_BUFFER_LOW_WATERMARK + 1U) {
+        assert(execution_buffer_try_pop(&output) == EXECUTION_BUFFER_STATUS_OK);
+    }
+    assert(test_space_listener_calls == 0U);
+    assert(execution_buffer_try_pop(&output) == EXECUTION_BUFFER_STATUS_OK);
+    assert(execution_buffer_count() == EXECUTION_BUFFER_LOW_WATERMARK);
+    assert(test_space_listener_calls == 1U);
+    while (execution_buffer_try_pop(&output) == EXECUTION_BUFFER_STATUS_OK) {
+    }
+    assert(test_space_listener_calls == 1U);
+
+    execution_buffer_set_space_listener(NULL);
+    for (uint32_t index = 0U; index <= EXECUTION_BUFFER_LOW_WATERMARK; ++index) {
+        assert(execution_buffer_try_push(&event) == EXECUTION_BUFFER_STATUS_OK);
+    }
+    assert(execution_buffer_try_pop(&output) == EXECUTION_BUFFER_STATUS_OK);
+    assert(test_space_listener_calls == 1U);
+    execution_buffer_clear();
+}
+
 static MotionExecutionEvent_t make_event(uint32_t sequence, uint8_t last) {
     return (MotionExecutionEvent_t){
         .interval_ns = 1000000U,
@@ -240,6 +274,20 @@ static void test_step_executor_completion_and_underrun(void) {
     assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
     assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_UNDERRUN);
     assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_UNDERRUN);
+
+    /* Queued blocks run back to back: the end of one block is not a stop when the next one is waiting. */
+    execution_buffer_clear();
+    step_executor_reset();
+    MotionExecutionEvent_t block_end = make_event(3U, 1U);
+    MotionExecutionEvent_t next_block = make_event(4U, 1U);
+    assert(execution_buffer_try_push(&block_end) == EXECUTION_BUFFER_STATUS_OK);
+    assert(execution_buffer_try_push(&next_block) == EXECUTION_BUFFER_STATUS_OK);
+    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
+    assert(output.sequence == 3U);
+    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_OK);
+    assert(output.sequence == 4U && output.last_in_block == 1U);
+    assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_OK);
+    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_COMPLETE);
 }
 
 static void test_step_executor_state_guards(void) {
@@ -291,6 +339,7 @@ int main(void) {
     test_generator_next_guards_and_exact_interval();
     test_generator_detects_corrupted_state();
     test_execution_buffer_capacity_wrap_and_clear();
+    test_execution_buffer_space_listener();
     test_step_executor_completion_and_underrun();
     test_step_executor_state_guards();
     test_step_executor_rejects_invalid_events();

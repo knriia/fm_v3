@@ -12,8 +12,9 @@
 typedef struct {
     int32_t min_position_um;
     int32_t max_position_um;
-    uint32_t steps_per_mm_numerator;
-    uint32_t steps_per_mm_denominator;
+    /* Motor steps per micrometre as an exact ratio: steps = um * numerator / denominator. */
+    uint32_t steps_per_um_numerator;
+    uint32_t steps_per_um_denominator;
     uint32_t max_speed_um_per_s;
 } MotionPlannerAxisConfig_t;
 
@@ -64,7 +65,8 @@ typedef struct {
     MotionPlanBlock_t block;
 } MotionPlannerResult_t;
 
-/* Pure planner: it validates a homed absolute XYZ move and returns one plan block. */
+/* Pure planner: it validates an absolute XYZ move and returns one plan block. Only axes whose target differs from
+ * their current position must be configured and homed, so a machine can run with some axes not fitted yet. */
 MotionPlannerResult_t motion_planner_plan_linear(
     const MotionPlannerRequest_t *request,
     const MotionPlannerMachineState_t *machine_state,
