@@ -474,7 +474,7 @@ static void motion_hardware_x_configure_gpio(const MotionHardwareXConfig_t *conf
 }
 
 static void motion_hardware_x_configure_exti(const MotionHardwareXConfig_t *config) {
-    const uint32_t start_edge = config->start_limit_active_high != 0U ? MOTION_X_START_LIMIT_PIN : 0U;
+    /* PF10 (start) is watched on both edges: homing also needs the moment the switch is released. */
     const uint32_t end_edge = config->end_limit_active_high != 0U ? MOTION_X_END_LIMIT_PIN : 0U;
     SYSCFG->EXTICR[2] = (SYSCFG->EXTICR[2] & ~(SYSCFG_EXTICR3_EXTI9_Msk | SYSCFG_EXTICR3_EXTI10_Msk)) |
                         SYSCFG_EXTICR3_EXTI9_PF | SYSCFG_EXTICR3_EXTI10_PF;

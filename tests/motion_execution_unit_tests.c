@@ -272,8 +272,10 @@ static void test_step_executor_completion_and_underrun(void) {
     first = make_event(2U, 0U);
     assert(execution_buffer_try_push(&first) == EXECUTION_BUFFER_STATUS_OK);
     assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
+    const uint32_t underruns_before = step_executor_get_underrun_count();
     assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_UNDERRUN);
     assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_UNDERRUN);
+    assert(step_executor_get_underrun_count() == underruns_before + 1U);
 
     /* Queued blocks run back to back: the end of one block is not a stop when the next one is waiting. */
     execution_buffer_clear();
@@ -300,7 +302,9 @@ static void test_step_executor_state_guards(void) {
     assert(step_executor_pulse_complete(NULL) == STEP_EXECUTOR_STATUS_INVALID_ARGUMENT);
     assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_NOT_RUNNING);
 
+    const uint32_t underruns_before = step_executor_get_underrun_count();
     assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_UNDERRUN);
+    assert(step_executor_get_underrun_count() == underruns_before);
 
     step_executor_reset();
     MotionExecutionEvent_t event = make_event(3U, 1U);

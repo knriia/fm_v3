@@ -68,25 +68,9 @@ typedef enum {
 } CommandDecoderResultType_t;
 
 typedef struct {
-    uint32_t protocol_version;
-    uint32_t max_payload_size;
-    uint32_t max_frame_size;
-    uint32_t requests_received;
-    uint32_t request_queue_overflows; /* Reserved for diagnostic wire compatibility. */
-    uint32_t request_bytes_dropped;   /* Reserved for diagnostic wire compatibility. */
     uint32_t commands_received;
     uint32_t commands_rejected;
-    uint32_t pings_received;
-    uint32_t responses_formed;
-    uint32_t pongs_formed;
-    uint32_t errors_formed;
-    uint32_t invalid_payload_length;
-    uint32_t unsupported_version;
-    uint32_t unexpected_type;
-    uint32_t invalid_sequence;
-    uint32_t unknown_commands;
-    uint32_t invalid_states;
-    uint32_t response_queue_overflows; /* Reserved for diagnostic wire compatibility. */
+    /* Error code of the last rejected request; the client gets the same code in its ERROR response. */
     int32_t last_error;
 } CommandDecoderDiagnostics;
 

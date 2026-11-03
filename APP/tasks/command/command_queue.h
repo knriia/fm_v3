@@ -10,11 +10,9 @@
 
 typedef enum { COMMAND_QUEUE_PUT_OK = 0, COMMAND_QUEUE_PUT_FULL, COMMAND_QUEUE_PUT_ERROR } CommandQueuePutResult_t;
 
+/* Sent as is in the diagnostic frame. */
 typedef struct {
-    uint32_t initialized;
-    uint32_t capacity;
     uint32_t queued;
-    uint32_t available;
     uint32_t max_queued;
     uint32_t enqueued_total;
     uint32_t full_rejections;

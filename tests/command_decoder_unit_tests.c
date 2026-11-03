@@ -390,44 +390,30 @@ static void test_temperature_output_tool_and_stop_commands(void) {
     (void)command_decoder_decode_command(&request);
 }
 
-static void test_decoder_diagnostics_and_error_mapping(void) {
+static void test_decoder_diagnostics(void) {
     reset_decoder();
-    command_decoder_record_request_error(COMMAND_ERROR_UNSUPPORTED_VERSION);
-    command_decoder_record_request_error(COMMAND_ERROR_UNEXPECTED_TYPE);
-    command_decoder_record_request_error(COMMAND_ERROR_INVALID_LENGTH);
-    command_decoder_record_request_error(COMMAND_ERROR_INVALID_SEQUENCE);
-    command_decoder_record_request_error(COMMAND_ERROR_UNKNOWN_COMMAND);
-    command_decoder_record_request_error(COMMAND_ERROR_INVALID_STATE);
-    command_decoder_record_request_error(UINT16_MAX);
-
     CommandRequestDTO_t request = make_request(COMMAND_MESSAGE_TYPE_PING, 501U, NULL, 0U);
-    command_decoder_diagnostics.requests_received = UINT32_MAX;
-    command_decoder_diagnostics.pings_received = UINT32_MAX;
+    (void)command_decoder_decode_request(&request);
+
+    const uint8_t stop[] = {COMMAND_CODE_STOP};
+    request = make_request(COMMAND_MESSAGE_TYPE_COMMAND, 502U, stop, sizeof(stop));
+    (void)command_decoder_decode_request(&request);
+    const uint8_t unknown[] = {0xFEU};
+    request = make_request(COMMAND_MESSAGE_TYPE_COMMAND, 503U, unknown, sizeof(unknown));
     (void)command_decoder_decode_request(&request);
 
     CommandDecoderDiagnostics diagnostics = {0};
     command_decoder_get_diagnostics(NULL);
     command_decoder_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.protocol_version, COMMAND_PROTOCOL_VERSION, "diagnostics report protocol version");
-    expect_u32(diagnostics.max_payload_size, COMMAND_MAX_PAYLOAD_SIZE, "diagnostics report maximum payload");
-    expect_u32(diagnostics.max_frame_size, COMMAND_MAX_FRAME_SIZE, "diagnostics report maximum frame");
-    expect_u32(diagnostics.requests_received, UINT32_MAX, "request counter saturates");
-    expect_u32(diagnostics.request_queue_overflows, 0U, "removed request queue reports zero");
-    expect_u32(diagnostics.request_bytes_dropped, 0U, "removed request buffer reports zero");
-    expect_u32(diagnostics.commands_received, 0U, "command count is copied");
-    expect_u32(diagnostics.commands_rejected, 0U, "rejected command count is copied");
-    expect_u32(diagnostics.pings_received, UINT32_MAX, "ping counter saturates");
-    expect_u32(diagnostics.responses_formed, 1U, "formed response count is copied");
-    expect_u32(diagnostics.pongs_formed, 1U, "formed PONG count is copied");
-    expect_u32(diagnostics.errors_formed, 0U, "formed ERROR count is copied");
-    expect_u32(diagnostics.invalid_payload_length, 1U, "invalid length count is mapped");
-    expect_u32(diagnostics.unsupported_version, 1U, "version error count is mapped");
-    expect_u32(diagnostics.unexpected_type, 1U, "type error count is mapped");
-    expect_u32(diagnostics.invalid_sequence, 1U, "sequence error count is mapped");
-    expect_u32(diagnostics.unknown_commands, 1U, "unknown command count is mapped");
-    expect_u32(diagnostics.invalid_states, 1U, "invalid state count is mapped");
-    expect_u32(diagnostics.response_queue_overflows, 0U, "removed response queue reports zero");
-    expect_u32(diagnostics.last_error, UINT16_MAX, "last error stores unknown error code");
+    expect_u32(diagnostics.commands_received, 2U, "only commands are counted, not pings");
+    expect_u32(diagnostics.commands_rejected, 1U, "rejected command is counted");
+    expect_u32((uint32_t)diagnostics.last_error, COMMAND_ERROR_UNKNOWN_COMMAND, "last error keeps the rejection code");
+
+    command_decoder_diagnostics.commands_received = UINT32_MAX;
+    request = make_request(COMMAND_MESSAGE_TYPE_COMMAND, 504U, stop, sizeof(stop));
+    (void)command_decoder_decode_request(&request);
+    command_decoder_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.commands_received, UINT32_MAX, "command counter saturates");
 }
 
 int main(void) {
@@ -437,7 +423,7 @@ int main(void) {
     test_x_jog_validation_and_decode();
     test_motion_operation_validation_and_decode();
     test_temperature_output_tool_and_stop_commands();
-    test_decoder_diagnostics_and_error_mapping();
+    test_decoder_diagnostics();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Command decoder unit tests failed: %u\n", test_failures);

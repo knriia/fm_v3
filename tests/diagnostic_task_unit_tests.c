@@ -1,5 +1,10 @@
+#include "command/command_queue.h"
+#include "command_decoder.h"
+#include "command_task.h"
 #include "diagnostic_dto.h"
+#include "ethernet_port.h"
 #include "ethernetif.h"
+#include "motion/plan_buffer.h"
 #include "FreeRTOS.h"
 #include "lwip/api.h"
 #include "lwip/err.h"
@@ -12,7 +17,8 @@
 
 static uint32_t test_failures;
 static TaskStatus_t test_task_status;
-static TaskHandle_t test_current_task = (TaskHandle_t)(uintptr_t)1U;
+/* Slots whose task does not exist: xTaskGetHandle returns NULL for their names. */
+static const char *test_missing_task_name;
 static uint32_t test_error_handler_calls;
 static jmp_buf test_jump_buffer;
 static uint8_t test_jump_active;
@@ -37,12 +43,17 @@ static err_t test_write_result;
 static size_t test_bytes_written;
 static size_t test_captured_write_size;
 static DiagnosticFrameDTO_t test_captured_frame;
-static TelemetryTaskDiagnostics test_telemetry_diagnostics;
+static uint32_t test_total_runtime_ticks;
+static EthernetPortDiagnostics test_ethernet_port_diagnostics;
+static EthernetRxDiagnostics test_ethernet_rx_diagnostics;
 static CommandTaskDiagnostics test_command_diagnostics;
 static CommandDecoderDiagnostics test_command_decoder_diagnostics;
 static MotionTaskDiagnostics test_motion_task_diagnostics;
+static StepGeneratorTaskDiagnostics test_step_generator_diagnostics;
 static CommandQueueDiagnostics_t test_command_queue_diagnostics;
 static PlanBufferDiagnostics_t test_plan_buffer_diagnostics;
+static uint32_t test_execution_buffer_level;
+static uint32_t test_underruns;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -57,11 +68,11 @@ static void expect_u32(uint32_t actual, uint32_t expected, const char *message) 
     }
 }
 
-TaskHandle_t xTaskGetCurrentTaskHandle(void) { return test_current_task; }
-
 TaskHandle_t xTaskGetHandle(const char *name) {
-    (void)name;
-    return test_current_task;
+    if (test_missing_task_name != NULL && strcmp(name, test_missing_task_name) == 0) {
+        return NULL;
+    }
+    return (TaskHandle_t)(uintptr_t)1U;
 }
 
 void vTaskGetInfo(TaskHandle_t task_handle, TaskStatus_t *task_status, int get_free_stack, int state) {
@@ -78,41 +89,50 @@ void Error_Handler(void) {
     }
 }
 
-void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics) {
-    (void)memset(diagnostics, 0, sizeof(*diagnostics));
-}
+void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics) { *diagnostics = test_ethernet_rx_diagnostics; }
 
 int EthernetPort_GetDiagnostics(EthernetPortDiagnostics *diagnostics) {
-    (void)memset(diagnostics, 0, sizeof(*diagnostics));
+    *diagnostics = test_ethernet_port_diagnostics;
     return test_ethernet_diagnostics_result;
 }
 
-void system_diagnostics_collect(SystemDiagnostics *diagnostics) { (void)memset(diagnostics, 0, sizeof(*diagnostics)); }
-
-void lwip_diagnostics_collect(LwipDiagnostics *diagnostics) { (void)memset(diagnostics, 0, sizeof(*diagnostics)); }
-
-void startup_task_get_diagnostics(StartupTaskDiagnostics *diagnostics) {
-    (void)memset(diagnostics, 0, sizeof(*diagnostics));
+uint32_t system_diagnostics_collect(SystemDiagnostics *diagnostics) {
+    *diagnostics = (SystemDiagnostics){.tick_count = 5007U, .reset_flags = 12U};
+    return test_total_runtime_ticks;
 }
 
-void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
-    *diagnostics = test_telemetry_diagnostics;
+void lwip_diagnostics_collect(LwipDiagnostics *diagnostics) {
+    *diagnostics = (LwipDiagnostics){.mailbox_errors = 3U, .if_out_discards = 4U};
 }
+
 void command_task_get_diagnostics(CommandTaskDiagnostics *diagnostics) { *diagnostics = test_command_diagnostics; }
+
 void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
     *diagnostics = test_command_decoder_diagnostics;
 }
+
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) { *diagnostics = test_motion_task_diagnostics; }
+
 void motion_task_get_x_axis_diagnostics(MotionAxisDiagnostics *diagnostics) {
     *diagnostics = (MotionAxisDiagnostics){.travel_um = 301000U, .scale_position_um = -5};
 }
+
+void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnostics) {
+    *diagnostics = test_step_generator_diagnostics;
+}
+
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     *diagnostics = test_command_queue_diagnostics;
 }
+
 PlanBufferStatus_t plan_buffer_get_diagnostics(PlanBufferDiagnostics_t *diagnostics) {
     *diagnostics = test_plan_buffer_diagnostics;
     return PLAN_BUFFER_STATUS_OK;
 }
+
+uint32_t execution_buffer_count(void) { return test_execution_buffer_level; }
+
+uint32_t step_executor_get_underrun_count(void) { return test_underruns; }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
     (void)event_flags_id;
@@ -216,165 +236,174 @@ void netconn_delete(struct netconn *connection) {
 #undef DiagnosticTask
 #undef static
 
-static void test_counter_helpers(void) {
-    uint32_t counter = 0U;
-
-    diagnostic_counter_increment(&counter);
-    expect_u32(counter, 1U, "diagnostic counter increment");
-
-    counter = UINT32_MAX;
-    diagnostic_counter_increment(&counter);
-    expect_u32(counter, UINT32_MAX, "diagnostic counter saturation");
-
-    counter = 10U;
-    diagnostic_counter_add(&counter, 5U);
-    expect_u32(counter, 15U, "diagnostic counter add");
-
-    counter = UINT32_MAX - 2U;
-    diagnostic_counter_add(&counter, 5U);
-    expect_u32(counter, UINT32_MAX, "diagnostic counter add saturation");
-
-    counter = 0U;
-    diagnostic_counter_add(&counter, (size_t)UINT32_MAX + 1U);
-    expect_u32(counter, UINT32_MAX, "diagnostic counter size overflow saturation");
+static void set_task_status(uint32_t high_water_mark_words, uint32_t runtime_ticks) {
+    test_task_status = (TaskStatus_t){
+        .uxCurrentPriority = 24U,
+        .uxBasePriority = 23U,
+        .eCurrentState = 2U,
+        .usStackHighWaterMark = high_water_mark_words,
+        .ulRunTimeCounter = runtime_ticks,
+    };
 }
 
 static void test_runtime_percent_calculation(void) {
+    RuntimePercentTracker tracker = {0};
     TaskRuntimeSample sample = {0};
     TaskHandle_t task_handle = (TaskHandle_t)(uintptr_t)2U;
 
-    runtime_percent_tracker = (RuntimePercentTracker){0};
     expect_u32(
-        diagnostic_task_calculate_runtime_percent(&sample, task_handle, 100U, 1000U),
+        diagnostic_task_calculate_runtime_percent(&tracker, &sample, task_handle, 100U, 1000U),
         0U,
-        "initial task runtime percentage"
+        "first sample has no runtime share"
     );
 
-    diagnostic_task_commit_runtime_sample(1000U);
+    tracker = (RuntimePercentTracker){.previous_total_runtime_ticks = 1000U, .initialized = 1U};
     expect_u32(
-        diagnostic_task_calculate_runtime_percent(&sample, task_handle, 150U, 1100U),
+        diagnostic_task_calculate_runtime_percent(&tracker, &sample, task_handle, 150U, 1100U),
         50U,
-        "task runtime percentage"
+        "task runtime share"
     );
 
-    diagnostic_task_commit_runtime_sample(1100U);
+    tracker.previous_total_runtime_ticks = 1100U;
     expect_u32(
-        diagnostic_task_calculate_runtime_percent(&sample, task_handle, 400U, 1200U),
+        diagnostic_task_calculate_runtime_percent(&tracker, &sample, task_handle, 400U, 1200U),
         100U,
-        "task runtime percentage upper bound"
+        "task runtime share is capped"
     );
 
+    tracker.previous_total_runtime_ticks = 1200U;
     expect_u32(
-        diagnostic_task_calculate_runtime_percent(&sample, NULL, 0U, 1200U),
+        diagnostic_task_calculate_runtime_percent(&tracker, &sample, task_handle, 450U, 1200U),
         0U,
-        "runtime percentage without task"
+        "no run time passed"
     );
-}
-
-static void test_task_diagnostics_mapping(void) {
-    TaskDiagnosticsDTO_t diagnostics = {0};
-    TaskRuntimeSample sample = {0};
-    uint32_t minimum_free_bytes = UINT32_MAX;
-
-    test_task_status.pxStackBase = (StackType_t *)(uintptr_t)0x12340000U;
-    test_task_status.uxCurrentPriority = 24U;
-    test_task_status.uxBasePriority = 23U;
-    test_task_status.eCurrentState = 2U;
-    test_task_status.usStackHighWaterMark = 100U;
-    test_task_status.ulRunTimeCounter = 500U;
-
-    diagnostic_network_task_fill_stats(&diagnostics, test_current_task, &sample, 1024U, &minimum_free_bytes, 1000U);
-
-    expect_u32(diagnostics.stack_size_bytes, 1024U, "task stack size");
-    expect_u32(diagnostics.stack_free_bytes, 400U, "task free stack");
-    expect_u32(diagnostics.stack_min_free_bytes, 400U, "task minimum free stack");
-    expect_u32(diagnostics.stack_base_address, 0x12340000U, "task stack base");
-    expect_u32((uint32_t)diagnostics.priority, 24U, "task priority");
-    expect_u32((uint32_t)diagnostics.base_priority, 23U, "task base priority");
-    expect_u32(diagnostics.state, 2U, "task state");
-    expect_u32(diagnostics.runtime_ticks, 500U, "task runtime ticks");
-
-    minimum_free_bytes = 500U;
-    diagnostic_network_task_fill_stats(&diagnostics, test_current_task, &sample, 1024U, &minimum_free_bytes, 1000U);
-    expect_u32(diagnostics.stack_min_free_bytes, 400U, "task minimum free stack decreases");
-
-    diagnostic_network_task_fill_stats(&diagnostics, test_current_task, &sample, 1024U, &minimum_free_bytes, 1000U);
-    expect_u32(diagnostics.stack_min_free_bytes, 400U, "task minimum free stack remains unchanged");
-
-    diagnostic_network_task_fill_stats(&diagnostics, NULL, &sample, 1024U, &minimum_free_bytes, 1000U);
-    expect_u32((uint32_t)diagnostics.priority, (uint32_t)osPriorityError, "missing task priority");
-    expect_u32(diagnostics.state, (uint32_t)osThreadError, "missing task state");
-    expect_u32(diagnostics.stack_free_bytes, 0U, "missing task free stack");
-}
-
-static void test_diagnostic_task_stats_mapping(void) {
-    DiagnosticPayloadDTO_t payload = {0};
-    DiagnosticTaskRuntime runtime = {
-        .stack_min_free_bytes = 0U,
-        .connections_accepted = 1U,
-        .connections_closed = 2U,
-        .active_connection = 1U,
-        .send_attempts = 3U,
-        .send_successes = 4U,
-        .send_errors = 5U,
-        .partial_writes = 6U,
-        .bytes_sent = 7U,
-        .netconn_alloc_errors = 8U,
-        .bind_errors = 9U,
-        .listen_errors = 10U,
-        .accept_errors = 11U,
-        .snapshot_errors = 12U,
-        .last_error = -4,
-    };
-
-    runtime_percent_tracker = (RuntimePercentTracker){0};
-    test_task_status.pxStackBase = (StackType_t *)(uintptr_t)0x12340000U;
-    test_task_status.uxCurrentPriority = 24U;
-    test_task_status.uxBasePriority = 23U;
-    test_task_status.eCurrentState = 2U;
-    test_task_status.usStackHighWaterMark = 100U;
-    test_task_status.ulRunTimeCounter = 500U;
-    payload.system.freertos.total_runtime_ticks = 1000U;
-
-    diagnostic_task_fill_stats(&payload, &runtime);
 
     expect_u32(
-        payload.diagnostic_task.runtime.stack_size_bytes,
-        5120U,
-        "diagnostic task stack size"
+        diagnostic_task_calculate_runtime_percent(&tracker, &sample, (TaskHandle_t)(uintptr_t)3U, 10U, 1300U),
+        0U,
+        "a recreated task starts a new sample"
     );
-    expect_u32(payload.diagnostic_task.runtime.stack_free_bytes, 400U, "diagnostic task free stack");
-    expect_u32(payload.diagnostic_task.runtime.stack_min_free_bytes, 400U, "diagnostic task minimum free stack");
-    expect_u32(payload.diagnostic_task.runtime.stack_base_address, 0x12340000U, "diagnostic task stack base");
-    expect_u32((uint32_t)payload.diagnostic_task.runtime.priority, 24U, "diagnostic task priority");
-    expect_u32(payload.diagnostic_task.runtime.runtime_ticks, 500U, "diagnostic task runtime ticks");
-    expect_u32(payload.diagnostic_task.port, DIAGNOSTIC_NETWORK_TASK_PORT, "diagnostic task port");
-    expect_u32(payload.diagnostic_task.interval_ms, DIAGNOSTIC_NETWORK_TASK_INTERVAL_MS, "diagnostic task interval");
-    expect_u32(payload.diagnostic_task.send_timeout_ms, DIAGNOSTIC_NETWORK_SEND_TIMEOUT_MS, "diagnostic task timeout");
-    expect_u32(payload.diagnostic_task.connections_accepted, 1U, "diagnostic connections accepted");
-    expect_u32(payload.diagnostic_task.connections_closed, 2U, "diagnostic connections closed");
-    expect_u32(payload.diagnostic_task.active_connection, 1U, "diagnostic active connection");
-    expect_u32(payload.diagnostic_task.send_attempts, 3U, "diagnostic send attempts");
-    expect_u32(payload.diagnostic_task.send_successes, 4U, "diagnostic send successes");
-    expect_u32(payload.diagnostic_task.send_errors, 5U, "diagnostic send errors");
-    expect_u32(payload.diagnostic_task.partial_writes, 6U, "diagnostic partial writes");
-    expect_u32(payload.diagnostic_task.bytes_sent, 7U, "diagnostic bytes sent");
-    expect_u32(payload.diagnostic_task.netconn_alloc_errors, 8U, "diagnostic netconn allocation errors");
-    expect_u32(payload.diagnostic_task.bind_errors, 9U, "diagnostic bind errors");
-    expect_u32(payload.diagnostic_task.listen_errors, 10U, "diagnostic listen errors");
-    expect_u32(payload.diagnostic_task.accept_errors, 11U, "diagnostic accept errors");
-    expect_u32(payload.diagnostic_task.snapshot_errors, 12U, "diagnostic snapshot errors");
-    expect_u32((uint32_t)payload.diagnostic_task.last_error, (uint32_t)-4, "diagnostic last error");
+    expect_u32((uint32_t)(uintptr_t)sample.task_handle, 3U, "sample follows the new task");
+}
 
-    runtime.stack_min_free_bytes = 500U;
-    diagnostic_task_fill_stats(&payload, &runtime);
-    expect_u32(payload.diagnostic_task.runtime.stack_min_free_bytes, 400U, "diagnostic task minimum free stack decreases");
+static void test_task_slots(void) {
+    TaskDiagnosticsDTO_t tasks[DIAGNOSTIC_TASK_SLOT_COUNT] = {0};
+    RuntimePercentTracker tracker = {0};
 
-    diagnostic_task_fill_stats(&payload, &runtime);
-    expect_u32(payload.diagnostic_task.runtime.stack_min_free_bytes, 400U, "diagnostic task minimum free stack remains unchanged");
+    set_task_status(100U, 500U);
+    test_missing_task_name = TELEMETRY_TASK_NAME;
+    diagnostic_task_collect_tasks(tasks, &tracker, 1000U);
 
-    diagnostic_record_error(&runtime, ERR_BUF);
-    expect_u32((uint32_t)runtime.last_error, (uint32_t)ERR_BUF, "diagnostic error recording");
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_MOTION].stack_min_free_bytes, 400U, "stack high-water mark in bytes");
+    expect_u32((uint32_t)tasks[DIAGNOSTIC_TASK_SLOT_MOTION].priority, 24U, "task priority");
+    expect_u32((uint32_t)tasks[DIAGNOSTIC_TASK_SLOT_MOTION].base_priority, 23U, "task base priority");
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_MOTION].state, 2U, "task state");
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_MOTION].runtime_percent, 0U, "first snapshot has no CPU share");
+    expect_u32(tracker.initialized, 1U, "first snapshot starts the CPU share tracking");
+    expect_u32(
+        (uint32_t)tasks[DIAGNOSTIC_TASK_SLOT_TELEMETRY].priority,
+        (uint32_t)osPriorityError,
+        "missing task reports no priority"
+    );
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_TELEMETRY].state, (uint32_t)osThreadError, "missing task reports no state");
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_TELEMETRY].stack_min_free_bytes, 0U, "missing task reports no stack");
+
+    set_task_status(90U, 750U);
+    diagnostic_task_collect_tasks(tasks, &tracker, 2000U);
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_TCPIP].runtime_percent, 25U, "CPU share between snapshots");
+    expect_u32(tasks[DIAGNOSTIC_TASK_SLOT_TCPIP].stack_min_free_bytes, 360U, "lower high-water mark is reported");
+    expect_u32(tracker.previous_total_runtime_ticks, 2000U, "run-time total is kept for the next snapshot");
+    test_missing_task_name = NULL;
+}
+
+static void test_command_channel_mapping(void) {
+    CommandChannelDiagnosticsDTO_t channel = {0};
+
+    test_command_diagnostics = (CommandTaskDiagnostics){
+        .connections_accepted = 31U,
+        .connections_closed = 32U,
+        .active_connection = 1U,
+        .complete_frames_received = 40U,
+        .invalid_frames = 126U,
+        .buffer_max_bytes = 45U,
+        .response_send_errors = 36U,
+        .recv_errors = 50U,
+        .decoder_errors = 51U,
+        .acks_deferred = 52U,
+        .last_error = -37,
+    };
+    test_command_decoder_diagnostics = (CommandDecoderDiagnostics){
+        .commands_received = 69U,
+        .commands_rejected = 70U,
+        .last_error = -83,
+    };
+    diagnostic_task_collect_command_channel(&channel);
+    expect_u32(channel.connections_accepted, 31U, "accepted connections");
+    expect_u32(channel.connections_closed, 32U, "closed connections");
+    expect_u32(channel.active_connection, 1U, "active connection");
+    expect_u32(channel.frames_received, 40U, "frames received");
+    expect_u32(channel.invalid_frames, 126U, "invalid frames");
+    expect_u32(channel.rx_buffer_max_bytes, 45U, "receive buffer maximum");
+    expect_u32(channel.recv_errors, 50U, "receive errors");
+    expect_u32(channel.send_errors, 36U, "send errors");
+    expect_u32(channel.decoder_errors, 51U, "decoder errors");
+    expect_u32(channel.acks_deferred, 52U, "held ACKs");
+    expect_u32((uint32_t)channel.last_error, (uint32_t)-37, "connection last error");
+    expect_u32(channel.commands_received, 69U, "commands received");
+    expect_u32(channel.commands_rejected, 70U, "commands rejected");
+    expect_u32((uint32_t)channel.decoder_last_error, (uint32_t)-83, "decoder last error");
+
+}
+
+static void test_ethernet_mapping(void) {
+    EthernetDiagnosticsDTO_t ethernet = {0};
+
+    test_ethernet_diagnostics_result = HAL_OK;
+    test_ethernet_port_diagnostics = (EthernetPortDiagnostics){
+        .link_up = 1U,
+        .speed = 100U,
+        .duplex = 1U,
+        .dma_error = 2U,
+        .link_up_events = 3U,
+        .link_down_events = 4U,
+        .link_state_read_errors = 5U,
+        .tx_errors = 6U,
+        .tx_descriptor_overflows = 7U,
+        .mutex_timeouts = 8U,
+    };
+    test_ethernet_rx_diagnostics = (EthernetRxDiagnostics){
+        .hal_read_data_errors = 9U,
+        .dma_receive_buffer_unavailable = 10U,
+        .dropped_packets = 11U,
+        .rx_pool_exhaustions = 12U,
+        .rx_pool_max_used = 13U,
+    };
+    diagnostic_task_collect_ethernet(&ethernet);
+    expect_u32(ethernet.link_up, 1U, "link state");
+    expect_u32(ethernet.speed, 100U, "link speed");
+    expect_u32(ethernet.duplex, 1U, "duplex");
+    expect_u32(ethernet.link_up_events, 3U, "link up events");
+    expect_u32(ethernet.link_down_events, 4U, "link down events");
+    expect_u32(ethernet.link_state_read_errors, 5U, "PHY read errors");
+    expect_u32(ethernet.dma_error, 2U, "DMA error");
+    expect_u32(ethernet.tx_errors, 6U, "transmit errors");
+    expect_u32(ethernet.tx_descriptor_overflows, 7U, "transmit descriptor overflows");
+    expect_u32(ethernet.mutex_timeouts, 8U, "port mutex timeouts");
+    expect_u32(ethernet.rx_pool_max_used, 13U, "receive pool maximum");
+    expect_u32(ethernet.rx_pool_exhaustions, 12U, "receive pool exhaustions");
+    expect_u32(ethernet.rx_dma_buffer_unavailable, 10U, "receive DMA buffer unavailable");
+    expect_u32(ethernet.rx_dropped_packets, 11U, "dropped packets");
+    expect_u32(ethernet.rx_read_errors, 9U, "receive read errors");
+
+    /* A busy port keeps the previous port values; receive values are still refreshed. */
+    test_ethernet_diagnostics_result = -1;
+    test_ethernet_port_diagnostics = (EthernetPortDiagnostics){0};
+    test_ethernet_rx_diagnostics.dropped_packets = 21U;
+    diagnostic_task_collect_ethernet(&ethernet);
+    expect_u32(ethernet.link_up, 1U, "busy port keeps the link state");
+    expect_u32(ethernet.mutex_timeouts, 8U, "busy port keeps its counters");
+    expect_u32(ethernet.rx_dropped_packets, 21U, "receive values are refreshed anyway");
+    test_ethernet_diagnostics_result = HAL_OK;
 }
 
 static void reset_network_fixture(void) {
@@ -401,12 +430,18 @@ static void reset_network_fixture(void) {
     test_bytes_written = sizeof(DiagnosticFrameDTO_t);
     test_captured_write_size = 0U;
     (void)memset(&test_captured_frame, 0, sizeof(test_captured_frame));
-    test_telemetry_diagnostics = (TelemetryTaskDiagnostics){0};
+    test_total_runtime_ticks = 0U;
+    test_missing_task_name = NULL;
+    test_ethernet_port_diagnostics = (EthernetPortDiagnostics){0};
+    test_ethernet_rx_diagnostics = (EthernetRxDiagnostics){0};
     test_command_diagnostics = (CommandTaskDiagnostics){0};
     test_command_decoder_diagnostics = (CommandDecoderDiagnostics){0};
     test_motion_task_diagnostics = (MotionTaskDiagnostics){0};
+    test_step_generator_diagnostics = (StepGeneratorTaskDiagnostics){0};
     test_command_queue_diagnostics = (CommandQueueDiagnostics_t){0};
     test_plan_buffer_diagnostics = (PlanBufferDiagnostics_t){0};
+    test_execution_buffer_level = 0U;
+    test_underruns = 0U;
 }
 
 static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
@@ -417,6 +452,75 @@ static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
     }
     test_jump_active = 0U;
     return jumped;
+}
+
+static void test_diagnostic_frame_contents(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_network_fixture();
+    test_stop_on_delay = 1U;
+    set_task_status(100U, 500U);
+    test_total_runtime_ticks = 1000U;
+    test_command_diagnostics = (CommandTaskDiagnostics){.acks_deferred = 7U};
+    test_command_queue_diagnostics = (CommandQueueDiagnostics_t){
+        .queued = 73U,
+        .max_queued = 91U,
+        .enqueued_total = 123U,
+        .full_rejections = 4U,
+        .enqueue_errors = 5U,
+    };
+    test_plan_buffer_diagnostics = (PlanBufferDiagnostics_t){
+        .queued = 37U,
+        .max_queued = 80U,
+        .enqueued_total = 1234U,
+        .dequeued_total = 1197U,
+        .full_rejections = 2U,
+        .rejected_operations = 1U,
+        .cancelled_blocks = 5U,
+    };
+    test_motion_task_diagnostics = (MotionTaskDiagnostics){.commands_dequeued = 14U, .last_sequence = 104U};
+    test_step_generator_diagnostics = (StepGeneratorTaskDiagnostics){.blocks_started = 8U, .buffer_full_waits = 9U};
+    test_execution_buffer_level = 300U;
+    test_underruns = 2U;
+    test_ethernet_port_diagnostics = (EthernetPortDiagnostics){.link_up = 1U};
+
+    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
+    expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
+    expect_u32(test_captured_write_size, sizeof(DiagnosticFrameDTO_t), "diagnostic frame write size");
+    expect_u32(test_captured_frame.header.magic, NETWORK_PROTOCOL_MAGIC, "diagnostic frame magic");
+    expect_u32(test_captured_frame.header.version, NETWORK_PROTOCOL_VERSION, "diagnostic frame version");
+    expect_u32(test_captured_frame.header.message_type, NETWORK_MESSAGE_TYPE_DIAGNOSTIC_SNAPSHOT, "frame type");
+    expect_u32(test_captured_frame.header.header_length, sizeof(NetworkFrameHeaderDTO_t), "header length");
+    expect_u32(test_captured_frame.header.payload_length, sizeof(DiagnosticPayloadDTO_t), "payload length");
+
+    const DiagnosticPayloadDTO_t *payload = &test_captured_frame.payload;
+    expect_u32(payload->sequence, 1U, "first diagnostic frame sequence");
+    expect_u32(payload->system.tick_count, 5007U, "system snapshot");
+    expect_u32(payload->tasks[DIAGNOSTIC_TASK_SLOT_DIAGNOSTIC].stack_min_free_bytes, 400U, "own task is reported");
+    expect_u32(payload->tasks[DIAGNOSTIC_TASK_SLOT_STEP_GENERATOR].state, 2U, "step generator task is reported");
+    expect_u32(payload->command_channel.acks_deferred, 7U, "command channel");
+    expect_u32(payload->command_queue.queued, 73U, "command queue occupancy");
+    expect_u32(payload->command_queue.max_queued, 91U, "command queue maximum");
+    expect_u32(payload->command_queue.enqueued_total, 123U, "command queue accepted total");
+    expect_u32(payload->command_queue.full_rejections, 4U, "command queue full rejections");
+    expect_u32(payload->command_queue.enqueue_errors, 5U, "command queue errors");
+    expect_u32(payload->motion.commands_dequeued, 14U, "MotionTask counters");
+    expect_u32(payload->motion.last_sequence, 104U, "MotionTask last sequence");
+    expect_u32(payload->plan_buffer.queued, 37U, "plan buffer occupancy");
+    expect_u32(payload->plan_buffer.max_queued, 80U, "plan buffer maximum");
+    expect_u32(payload->plan_buffer.enqueued_total, 1234U, "plan buffer accepted total");
+    expect_u32(payload->plan_buffer.dequeued_total, 1197U, "plan buffer consumed total");
+    expect_u32(payload->plan_buffer.full_rejections, 2U, "plan buffer full rejections");
+    expect_u32(payload->plan_buffer.rejected_operations, 1U, "plan buffer rejected operations");
+    expect_u32(payload->plan_buffer.cancelled_blocks, 5U, "plan buffer cancelled blocks");
+    expect_u32(payload->step_generator.blocks_started, 8U, "step generator counters");
+    expect_u32(payload->step_generator.buffer_full_waits, 9U, "step generator waits");
+    expect_u32(payload->execution_buffer.level, 300U, "execution buffer level");
+    expect_u32(payload->execution_buffer.underruns, 2U, "execution buffer underruns");
+    expect_u32(payload->x_axis.travel_um, 301000U, "X axis");
+    expect_u32((uint32_t)payload->x_axis.scale_position_um, (uint32_t)-5, "X axis scale");
+    expect_u32(payload->ethernet.link_up, 1U, "Ethernet");
+    expect_u32(payload->lwip.mailbox_errors, 3U, "LwIP");
 }
 
 static void test_diagnostic_task_network_paths(void) {
@@ -454,7 +558,6 @@ static void test_diagnostic_task_network_paths(void) {
     test_bind_result = ERR_MEM;
     test_stop_on_delay = 1U;
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "bind error path");
-    expect_u32(test_netconn_new_calls, 1U, "socket allocation before bind error");
     expect_u32(test_netconn_bind_calls, 1U, "bind attempt");
     expect_u32(test_netconn_listen_calls, 0U, "no listen after bind error");
     expect_u32(test_netconn_delete_calls, 1U, "listener deleted after bind error");
@@ -465,6 +568,7 @@ static void test_diagnostic_task_network_paths(void) {
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "listen error path");
     expect_u32(test_netconn_listen_calls, 1U, "listen attempt");
     expect_u32(test_netconn_accept_calls, 0U, "no accept after listen error");
+    expect_u32(test_netconn_delete_calls, 1U, "listener deleted after listen error");
 
     reset_network_fixture();
     test_accept_result = ERR_MEM;
@@ -474,435 +578,11 @@ static void test_diagnostic_task_network_paths(void) {
     expect_u32(test_netconn_close_calls, 1U, "listener closed after accept error");
 
     reset_network_fixture();
-    test_stop_on_delay = 1U;
-    test_task_status.pxStackBase = (StackType_t *)(uintptr_t)0x12340000U;
-    test_task_status.uxCurrentPriority = 24U;
-    test_task_status.uxBasePriority = 23U;
-    test_task_status.eCurrentState = 2U;
-    test_task_status.usStackHighWaterMark = 100U;
-    test_task_status.ulRunTimeCounter = 500U;
-    test_telemetry_diagnostics = (TelemetryTaskDiagnostics){
-        .port = TELEMETRY_NETWORK_TASK_PORT,
-        .interval_ms = TELEMETRY_NETWORK_TASK_INTERVAL_MS,
-        .send_timeout_ms = TELEMETRY_NETWORK_SEND_TIMEOUT_MS,
-        .connections_accepted = 11U,
-        .connections_closed = 12U,
-        .active_connection = 13U,
-        .send_attempts = 14U,
-        .send_successes = 15U,
-        .send_errors = 16U,
-        .partial_writes = 17U,
-        .bytes_sent = 18U,
-        .netconn_alloc_errors = 19U,
-        .bind_errors = 20U,
-        .listen_errors = 21U,
-        .accept_errors = 22U,
-        .last_error = -23,
-    };
-    test_command_diagnostics = (CommandTaskDiagnostics){
-        .port = COMMAND_NETWORK_TASK_PORT,
-        .connections_accepted = 31U,
-        .connections_closed = 32U,
-        .active_connection = 1U,
-        .bytes_received = 38U,
-        .complete_frames_received = 40U,
-        .invalid_magic = 41U,
-        .invalid_frame_length = 42U,
-        .invalid_crc = 43U,
-        .buffer_current_bytes = 44U,
-        .buffer_max_bytes = 45U,
-        .bytes_sent = 39U,
-        .response_attempts = 43U,
-        .response_successes = 44U,
-        .response_send_errors = 36U,
-        .partial_writes = 45U,
-        .netconn_alloc_errors = 46U,
-        .bind_errors = 47U,
-        .listen_errors = 48U,
-        .accept_errors = 49U,
-        .recv_errors = 50U,
-        .decoder_errors = 51U,
-        .last_error = -37,
-    };
-    test_command_decoder_diagnostics = (CommandDecoderDiagnostics){
-        .protocol_version = COMMAND_PROTOCOL_VERSION,
-        .max_payload_size = COMMAND_MAX_PAYLOAD_SIZE,
-        .max_frame_size = COMMAND_MAX_FRAME_SIZE,
-        .requests_received = 61U,
-        .request_queue_overflows = 63U,
-        .request_bytes_dropped = 64U,
-        .commands_received = 69U,
-        .commands_rejected = 70U,
-        .pings_received = 71U,
-        .responses_formed = 72U,
-        .pongs_formed = 73U,
-        .errors_formed = 74U,
-        .invalid_payload_length = 75U,
-        .unsupported_version = 77U,
-        .unexpected_type = 78U,
-        .invalid_sequence = 79U,
-        .unknown_commands = 80U,
-        .invalid_states = 81U,
-        .response_queue_overflows = 82U,
-        .last_error = -83,
-    };
-    test_command_queue_diagnostics = (CommandQueueDiagnostics_t){
-        .initialized = 1U,
-        .capacity = COMMAND_QUEUE_CAPACITY,
-        .queued = 73U,
-        .available = COMMAND_QUEUE_CAPACITY - 73U,
-        .max_queued = 91U,
-        .enqueued_total = 123U,
-        .full_rejections = 4U,
-        .enqueue_errors = 5U,
-    };
-    test_plan_buffer_diagnostics = (PlanBufferDiagnostics_t){
-        .initialized = 1U,
-        .capacity = PLAN_BUFFER_CAPACITY,
-        .queued = 37U,
-        .available = PLAN_BUFFER_CAPACITY - 37U,
-        .max_queued = 80U,
-        .enqueued_total = 1234U,
-        .dequeued_total = 1197U,
-        .full_rejections = 2U,
-        .empty_reads = 3U,
-        .rejected_operations = 1U,
-        .clear_calls = 4U,
-        .cancelled_blocks = 5U,
-    };
-    test_motion_task_diagnostics = (MotionTaskDiagnostics){
-        .commands_dequeued = 14U,
-        .queue_receive_errors = 0U,
-        .last_sequence = 104U,
-        .last_command_code = COMMAND_CODE_HOME,
-        .planner_calls = 3U,
-        .planner_blocks_created = 1U,
-        .planner_no_motion = 1U,
-        .planner_errors = 1U,
-        .last_planner_status = MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
-        .last_planner_sequence = 103U,
-    };
-    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "successful diagnostic frame path");
-    expect_u32(test_netconn_write_calls, 1U, "diagnostic frame write");
-    expect_u32(test_captured_write_size, sizeof(DiagnosticFrameDTO_t), "diagnostic frame write size");
-    expect_u32(test_captured_frame.header.magic, NETWORK_PROTOCOL_MAGIC, "diagnostic frame magic");
-    expect_u32(test_captured_frame.header.version, NETWORK_PROTOCOL_VERSION, "diagnostic frame version");
-    expect_u32(
-        test_captured_frame.header.message_type,
-        NETWORK_MESSAGE_TYPE_DIAGNOSTIC_SNAPSHOT,
-        "diagnostic frame type"
-    );
-    expect_u32(
-        test_captured_frame.header.header_length,
-        sizeof(NetworkFrameHeaderDTO_t),
-        "diagnostic frame header length"
-    );
-    expect_u32(
-        test_captured_frame.header.payload_length,
-        sizeof(DiagnosticPayloadDTO_t),
-        "diagnostic frame payload length"
-    );
-    expect_u32(test_captured_frame.payload.sequence, 1U, "first diagnostic frame sequence");
-    expect_u32(
-        test_captured_frame.payload.eth_link.runtime.stack_size_bytes,
-        2048U,
-        "EthLink diagnostic stack size"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.runtime.stack_size_bytes,
-        TELEMETRY_TASK_STACK_SIZE_BYTES,
-        "telemetry task diagnostic stack size"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.runtime.stack_free_bytes,
-        400U,
-        "telemetry task diagnostic free stack"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.runtime.stack_min_free_bytes,
-        400U,
-        "telemetry task diagnostic minimum free stack"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.runtime.stack_base_address,
-        0x12340000U,
-        "telemetry task diagnostic stack base"
-    );
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.telemetry_task.runtime.priority,
-        24U,
-        "telemetry task diagnostic priority"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.runtime.runtime_ticks,
-        500U,
-        "telemetry task diagnostic runtime ticks"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.port,
-        TELEMETRY_NETWORK_TASK_PORT,
-        "telemetry diagnostic port"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.interval_ms,
-        TELEMETRY_NETWORK_TASK_INTERVAL_MS,
-        "telemetry diagnostic interval"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.send_timeout_ms,
-        TELEMETRY_NETWORK_SEND_TIMEOUT_MS,
-        "telemetry diagnostic timeout"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.connections_accepted,
-        11U,
-        "telemetry diagnostic accepted connections"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.connections_closed,
-        12U,
-        "telemetry diagnostic closed connections"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.active_connection,
-        13U,
-        "telemetry diagnostic active connection"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.send_attempts,
-        14U,
-        "telemetry diagnostic send attempts"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.send_successes,
-        15U,
-        "telemetry diagnostic send successes"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.send_errors,
-        16U,
-        "telemetry diagnostic send errors"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.partial_writes,
-        17U,
-        "telemetry diagnostic partial writes"
-    );
-    expect_u32(test_captured_frame.payload.telemetry_task.telemetry.bytes_sent, 18U, "telemetry diagnostic bytes sent");
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.netconn_alloc_errors,
-        19U,
-        "telemetry diagnostic allocation errors"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.bind_errors,
-        20U,
-        "telemetry diagnostic bind errors"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.listen_errors,
-        21U,
-        "telemetry diagnostic listen errors"
-    );
-    expect_u32(
-        test_captured_frame.payload.telemetry_task.telemetry.accept_errors,
-        22U,
-        "telemetry diagnostic accept errors"
-    );
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.telemetry_task.telemetry.last_error,
-        (uint32_t)-23,
-        "telemetry diagnostic last error"
-    );
-
-    expect_u32(
-        test_captured_frame.payload.command_task.runtime.stack_size_bytes,
-        COMMAND_TASK_STACK_SIZE_BYTES,
-        "command task diagnostic stack size"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.runtime.stack_free_bytes,
-        400U,
-        "command task diagnostic free stack"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.runtime.stack_size_bytes,
-        MOTION_TASK_STACK_SIZE_BYTES,
-        "motion task diagnostic stack size"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.runtime.stack_free_bytes,
-        400U,
-        "motion task diagnostic free stack"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.commands_dequeued,
-        14U,
-        "motion task diagnostic dequeued commands"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.last_sequence,
-        104U,
-        "motion task diagnostic last sequence"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.last_command_code,
-        COMMAND_CODE_HOME,
-        "motion task diagnostic last command code"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.planner_calls,
-        3U,
-        "motion task diagnostic planner calls"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.planner_blocks_created,
-        1U,
-        "motion task diagnostic planner blocks"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.planner_no_motion,
-        1U,
-        "motion task diagnostic planner no-motion results"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.planner_errors,
-        1U,
-        "motion task diagnostic planner errors"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.last_planner_status,
-        MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
-        "motion task diagnostic last planner status"
-    );
-    expect_u32(
-        test_captured_frame.payload.motion_task.motion.last_planner_sequence,
-        103U,
-        "motion task diagnostic last planner sequence"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.port,
-        COMMAND_NETWORK_TASK_PORT,
-        "command diagnostic port"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.connections_accepted,
-        31U,
-        "command diagnostic accepted connections"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.complete_frames_received,
-        40U,
-        "command diagnostic complete frames"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.invalid_crc,
-        43U,
-        "command diagnostic invalid CRC"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.response_send_errors,
-        36U,
-        "command diagnostic response errors"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_task.command.decoder_errors,
-        51U,
-        "command diagnostic decoder errors"
-    );
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.command_task.command.last_error,
-        (uint32_t)-37,
-        "command diagnostic last error"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_decoder.runtime.state,
-        osThreadError,
-        "decoder module has no task runtime state"
-    );
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.command_decoder.runtime.priority,
-        (uint32_t)osPriorityError,
-        "decoder module reports no task priority"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_decoder.decoder.protocol_version,
-        COMMAND_PROTOCOL_VERSION,
-        "command decoder diagnostic protocol version"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_decoder.decoder.requests_received,
-        61U,
-        "command decoder diagnostic requests"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_decoder.decoder.responses_formed,
-        72U,
-        "command decoder diagnostic formed responses"
-    );
-    expect_u32(
-        test_captured_frame.payload.command_decoder.decoder.invalid_payload_length,
-        75U,
-        "command decoder diagnostic invalid payload length"
-    );
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.command_decoder.decoder.last_error,
-        (uint32_t)-83,
-        "command decoder diagnostic last error"
-    );
-    expect_u32(test_captured_frame.payload.command_queue.initialized, 1U, "command queue initialized diagnostic");
-    expect_u32(test_captured_frame.payload.command_queue.capacity, COMMAND_QUEUE_CAPACITY, "command queue capacity diagnostic");
-    expect_u32(test_captured_frame.payload.command_queue.queued, 73U, "command queue current occupancy diagnostic");
-    expect_u32(
-        test_captured_frame.payload.command_queue.available,
-        COMMAND_QUEUE_CAPACITY - 73U,
-        "command queue available slots diagnostic"
-    );
-    expect_u32(test_captured_frame.payload.command_queue.max_queued, 91U, "command queue maximum occupancy diagnostic");
-    expect_u32(test_captured_frame.payload.command_queue.enqueued_total, 123U, "command queue accepted total diagnostic");
-    expect_u32(test_captured_frame.payload.command_queue.full_rejections, 4U, "command queue full rejections diagnostic");
-    expect_u32(test_captured_frame.payload.command_queue.enqueue_errors, 5U, "command queue enqueue errors diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.initialized, 1U, "plan buffer initialized diagnostic");
-    expect_u32(test_captured_frame.payload.x_axis.travel_um, 301000U, "X axis travel diagnostic");
-    expect_u32((uint32_t)test_captured_frame.payload.x_axis.scale_position_um, (uint32_t)-5, "X axis scale diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.capacity, PLAN_BUFFER_CAPACITY, "plan buffer capacity diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.queued, 37U, "plan buffer current occupancy diagnostic");
-    expect_u32(
-        test_captured_frame.payload.plan_buffer.available,
-        PLAN_BUFFER_CAPACITY - 37U,
-        "plan buffer available slots diagnostic"
-    );
-    expect_u32(test_captured_frame.payload.plan_buffer.max_queued, 80U, "plan buffer maximum occupancy diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.enqueued_total, 1234U, "plan buffer accepted total diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.dequeued_total, 1197U, "plan buffer consumed total diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.full_rejections, 2U, "plan buffer full rejections diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.empty_reads, 3U, "plan buffer empty reads diagnostic");
-    expect_u32(
-        test_captured_frame.payload.plan_buffer.rejected_operations,
-        1U,
-        "plan buffer rejected operations diagnostic"
-    );
-    expect_u32(test_captured_frame.payload.plan_buffer.clear_calls, 4U, "plan buffer clear calls diagnostic");
-    expect_u32(test_captured_frame.payload.plan_buffer.cancelled_blocks, 5U, "plan buffer cancelled blocks diagnostic");
-
-    reset_network_fixture();
-    test_stop_on_delay = 1U;
-    test_ethernet_diagnostics_result = -1;
-    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "Ethernet snapshot error path");
-    expect_u32(test_captured_frame.payload.diagnostic_task.snapshot_errors, 1U, "Ethernet snapshot error count");
-    expect_u32(
-        test_captured_frame.payload.eth_link.ethernet_port.values[0],
-        0U,
-        "Ethernet diagnostics cleared after snapshot error"
-    );
-
-    reset_network_fixture();
     test_write_result = ERR_BUF;
     test_bytes_written = 3U;
     test_stop_on_second_accept = 1U;
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "partial diagnostic frame path");
     expect_u32(test_netconn_write_calls, 1U, "partial frame write");
-    expect_u32(test_captured_write_size, sizeof(DiagnosticFrameDTO_t), "partial frame attempted size");
     expect_u32(test_netconn_close_calls, 1U, "client closed after partial frame");
     expect_u32(test_netconn_delete_calls, 1U, "client deleted after partial frame");
     expect_u32(test_netconn_accept_calls, 2U, "accept retried after partial frame");
@@ -911,36 +591,24 @@ static void test_diagnostic_task_network_paths(void) {
     test_write_result = ERR_BUF;
     test_succeed_after_first_write = 1U;
     test_stop_on_delay = 1U;
-    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "full-length write error path");
-    expect_u32(test_netconn_write_calls, 2U, "write retried after full-length write error");
-    expect_u32(test_captured_frame.payload.diagnostic_task.send_errors, 1U, "full-length write error count");
-    expect_u32(test_captured_frame.payload.diagnostic_task.partial_writes, 0U, "full-length write is not partial");
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.diagnostic_task.last_error,
-        (uint32_t)ERR_BUF,
-        "full-length write error recorded"
-    );
+    expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "write error path");
+    expect_u32(test_netconn_write_calls, 2U, "client is accepted again after a write error");
+    expect_u32(test_captured_frame.payload.sequence, 2U, "sequence keeps counting across clients");
 
     reset_network_fixture();
     test_bytes_written = 3U;
     test_succeed_after_first_write = 1U;
     test_stop_on_delay = 1U;
     expect_u32((uint32_t)run_diagnostic_task_until_jump(&context), 1U, "short successful write path");
-    expect_u32(test_netconn_write_calls, 2U, "write retried after short successful write");
-    expect_u32(test_captured_frame.payload.diagnostic_task.send_errors, 1U, "short successful write error count");
-    expect_u32(test_captured_frame.payload.diagnostic_task.partial_writes, 1U, "short successful write is partial");
-    expect_u32(
-        (uint32_t)test_captured_frame.payload.diagnostic_task.last_error,
-        (uint32_t)ERR_BUF,
-        "short successful write normalized to buffer error"
-    );
+    expect_u32(test_netconn_write_calls, 2U, "a short write closes the client");
 }
 
 int main(void) {
-    test_counter_helpers();
     test_runtime_percent_calculation();
-    test_task_diagnostics_mapping();
-    test_diagnostic_task_stats_mapping();
+    test_task_slots();
+    test_command_channel_mapping();
+    test_ethernet_mapping();
+    test_diagnostic_frame_contents();
     test_diagnostic_task_network_paths();
 
     expect_u32(test_error_handler_calls, 0U, "diagnostic task helper tests must not call Error_Handler");

@@ -17,18 +17,14 @@ typedef enum {
     PLAN_BUFFER_STATUS_NO_MEMORY
 } PlanBufferStatus_t;
 
+/* Sent as is in the diagnostic frame. */
 typedef struct {
-    uint32_t initialized;
-    uint32_t capacity;
     uint32_t queued;
-    uint32_t available;
     uint32_t max_queued;
     uint32_t enqueued_total;
     uint32_t dequeued_total;
     uint32_t full_rejections;
-    uint32_t empty_reads;
     uint32_t rejected_operations;
-    uint32_t clear_calls;
     uint32_t cancelled_blocks;
 } PlanBufferDiagnostics_t;
 

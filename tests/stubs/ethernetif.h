@@ -3,8 +3,13 @@
 
 #include <stdint.h>
 
+/* Only the fields the diagnostic snapshot reads; names match LWIP/Target/ethernetif.h. */
 typedef struct {
-    uint32_t values[16];
+    uint32_t hal_read_data_errors;
+    uint32_t dma_receive_buffer_unavailable;
+    uint32_t dropped_packets;
+    uint32_t rx_pool_exhaustions;
+    uint32_t rx_pool_max_used;
 } EthernetRxDiagnostics;
 
 #define ETHERNETIF_INPUT_THREAD_STACK_SIZE_BYTES 1024U

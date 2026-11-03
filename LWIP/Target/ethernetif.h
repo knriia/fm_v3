@@ -46,22 +46,11 @@ void ethernetif_phy_interrupt_notify(void);
 
 typedef struct
 {
-  uint32_t rx_interrupts;
-  uint32_t rx_packets;
-  uint32_t rx_segments;
-  uint32_t rx_bytes;
-  uint32_t rx_pool_exhausted;
-  uint32_t rx_pool_exhaustions;
   uint32_t hal_read_data_errors;
   uint32_t dma_receive_buffer_unavailable;
   uint32_t dropped_packets;
-  uint32_t rx_pool_base_address;
-  uint32_t rx_pool_element_size;
-  uint32_t rx_pool_capacity;
-  uint32_t rx_pool_used;
+  uint32_t rx_pool_exhaustions;
   uint32_t rx_pool_max_used;
-  uint32_t rx_pool_errors;
-  uint32_t rx_pool_illegal;
 } EthernetRxDiagnostics;
 
 void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics);

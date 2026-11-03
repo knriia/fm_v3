@@ -90,10 +90,7 @@ void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
         return;
     }
 
-    diagnostics->initialized = command_queue_handle != NULL ? 1U : 0U;
-    diagnostics->capacity = COMMAND_QUEUE_CAPACITY;
     diagnostics->queued = command_queue_handle == NULL ? 0U : osMessageQueueGetCount(command_queue_handle);
-    diagnostics->available = diagnostics->initialized != 0U ? COMMAND_QUEUE_CAPACITY - diagnostics->queued : 0U;
     diagnostics->max_queued = command_queue_max_queued;
     diagnostics->enqueued_total = command_queue_enqueued_total;
     diagnostics->full_rejections = command_queue_full_rejections;
