@@ -209,6 +209,7 @@ static void motion_task_x_home_complete(MotionTaskXHomeContext_t *homing, Motion
     encoder_ox_reset_coordinate();
     context->machine_state.position_um[0] = 0;
     context->machine_state.homed_axes_mask |= MOTION_TASK_X_HOME_AXIS_MASK;
+    (void)motion_hardware_x_ready_after_home();
     *homing = (MotionTaskXHomeContext_t){0};
 }
 

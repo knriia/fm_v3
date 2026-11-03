@@ -69,6 +69,7 @@ MotionHardwareXStatus_t motion_hardware_x_start_jog_profile(
 void motion_hardware_x_request_stop(void);
 /* Returns a runtime fault (limit, underrun, event, timing) to READY. Config and clock faults need init. */
 MotionHardwareXStatus_t motion_hardware_x_clear_fault(void);
+MotionHardwareXStatus_t motion_hardware_x_ready_after_home(void);
 MotionHardwareXStatus_t motion_hardware_x_get_status(void);
 MotionHardwareXStopReason_t motion_hardware_x_get_last_stop_reason(void);
 uint8_t motion_hardware_x_start_limit_is_active(void);

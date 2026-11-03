@@ -713,6 +713,21 @@ MotionHardwareXStatus_t motion_hardware_x_clear_fault(void) {
     return result;
 }
 
+MotionHardwareXStatus_t motion_hardware_x_ready_after_home(void) {
+    const uint32_t primask = motion_hardware_x_enter_critical();
+    if (motion_hardware_x_context.status == MOTION_HARDWARE_X_STATUS_STOPPED &&
+        motion_hardware_x_limit_is_active(
+            MOTION_X_START_LIMIT_PIN,
+            motion_hardware_x_context.config.start_limit_active_high
+        ) != 0U) {
+        motion_hardware_x_stop(MOTION_HARDWARE_X_STATUS_READY);
+        step_executor_reset();
+    }
+    const MotionHardwareXStatus_t result = motion_hardware_x_context.status;
+    motion_hardware_x_exit_critical(primask);
+    return result;
+}
+
 MotionHardwareXStatus_t motion_hardware_x_get_status(void) { return motion_hardware_x_context.status; }
 
 uint8_t motion_hardware_x_start_limit_is_active(void) {
