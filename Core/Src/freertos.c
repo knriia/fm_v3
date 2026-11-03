@@ -31,6 +31,7 @@
 #include "command/command_queue.h"
 #include "motion_task.h"
 #include "motion/plan_buffer.h"
+#include "step_generator_task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -91,6 +92,14 @@ static const osThreadAttr_t motion_task_attr = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 
+/* Above MotionTask and the network tasks so step events are produced before the timer ISR runs out. */
+static osThreadId_t step_generator_task_handle;
+static const osThreadAttr_t step_generator_task_attr = {
+  .name = STEP_GENERATOR_TASK_NAME,
+  .stack_size = STEP_GENERATOR_TASK_STACK_SIZE_BYTES,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+
 static osEventFlagsId_t lwip_ready_flags;
 static NetworkTaskContext diagnostic_task_context;
 static NetworkTaskContext telemetry_task_context;
@@ -120,8 +129,15 @@ void MX_FREERTOS_Init(void)
     Error_Handler();
   }
 
+  motion_task_context.planner_config.max_step_event_rate_hz = MOTION_TASK_MAX_STEP_RATE_HZ;
   motion_task_handle = osThreadNew(MotionTask, &motion_task_context, &motion_task_attr);
   if (motion_task_handle == NULL)
+  {
+    Error_Handler();
+  }
+
+  step_generator_task_handle = osThreadNew(StepGeneratorTask, NULL, &step_generator_task_attr);
+  if (step_generator_task_handle == NULL)
   {
     Error_Handler();
   }

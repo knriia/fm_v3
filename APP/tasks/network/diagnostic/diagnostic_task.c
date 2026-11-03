@@ -197,6 +197,7 @@ static void diagnostic_collect_network_tasks(
         total_runtime_ticks
     );
     motion_task_get_diagnostics(&payload->motion_task.motion);
+    motion_task_get_x_axis_diagnostics(&payload->x_axis);
     diagnostic_network_task_fill_stats(
         &payload->eth_if.runtime,
         xTaskGetHandle(ETHERNET_IF_TASK_NAME),

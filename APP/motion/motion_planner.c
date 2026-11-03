@@ -43,26 +43,15 @@ static int motion_planner_checked_square_sum(const uint64_t values[MOTION_PLANNE
     return 1;
 }
 
-static int motion_planner_validate_config(const MotionPlannerConfig_t *config) {
-    if (config->max_step_event_rate_hz == 0U) {
-        return 0;
-    }
-
-    for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
-        const MotionPlannerAxisConfig_t *axis_config = &config->axis[axis];
-        if (axis_config->min_position_um > axis_config->max_position_um || axis_config->steps_per_mm_numerator == 0U ||
-            axis_config->steps_per_mm_denominator == 0U || axis_config->max_speed_um_per_s == 0U) {
-            return 0;
-        }
-    }
-
-    return 1;
+static int motion_planner_validate_axis_config(const MotionPlannerAxisConfig_t *axis_config) {
+    return axis_config->min_position_um <= axis_config->max_position_um && axis_config->steps_per_um_numerator != 0U &&
+           axis_config->steps_per_um_denominator != 0U && axis_config->max_speed_um_per_s != 0U;
 }
 
 static int64_t motion_planner_position_to_steps(int32_t position_um, const MotionPlannerAxisConfig_t *config) {
     const uint64_t magnitude_um = position_um < 0 ? (uint64_t)(-(int64_t)position_um) : (uint64_t)position_um;
-    const uint64_t denominator = 1000U * (uint64_t)config->steps_per_mm_denominator;
-    const uint64_t numerator_scale = config->steps_per_mm_numerator;
+    const uint64_t denominator = config->steps_per_um_denominator;
+    const uint64_t numerator_scale = config->steps_per_um_numerator;
     const uint64_t rounding_offset = denominator / 2U;
     const uint64_t rounded_steps = (magnitude_um * numerator_scale + rounding_offset) / denominator;
     const int64_t signed_steps = (int64_t)rounded_steps;
@@ -89,11 +78,30 @@ MotionPlannerResult_t motion_planner_plan_linear(
     if ((machine_state->homed_axes_mask & (uint8_t)~MOTION_PLANNER_ALL_AXES_MASK) != 0U) {
         return result;
     }
-    if (!motion_planner_validate_config(config)) {
+
+    uint8_t requested_axes_mask = 0U;
+    for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        if (request->target_um[axis] != machine_state->position_um[axis]) {
+            requested_axes_mask |= (uint8_t)(1U << axis);
+        }
+    }
+    if (requested_axes_mask == 0U) {
+        result.status = MOTION_PLANNER_STATUS_NO_MOVEMENT;
+        return result;
+    }
+
+    if (config->max_step_event_rate_hz == 0U) {
         result.status = MOTION_PLANNER_STATUS_INVALID_CONFIGURATION;
         return result;
     }
-    if ((machine_state->homed_axes_mask & MOTION_PLANNER_ALL_AXES_MASK) != MOTION_PLANNER_ALL_AXES_MASK) {
+    for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        if ((requested_axes_mask & (uint8_t)(1U << axis)) != 0U &&
+            !motion_planner_validate_axis_config(&config->axis[axis])) {
+            result.status = MOTION_PLANNER_STATUS_INVALID_CONFIGURATION;
+            return result;
+        }
+    }
+    if ((machine_state->homed_axes_mask & requested_axes_mask) != requested_axes_mask) {
         result.status = MOTION_PLANNER_STATUS_NOT_HOMED;
         return result;
     }
@@ -110,12 +118,16 @@ MotionPlannerResult_t motion_planner_plan_linear(
     MotionPlanBlock_t block = {0};
 
     for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        if ((requested_axes_mask & (uint8_t)(1U << axis)) == 0U) {
+            continue;
+        }
         const MotionPlannerAxisConfig_t *axis_config = &config->axis[axis];
         const int32_t current_um = machine_state->position_um[axis];
         const int32_t target_um = request->target_um[axis];
 
-        if (current_um < axis_config->min_position_um || current_um > axis_config->max_position_um ||
-            target_um < axis_config->min_position_um || target_um > axis_config->max_position_um) {
+        /* Only the target is limited: after homing or calibration the axis sits at a switch, outside the usable
+         * travel, and must be able to move back into it. */
+        if (target_um < axis_config->min_position_um || target_um > axis_config->max_position_um) {
             result.status = MOTION_PLANNER_STATUS_POSITION_OUT_OF_RANGE;
             return result;
         }

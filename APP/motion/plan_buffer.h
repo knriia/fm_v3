@@ -13,7 +13,8 @@ typedef enum {
     PLAN_BUFFER_STATUS_EMPTY,
     PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
     PLAN_BUFFER_STATUS_NOT_INITIALIZED,
-    PLAN_BUFFER_STATUS_ALREADY_INITIALIZED
+    PLAN_BUFFER_STATUS_ALREADY_INITIALIZED,
+    PLAN_BUFFER_STATUS_NO_MEMORY
 } PlanBufferStatus_t;
 
 typedef struct {
@@ -31,7 +32,9 @@ typedef struct {
     uint32_t cancelled_blocks;
 } PlanBufferDiagnostics_t;
 
-/* The MotionTask pipeline owns queue operations; calls are bounded and never wait for space. */
+/* Shared by MotionTask (push, clear) and the step generator task (pop); a mutex guards every operation.
+ * Calls never wait for space or data, only for the short critical part of another call. Not for ISRs.
+ * Call init before the scheduler starts tasks that use the buffer. */
 PlanBufferStatus_t plan_buffer_init(void);
 PlanBufferStatus_t plan_buffer_try_push(const MotionPlanBlock_t *block);
 PlanBufferStatus_t plan_buffer_try_pop(MotionPlanBlock_t *block);

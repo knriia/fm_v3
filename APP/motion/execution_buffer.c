@@ -11,6 +11,11 @@ _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "32-bit atomics must be lock-free for 
 static MotionExecutionEvent_t execution_buffer_entries[EXECUTION_BUFFER_CAPACITY];
 static _Atomic uint32_t execution_buffer_write_position;
 static _Atomic uint32_t execution_buffer_read_position;
+static volatile ExecutionBufferSpaceListener_t execution_buffer_space_listener;
+
+void execution_buffer_set_space_listener(ExecutionBufferSpaceListener_t listener) {
+    execution_buffer_space_listener = listener;
+}
 
 void execution_buffer_init(void) {
     atomic_store_explicit(&execution_buffer_read_position, 0U, memory_order_relaxed);
@@ -46,6 +51,12 @@ ExecutionBufferStatus_t execution_buffer_try_pop(MotionExecutionEvent_t *event) 
 
     *event = execution_buffer_entries[read_position & EXECUTION_BUFFER_INDEX_MASK];
     atomic_store_explicit(&execution_buffer_read_position, read_position + 1U, memory_order_release);
+
+    /* Each pop lowers the count by one, so equality marks the single crossing of the watermark. */
+    const ExecutionBufferSpaceListener_t listener = execution_buffer_space_listener;
+    if (listener != NULL && (uint32_t)(write_position - (read_position + 1U)) == EXECUTION_BUFFER_LOW_WATERMARK) {
+        listener();
+    }
     return EXECUTION_BUFFER_STATUS_OK;
 }
 

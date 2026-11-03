@@ -1,9 +1,20 @@
 #include "motion/x_axis_bench.h"
 
+#include "cmsis_os.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
 #define X_AXIS_BENCH_NANOSECONDS_PER_SECOND 1000000000ULL
+
+static XAxisBenchStatus_t x_axis_bench_start_idle_axis(
+    const MotionHardwareXConfig_t *hardware_config,
+    int32_t signed_steps,
+    uint32_t initial_step_rate_hz,
+    uint32_t target_step_rate_hz,
+    uint32_t acceleration_steps_per_s2,
+    MotionHardwareXStatus_t *hardware_status
+);
 
 /* The STEP period cannot be shorter than the driver's pulse width plus its minimum low time. */
 static uint32_t x_axis_bench_max_step_rate_hz(const MotionHardwareXConfig_t *hardware_config) {
@@ -33,6 +44,29 @@ static XAxisBenchStatus_t x_axis_bench_start_internal(
         return X_AXIS_BENCH_STATUS_INVALID_ARGUMENT;
     }
 
+    /* StepGeneratorTask also starts this axis; with task switching paused the status check and the start cannot
+     * interleave with its start. Interrupts keep running. */
+    (void)osKernelLock();
+    const XAxisBenchStatus_t status = x_axis_bench_start_idle_axis(
+        hardware_config,
+        signed_steps,
+        initial_step_rate_hz,
+        target_step_rate_hz,
+        acceleration_steps_per_s2,
+        hardware_status
+    );
+    (void)osKernelUnlock();
+    return status;
+}
+
+static XAxisBenchStatus_t x_axis_bench_start_idle_axis(
+    const MotionHardwareXConfig_t *hardware_config,
+    int32_t signed_steps,
+    uint32_t initial_step_rate_hz,
+    uint32_t target_step_rate_hz,
+    uint32_t acceleration_steps_per_s2,
+    MotionHardwareXStatus_t *hardware_status
+) {
     MotionHardwareXStatus_t init_status = motion_hardware_x_get_status();
     if (init_status == MOTION_HARDWARE_X_STATUS_UNINITIALIZED) {
         init_status = motion_hardware_x_init(hardware_config);

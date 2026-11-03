@@ -35,8 +35,8 @@ static MotionPlannerConfig_t valid_config(void) {
         config.axis[axis] = (MotionPlannerAxisConfig_t){
             .min_position_um = -100000,
             .max_position_um = 100000,
-            .steps_per_mm_numerator = 80U,
-            .steps_per_mm_denominator = 1U,
+            .steps_per_um_numerator = 80U,
+            .steps_per_um_denominator = 1000U,
             .max_speed_um_per_s = 100000U,
         };
     }
@@ -113,7 +113,7 @@ static void test_no_motion_when_target_is_same_or_below_step_resolution(void) {
         "unchanged target is a no-op"
     );
 
-    config.axis[0].steps_per_mm_numerator = 1U;
+    config.axis[0].steps_per_um_numerator = 1U;
     request = request_to(1, 0, 0, 1000U);
     expect_status(
         motion_planner_plan_linear(&request, &state, &config).status,
@@ -124,8 +124,8 @@ static void test_no_motion_when_target_is_same_or_below_step_resolution(void) {
 
 static void test_rational_calibration_rounds_to_nearest_step(void) {
     MotionPlannerConfig_t config = valid_config();
-    config.axis[0].steps_per_mm_numerator = 1000U;
-    config.axis[0].steps_per_mm_denominator = 1U;
+    config.axis[0].steps_per_um_numerator = 1000U;
+    config.axis[0].steps_per_um_denominator = 1000U;
     const MotionPlannerMachineState_t state = homed_origin();
     const MotionPlannerRequest_t request = request_to(1, 0, 0, 1000U);
 
@@ -165,9 +165,34 @@ static void test_homing_state_is_required_for_absolute_xyz(void) {
     state.homed_axes_mask = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK;
     expect_status(
         motion_planner_plan_linear(&request, &state, &config).status,
-        MOTION_PLANNER_STATUS_NOT_HOMED,
-        "absolute XYZ request requires all axes to be homed"
+        MOTION_PLANNER_STATUS_OK,
+        "only the moving axis has to be homed"
     );
+
+    request = request_to(1000, 0, 500, 1000U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_NOT_HOMED,
+        "moving an axis that is not homed is rejected"
+    );
+
+    state.homed_axes_mask = MOTION_PLANNER_AXIS_X_MASK;
+    config.axis[1] = (MotionPlannerAxisConfig_t){0};
+    config.axis[2] = (MotionPlannerAxisConfig_t){0};
+    request = request_to(1000, 0, 0, 1000U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_OK,
+        "axes that do not move need no configuration"
+    );
+    request = request_to(1000, 0, 500, 1000U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
+        "moving an axis without configuration is rejected"
+    );
+    config = valid_config();
+    request = request_to(1000, 0, 0, 1000U);
 
     state.homed_axes_mask = (uint8_t)(MOTION_PLANNER_ALL_AXES_MASK | 0x80U);
     expect_status(
@@ -192,12 +217,12 @@ static void test_invalid_configuration_fields_are_rejected(void) {
                   MOTION_PLANNER_STATUS_INVALID_CONFIGURATION, "inverted axis range is rejected");
 
     config = valid_config();
-    config.axis[0].steps_per_mm_numerator = 0U;
+    config.axis[0].steps_per_um_numerator = 0U;
     expect_status(motion_planner_plan_linear(&request, &state, &config).status,
                   MOTION_PLANNER_STATUS_INVALID_CONFIGURATION, "zero calibration numerator is rejected");
 
     config = valid_config();
-    config.axis[0].steps_per_mm_denominator = 0U;
+    config.axis[0].steps_per_um_denominator = 0U;
     expect_status(motion_planner_plan_linear(&request, &state, &config).status,
                   MOTION_PLANNER_STATUS_INVALID_CONFIGURATION, "zero calibration denominator is rejected");
 
@@ -215,8 +240,8 @@ static void test_machine_position_and_target_must_be_within_limits(void) {
     state.position_um[0] = 100001;
     expect_status(
         motion_planner_plan_linear(&request, &state, &config).status,
-        MOTION_PLANNER_STATUS_POSITION_OUT_OF_RANGE,
-        "current position outside configured range is rejected"
+        MOTION_PLANNER_STATUS_OK,
+        "axis outside the usable travel may move back into it"
     );
 
     state = homed_origin();
@@ -229,10 +254,11 @@ static void test_machine_position_and_target_must_be_within_limits(void) {
 
     state = homed_origin();
     state.position_um[0] = -100001;
+    request = request_to(1000, 0, 0, 1000U);
     expect_status(
         motion_planner_plan_linear(&request, &state, &config).status,
-        MOTION_PLANNER_STATUS_POSITION_OUT_OF_RANGE,
-        "current position below configured range is rejected"
+        MOTION_PLANNER_STATUS_OK,
+        "axis below the usable travel may move back into it"
     );
 
     state = homed_origin();
@@ -257,9 +283,9 @@ static void test_zero_feedrate_is_rejected(void) {
 
 static void test_axis_speed_limit_includes_fractional_excess(void) {
     MotionPlannerConfig_t config = valid_config();
-    config.axis[0].steps_per_mm_numerator = 1000U;
+    config.axis[0].steps_per_um_numerator = 1000U;
     config.axis[0].max_speed_um_per_s = 6U;
-    config.axis[1].steps_per_mm_numerator = 1000U;
+    config.axis[1].steps_per_um_numerator = 1000U;
     config.axis[1].max_speed_um_per_s = 9000U;
     const MotionPlannerMachineState_t state = homed_origin();
     const MotionPlannerRequest_t request = request_to(3, 4, 0, 10001U);
@@ -313,7 +339,7 @@ static void test_distance_square_sum_overflow_is_rejected(void) {
     for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
         config.axis[axis].min_position_um = INT32_MIN;
         config.axis[axis].max_position_um = INT32_MAX;
-        config.axis[axis].steps_per_mm_numerator = 1U;
+        config.axis[axis].steps_per_um_numerator = 1U;
         config.axis[axis].max_speed_um_per_s = UINT32_MAX;
     }
     expect_status(
@@ -327,7 +353,7 @@ static void test_step_rate_numerator_overflow_is_rejected(void) {
     MotionPlannerConfig_t config = valid_config();
     config.axis[0].min_position_um = 0;
     config.axis[0].max_position_um = INT32_MAX;
-    config.axis[0].steps_per_mm_numerator = UINT32_MAX;
+    config.axis[0].steps_per_um_numerator = UINT32_MAX;
     config.axis[0].max_speed_um_per_s = UINT32_MAX;
     config.max_step_event_rate_hz = UINT32_MAX;
     const MotionPlannerMachineState_t state = homed_origin();

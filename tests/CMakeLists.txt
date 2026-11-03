@@ -64,6 +64,8 @@ add_executable(motion_task_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/motion_task.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/plan_buffer.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/axis_calibration.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
 )
 target_compile_definitions(motion_task_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
 
@@ -83,6 +85,26 @@ add_executable(motion_execution_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_segment_generator.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/execution_buffer.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/step_executor.c
+)
+
+add_executable(step_generator_task_unit_tests
+    step_generator_task_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/plan_buffer.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_segment_generator.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/execution_buffer.c
+)
+target_compile_definitions(step_generator_task_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
+
+add_executable(calibration_storage_unit_tests
+    calibration_storage_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/axis_calibration.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/calibration_store.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
+)
+
+add_executable(x_axis_calibration_unit_tests
+    x_axis_calibration_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/x_axis_calibration.c
 )
 
 add_executable(x_axis_bench_unit_tests
@@ -183,13 +205,35 @@ target_include_directories(motion_execution_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
 )
 
+target_include_directories(step_generator_task_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
+)
+
+target_include_directories(calibration_storage_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
+)
+
+target_include_directories(x_axis_calibration_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/ENC
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
+)
+
 target_include_directories(x_axis_bench_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
 )
 
 target_include_directories(plan_buffer_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
 )
@@ -247,6 +291,21 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wpedantic
     )
     target_compile_options(motion_planner_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+    target_compile_options(step_generator_task_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+    target_compile_options(calibration_storage_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+    target_compile_options(x_axis_calibration_unit_tests PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -317,4 +376,7 @@ add_test(NAME motion_task_unit_tests COMMAND motion_task_unit_tests)
 add_test(NAME plan_buffer_unit_tests COMMAND plan_buffer_unit_tests)
 add_test(NAME motion_planner_unit_tests COMMAND motion_planner_unit_tests)
 add_test(NAME motion_execution_unit_tests COMMAND motion_execution_unit_tests)
+add_test(NAME step_generator_task_unit_tests COMMAND step_generator_task_unit_tests)
+add_test(NAME calibration_storage_unit_tests COMMAND calibration_storage_unit_tests)
+add_test(NAME x_axis_calibration_unit_tests COMMAND x_axis_calibration_unit_tests)
 add_test(NAME x_axis_bench_unit_tests COMMAND x_axis_bench_unit_tests)

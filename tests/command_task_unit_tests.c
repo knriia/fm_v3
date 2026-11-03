@@ -345,6 +345,14 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
     return COMMAND_TASK_FLAG_RX;
 }
 
+static uint32_t test_motion_stop_requests;
+static uint32_t test_queue_puts_before_stop_request;
+
+void motion_task_request_stop(void) {
+    ++test_motion_stop_requests;
+    test_queue_puts_before_stop_request = test_command_queue_put_calls;
+}
+
 CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command) {
     ++test_command_queue_put_calls;
     if (command == NULL) {
@@ -475,6 +483,8 @@ static void reset_fixture(void) {
     test_force_decoder_invalid_argument = 0U;
     test_command_queue_put_result = COMMAND_QUEUE_PUT_OK;
     test_command_queue_put_calls = 0U;
+    test_motion_stop_requests = 0U;
+    test_queue_puts_before_stop_request = 0U;
     test_queued_command = (CommandDTO_t){0};
     memset(test_queue_free_slots, 0xFF, sizeof(test_queue_free_slots));
     test_queue_free_slots_calls = 0U;
@@ -705,8 +715,24 @@ static void test_ping_ack_and_error_responses(void) {
     expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 42U, 0U);
     expect_u32(test_netconn_write_calls, 1U, "accepted command receives only one ACK");
     expect_u32(test_command_queue_put_calls, 1U, "decoded command is submitted to the queue once");
+    expect_u32(test_motion_stop_requests, 1U, "STOP acts before it waits in the queue");
+    expect_u32(test_queue_puts_before_stop_request, 0U, "STOP acts before it is queued");
     expect_u32(test_queued_command.sequence, 42U, "queued command preserves sequence");
     expect_u32(test_queued_command.code, COMMAND_CODE_STOP, "queued command preserves command code");
+
+    reset_fixture();
+    const uint8_t home_payload[] = {COMMAND_CODE_HOME, 0x01U};
+    frame_length = command_protocol_build_frame(
+        frame,
+        sizeof(frame),
+        COMMAND_MESSAGE_TYPE_COMMAND,
+        48U,
+        home_payload,
+        sizeof(home_payload)
+    );
+    run_one_receive(frame, frame_length);
+    expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 48U, 0U);
+    expect_u32(test_motion_stop_requests, 0U, "other commands do not stop motion");
 
     reset_fixture();
     test_command_queue_put_result = COMMAND_QUEUE_PUT_FULL;

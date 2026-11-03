@@ -28,6 +28,8 @@ osStatus_t command_queue_init(void);
 CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command);
 osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms);
 uint32_t command_queue_free_slots(void);
+/* Drops every queued command; used by STOP, which cancels everything accepted before it. */
+void command_queue_discard_all(void);
 void command_queue_set_space_listener(CommandQueueSpaceListener_t listener);
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics);
 

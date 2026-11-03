@@ -1,6 +1,8 @@
 #include "command/command_queue.h"
+#include "motion/calibration_store.h"
 #include "motion/plan_buffer.h"
 #include "motion/x_axis_bench.h"
+#include "motion/x_axis_calibration.h"
 #include "motion_hardware_x.h"
 #include "motion_task.h"
 
@@ -25,7 +27,7 @@ static uint32_t test_receive_calls;
 static uint32_t test_last_receive_timeout;
 static uint32_t test_receive_script_count;
 static uint32_t test_receive_script_position;
-static TestQueueRead_t test_receive_script[8];
+static TestQueueRead_t test_receive_script[16];
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -68,7 +70,7 @@ static uint8_t fake_x_start_limit_active;
 static uint32_t fake_x_jog_steps_completed;
 static uint8_t fake_x_start_limit_release_event;
 /* Hardware state applied just before the matching scripted queue read, i.e. while MotionTask is blocked. */
-static TestXHardwareState_t test_x_state_script[8];
+static TestXHardwareState_t test_x_state_script[16];
 
 static void script_x_state(
     uint32_t index,
@@ -87,7 +89,7 @@ static void script_x_state(
 }
 
 osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
-    if (test_receive_calls < 8U && test_x_state_script[test_receive_calls].apply != 0U) {
+    if (test_receive_calls < 16U && test_x_state_script[test_receive_calls].apply != 0U) {
         const TestXHardwareState_t *state = &test_x_state_script[test_receive_calls];
         fake_x_status = state->status;
         fake_x_stop_reason = state->stop_reason;
@@ -110,9 +112,58 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
     return osErrorResource;
 }
 
+/* The plan buffer mutex is exercised in its own tests; here it only has to succeed. */
+static uint8_t test_plan_buffer_mutex;
+
+osMutexId_t osMutexNew(const osMutexAttr_t *attr) {
+    (void)attr;
+    return &test_plan_buffer_mutex;
+}
+
+osStatus_t osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout) {
+    (void)mutex_id;
+    (void)timeout;
+    return osOK;
+}
+
+osStatus_t osMutexRelease(osMutexId_t mutex_id) {
+    (void)mutex_id;
+    return osOK;
+}
+
+void Error_Handler(void) {}
+
+static uint32_t test_block_ready_notifications;
+static CalibrationStoreStatus_t test_calibration_load_status;
+static MachineCalibration_t test_stored_calibration;
+
+CalibrationStoreStatus_t calibration_store_load(MachineCalibration_t *calibration) {
+    if (test_calibration_load_status == CALIBRATION_STORE_STATUS_OK) {
+        *calibration = test_stored_calibration;
+    }
+    return test_calibration_load_status;
+}
+
+void step_generator_task_notify_block_ready(void) { ++test_block_ready_notifications; }
+
+static uint32_t test_generator_halts;
+static uint32_t test_generator_resumes;
+static uint32_t test_queue_discards;
+/* After this many 1 ms waits the axis reports READY; 0 keeps it moving. */
+static uint32_t test_axis_settles_after_delays;
+
+void step_generator_task_halt(void) { ++test_generator_halts; }
+
+void step_generator_task_resume_after_stop(void) { ++test_generator_resumes; }
+
+void command_queue_discard_all(void) { ++test_queue_discards; }
+
 uint32_t osDelay(uint32_t milliseconds) {
     ++test_delay_calls;
     test_last_delay_ms = milliseconds;
+    if (test_axis_settles_after_delays != 0U && test_delay_calls == test_axis_settles_after_delays) {
+        fake_x_status = MOTION_HARDWARE_X_STATUS_READY;
+    }
     if (test_jump_active != 0U && test_jump_on_delay != 0U) {
         longjmp(test_jump_buffer, 3);
     }
@@ -124,7 +175,6 @@ static uint32_t fake_x_init_receive_calls;
 static uint32_t fake_x_stop_requests;
 static uint32_t fake_x_clear_fault_calls;
 static uint32_t fake_x_bench_starts;
-static uint32_t fake_x_jog_starts;
 static int32_t fake_x_bench_last_signed_steps;
 static uint32_t fake_x_release_stop_arms;
 /* 1-based index of the profile start that fails, leaving the hardware in fake_x_failed_start_status. */
@@ -169,18 +219,50 @@ void motion_hardware_x_disarm_start_limit_release_stop(void) {}
 
 void encoder_ox_reset_coordinate(void) {}
 
-XAxisBenchStatus_t x_axis_bench_start(
-    const MotionHardwareXConfig_t *hardware_config,
-    int32_t signed_steps,
-    uint32_t step_rate_hz,
-    MotionHardwareXStatus_t *hardware_status
+static int32_t fake_encoder_x_um;
+
+int32_t encoder_ox_get_coordinate(void) { return fake_encoder_x_um; }
+
+/* The calibration procedure has its own tests; here it only reports scripted outcomes. */
+static XAxisCalibrationResult_t fake_calibration_begin_result;
+static XAxisCalibrationResult_t fake_calibration_poll_result;
+static AxisCalibration_t fake_calibration_measured;
+static uint32_t fake_calibration_begin_calls;
+static uint32_t fake_calibration_poll_calls;
+static uint32_t fake_calibration_abort_calls;
+
+XAxisCalibrationResult_t x_axis_calibration_begin(XAxisCalibration_t *calibration, const MotionHardwareXConfig_t *config) {
+    (void)config;
+    ++fake_calibration_begin_calls;
+    calibration->phase = fake_calibration_begin_result == X_AXIS_CALIBRATION_RESULT_RUNNING
+                             ? X_AXIS_CALIBRATION_PHASE_SEEK_END
+                             : X_AXIS_CALIBRATION_PHASE_IDLE;
+    return fake_calibration_begin_result;
+}
+
+XAxisCalibrationResult_t x_axis_calibration_poll(
+    XAxisCalibration_t *calibration,
+    const MotionHardwareXConfig_t *config,
+    AxisCalibration_t *result
 ) {
-    (void)hardware_config;
-    (void)step_rate_hz;
-    ++fake_x_jog_starts;
-    fake_x_bench_last_signed_steps = signed_steps;
-    *hardware_status = fake_x_status;
-    return X_AXIS_BENCH_STATUS_HARDWARE_ERROR;
+    (void)config;
+    ++fake_calibration_poll_calls;
+    if (fake_calibration_poll_result != X_AXIS_CALIBRATION_RESULT_RUNNING) {
+        calibration->phase = X_AXIS_CALIBRATION_PHASE_IDLE;
+    }
+    if (fake_calibration_poll_result == X_AXIS_CALIBRATION_RESULT_OK) {
+        *result = fake_calibration_measured;
+    }
+    return fake_calibration_poll_result;
+}
+
+void x_axis_calibration_abort(XAxisCalibration_t *calibration) {
+    ++fake_calibration_abort_calls;
+    calibration->phase = X_AXIS_CALIBRATION_PHASE_IDLE;
+}
+
+uint8_t x_axis_calibration_is_active(const XAxisCalibration_t *calibration) {
+    return calibration->phase != X_AXIS_CALIBRATION_PHASE_IDLE ? 1U : 0U;
 }
 
 XAxisBenchStatus_t x_axis_bench_start_profile(
@@ -221,7 +303,6 @@ static void reset_receive_script(void) {
     fake_x_start_limit_release_event = 0U;
     (void)memset(test_x_state_script, 0, sizeof(test_x_state_script));
     fake_x_bench_last_signed_steps = 0;
-    fake_x_jog_starts = 0U;
     fake_x_failing_start = 0U;
     fake_x_failed_start_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
     fake_x_release_stop_arms = 0U;
@@ -247,6 +328,20 @@ static void reset_receive_script(void) {
     motion_task_test_reset_planner();
     plan_buffer_test_reset();
     (void)plan_buffer_init();
+    test_block_ready_notifications = 0U;
+    test_generator_halts = 0U;
+    test_generator_resumes = 0U;
+    test_queue_discards = 0U;
+    test_axis_settles_after_delays = 0U;
+    test_calibration_load_status = CALIBRATION_STORE_STATUS_EMPTY;
+    test_stored_calibration = (MachineCalibration_t){0};
+    fake_encoder_x_um = 0;
+    fake_calibration_begin_result = X_AXIS_CALIBRATION_RESULT_RUNNING;
+    fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_RUNNING;
+    fake_calibration_measured = (AxisCalibration_t){0};
+    fake_calibration_begin_calls = 0U;
+    fake_calibration_poll_calls = 0U;
+    fake_calibration_abort_calls = 0U;
 }
 
 static void script_read(uint32_t index, osStatus_t status, const CommandDTO_t *command) {
@@ -273,8 +368,8 @@ static MotionTaskContext_t valid_motion_context(void) {
         context.planner_config.axis[axis] = (MotionPlannerAxisConfig_t){
             .min_position_um = -100000,
             .max_position_um = 100000,
-            .steps_per_mm_numerator = 80U,
-            .steps_per_mm_denominator = 1U,
+            .steps_per_um_numerator = 80U,
+            .steps_per_um_denominator = 1000U,
             .max_speed_um_per_s = 100000U,
         };
     }
@@ -346,6 +441,10 @@ static void test_successful_receive_marks_dequeue(void) {
     );
     expect_u32(plan_buffer_diagnostics.queued, 1U, "successful plan is queued");
     expect_u32(plan_buffer_diagnostics.enqueued_total, 1U, "successful plan enqueue is counted");
+    expect_u32(test_block_ready_notifications, 1U, "step generator is woken for the queued plan");
+    expect_u32((uint32_t)context.machine_state.position_um[0], 1234U, "planned X becomes the next start");
+    expect_u32((uint32_t)context.machine_state.position_um[1], (uint32_t)-567, "planned Y becomes the next start");
+    expect_u32((uint32_t)context.machine_state.position_um[2], 890U, "planned Z becomes the next start");
     MotionPlanBlock_t buffered_block = {0};
     expect_u32(plan_buffer_try_pop(&buffered_block), PLAN_BUFFER_STATUS_OK, "plan is available to the next pipeline block");
     expect_u32(buffered_block.sequence, 101U, "plan buffer preserves source command sequence");
@@ -558,6 +657,7 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
     expect_u32(plan_buffer_diagnostics.queued, PLAN_BUFFER_CAPACITY, "full buffer retains existing plans");
     expect_u32(plan_buffer_diagnostics.enqueued_total, PLAN_BUFFER_CAPACITY, "rejected plan is not counted as enqueued");
     expect_u32(plan_buffer_diagnostics.full_rejections, 1U, "full plan buffer rejection is visible");
+    expect_u32(test_block_ready_notifications, 0U, "rejected plan does not wake the step generator");
 
     MotionPlanBlock_t first_block = {0};
     expect_u32(plan_buffer_try_pop(&first_block), PLAN_BUFFER_STATUS_OK, "existing plans remain consumable after full rejection");
@@ -712,6 +812,207 @@ static void run_home_to_fine_seek_result(
     (void)run_motion_task_until_scripted_stop(context);
 }
 
+static const CommandDTO_t test_calibrate_x_command = {
+    .sequence = 140U,
+    .code = COMMAND_CODE_CALIBRATE,
+    .parameters.calibrate.axes = MOTION_PLANNER_AXIS_X_MASK,
+};
+
+/* The five hardware states of a successful homing, applied on reads first..first+4. */
+static void script_successful_home_states(uint32_t first) {
+    script_x_state(first, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_x_state(first + 1U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(first + 2U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
+    script_x_state(first + 3U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
+    script_x_state(first + 4U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+}
+
+/* CALIBRATE, homing on reads 1..5, the measurement finishes on read 6, then `polls` more reads. */
+static void run_calibration_with_final_home_polls(MotionTaskContext_t *context, uint32_t polls) {
+    script_successful_home_states(1U);
+    script_read(0U, osOK, &test_calibrate_x_command);
+    for (uint32_t index = 1U; index <= 6U + polls; ++index) {
+        script_read(index, osErrorTimeout, NULL);
+    }
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(context);
+}
+
+static void test_calibration_runs_after_homing_and_applies_result(void) {
+    MotionTaskContext_t context;
+    reset_receive_script();
+    fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
+    fake_calibration_measured = (AxisCalibration_t){.steps = 10U, .distance_um = 12U, .travel_um = 301000U};
+    fake_encoder_x_um = -300000;
+    context = valid_motion_context();
+    context.machine_state.position_um[0] = 777;
+    script_successful_home_states(7U);
+    run_calibration_with_final_home_polls(&context, 5U);
+
+    expect_u32(fake_calibration_begin_calls, 1U, "calibration starts once homing has finished");
+    expect_u32(fake_calibration_poll_calls, 1U, "calibration is polled while it runs");
+    expect_u32(fake_x_bench_starts, 8U, "calibration homes X before and after the measurement");
+    expect_i64(fake_x_bench_last_signed_steps, -400, "the last move is the fine seek of the final homing");
+    expect_u32(context.calibration.calibrated_axes_mask, MOTION_PLANNER_AXIS_X_MASK, "X is marked calibrated");
+    expect_u32(context.calibration.axis[0].distance_um, 12U, "measured distance is kept in RAM");
+    expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 10U, "planner uses the measured steps");
+    expect_u32(context.planner_config.axis[0].steps_per_um_denominator, 12U, "planner uses the measured distance");
+    expect_u32(context.planner_config.axis[0].max_speed_um_per_s, 60000U, "speed limit follows from the step rate");
+    expect_i64(context.machine_state.position_um[0], 0, "calibration ends with X at home");
+    expect_u32(test_last_receive_timeout, osWaitForever, "finished calibration stops polling");
+
+    MotionAxisDiagnostics axis = {0};
+    motion_task_get_x_axis_diagnostics(NULL);
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_OK, "diagnostics report the calibration result");
+    expect_u32(axis.calibrated, 1U, "diagnostics report X as calibrated");
+    expect_u32(axis.calibration_steps, 10U, "diagnostics report the measured steps");
+    expect_u32(axis.calibration_distance_um, 12U, "diagnostics report the measured distance");
+    expect_u32(axis.travel_um, 301000U, "diagnostics report the travel");
+    expect_u32((uint32_t)axis.max_position_um, 301000U, "diagnostics report the usable travel");
+    expect_u32(axis.max_speed_um_per_s, 60000U, "diagnostics report the speed limit");
+    expect_u32(axis.homed, 1U, "diagnostics report X as homed");
+    expect_u32((uint32_t)axis.planned_position_um, 0U, "diagnostics report the planned position");
+    expect_u32((uint32_t)axis.scale_position_um, (uint32_t)-300000, "diagnostics read the scale live");
+
+    /* While the final homing runs the calibration is still busy and other X commands wait. */
+    reset_receive_script();
+    fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
+    fake_calibration_measured = (AxisCalibration_t){.steps = 10U, .distance_um = 12U, .travel_um = 301000U};
+    context = valid_motion_context();
+    script_x_state(7U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    run_calibration_with_final_home_polls(&context, 1U);
+    expect_u32(test_last_receive_timeout, 1U, "calibration keeps polling during the final homing");
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_RUNNING, "calibration is not done before X is home");
+
+    /* The final homing fails: the measurement is kept, X is left unhomed. */
+    reset_receive_script();
+    fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
+    fake_calibration_measured = (AxisCalibration_t){.steps = 10U, .distance_um = 12U, .travel_um = 301000U};
+    context = valid_motion_context();
+    script_x_state(7U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U, 0U);
+    run_calibration_with_final_home_polls(&context, 1U);
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_HOME_FAILED, "failed final homing is reported");
+    expect_u32(context.calibration.calibrated_axes_mask, MOTION_PLANNER_AXIS_X_MASK, "measurement survives it");
+    expect_u32(axis.homed, 0U, "X is unhomed after the failed final homing");
+    expect_u32(test_last_receive_timeout, osWaitForever, "failed final homing ends the calibration");
+
+    /* STOP during the final homing aborts the calibration as well. */
+    reset_receive_script();
+    fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
+    context = valid_motion_context();
+    script_successful_home_states(1U);
+    script_x_state(7U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_read(0U, osOK, &test_calibrate_x_command);
+    for (uint32_t index = 1U; index <= 6U; ++index) {
+        script_read(index, osErrorTimeout, NULL);
+    }
+    const CommandDTO_t stop = {.sequence = 143U, .code = COMMAND_CODE_STOP};
+    script_read(7U, osOK, &stop);
+    test_axis_settles_after_delays = 1U;
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_ABORTED, "STOP aborts the final homing");
+    expect_u32(axis.homed, 0U, "aborted final homing leaves X unhomed");
+}
+
+static void test_calibration_failures(void) {
+    MotionTaskContext_t context;
+
+    reset_receive_script();
+    context = valid_motion_context();
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U, 0U);
+    script_read(0U, osOK, &test_calibrate_x_command);
+    script_read(1U, osErrorTimeout, NULL);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_calibration_begin_calls, 0U, "calibration does not start when homing fails");
+    MotionAxisDiagnostics axis = {0};
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_HOME_FAILED, "failed homing is reported");
+
+    run_home_to_fine_seek_result(&context, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    expect_u32(fake_calibration_begin_calls, 0U, "HOME alone does not calibrate");
+
+    reset_receive_script();
+    fake_calibration_begin_result = X_AXIS_CALIBRATION_RESULT_MOVE_FAILED;
+    context = valid_motion_context();
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
+    script_x_state(4U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
+    script_x_state(5U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_read(0U, osOK, &test_calibrate_x_command);
+    for (uint32_t index = 1U; index <= 5U; ++index) {
+        script_read(index, osErrorTimeout, NULL);
+    }
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_MOVE_FAILED, "calibration that cannot start fails");
+    expect_u32(context.calibration.calibrated_axes_mask, 0U, "failed calibration marks nothing");
+
+    reset_receive_script();
+    fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_NO_DISTANCE;
+    context = valid_motion_context();
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
+    script_x_state(4U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
+    script_x_state(5U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_read(0U, osOK, &test_calibrate_x_command);
+    for (uint32_t index = 1U; index <= 6U; ++index) {
+        script_read(index, osErrorTimeout, NULL);
+    }
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_NO_DISTANCE, "measurement failure is reported");
+    expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 80U, "failed calibration keeps the limits");
+}
+
+static void test_calibration_is_cancelled_and_guarded(void) {
+    MotionTaskContext_t context;
+    const CommandDTO_t stop = {.sequence = 141U, .code = COMMAND_CODE_STOP};
+
+    reset_receive_script();
+    context = valid_motion_context();
+    script_read(0U, osOK, &test_calibrate_x_command);
+    script_read(1U, osOK, &test_calibrate_x_command);
+    script_read(2U, osOK, &test_home_x_command);
+    script_read(3U, osOK, &stop);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 1U, "CALIBRATE and HOME are ignored while calibration homes");
+    expect_u32(fake_calibration_abort_calls, 1U, "STOP aborts the calibration");
+    MotionAxisDiagnostics axis = {0};
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_ABORTED, "aborted calibration is reported");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    script_read(0U, osOK, &test_calibrate_x_command);
+    script_read(1U, osErrorParameter, NULL);
+    test_jump_on_delay = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_calibration_abort_calls, 1U, "queue failure aborts the calibration");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    const CommandDTO_t calibrate_all = {
+        .sequence = 142U,
+        .code = COMMAND_CODE_CALIBRATE,
+        .parameters.calibrate.axes = MOTION_PLANNER_ALL_AXES_MASK,
+    };
+    script_read(0U, osOK, &calibrate_all);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 0U, "only X can be calibrated for now");
+}
+
 static void test_home_completes_only_on_pf10_during_fine_seek(void) {
     MotionTaskContext_t context;
     run_home_to_fine_seek_result(&context, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
@@ -757,6 +1058,45 @@ static void test_stop_clears_runtime_fault_and_x_homing(void) {
         MOTION_PLANNER_ALL_AXES_MASK & (uint8_t)~MOTION_PLANNER_AXIS_X_MASK,
         "X position is no longer trusted after a fault"
     );
+}
+
+static void test_stop_request_and_pipeline_reset(void) {
+    reset_receive_script();
+    motion_task_request_stop();
+    expect_u32(test_generator_halts, 1U, "STOP halts the step generator at once");
+    expect_u32(fake_x_stop_requests, 1U, "STOP stops the pulses at once");
+    expect_u32(test_queue_discards, 1U, "STOP drops the commands accepted before it");
+
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.position_um[0] = 5000;
+    fake_encoder_x_um = -1234;
+    run_single_stop(&context, MOTION_HARDWARE_X_STATUS_READY);
+    expect_u32(test_generator_resumes, 1U, "STOP restarts the generator once the axis is at rest");
+    expect_i64(context.machine_state.position_um[0], 1234, "after STOP X continues from the scale reading");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    context.machine_state.homed_axes_mask = 0U;
+    context.machine_state.position_um[0] = 5000;
+    fake_encoder_x_um = 777;
+    run_single_stop(&context, MOTION_HARDWARE_X_STATUS_READY);
+    expect_i64(context.machine_state.position_um[0], 5000, "unhomed X keeps its position after STOP");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_encoder_x_um = 42;
+    test_axis_settles_after_delays = 3U;
+    run_single_stop(&context, MOTION_HARDWARE_X_STATUS_RUNNING);
+    expect_u32(test_delay_calls, 3U, "STOP waits for the axis to come to rest");
+    expect_u32(test_generator_resumes, 1U, "generator restarts after the axis settled");
+    expect_i64(context.machine_state.position_um[0], 42, "positive scale reading is used as is");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    run_single_stop(&context, MOTION_HARDWARE_X_STATUS_RUNNING);
+    expect_u32(test_delay_calls, MOTION_TASK_STOP_SETTLE_TIMEOUT_MS, "STOP gives up after the settle timeout");
+    expect_u32(test_generator_resumes, 0U, "generator stays halted while the axis still moves");
 }
 
 static void test_stop_without_fault_keeps_homing(void) {
@@ -915,7 +1255,7 @@ static void test_home_start_failures(void) {
 static const CommandDTO_t test_x_jog_command = {
     .sequence = 140U,
     .code = COMMAND_CODE_X_JOG,
-    .parameters.x_jog = {.signed_steps = -200, .step_rate_hz = 1000U},
+    .parameters.x_jog = {.delta_um = 2000, .speed_um_per_s = 1000U},
 };
 
 static const CommandDTO_t test_xyz_move_command = {
@@ -952,7 +1292,7 @@ static void test_commands_during_home(void) {
     expect_u32(test_last_receive_timeout, 1U, "repeated HOME keeps homing active");
 
     run_command_during_home(&context, &test_x_jog_command);
-    expect_u32(fake_x_jog_starts, 0U, "X_JOG is ignored while homing");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "X_JOG is ignored while homing");
     expect_u32(test_last_receive_timeout, 1U, "X_JOG does not interrupt homing");
 
     run_command_during_home(&context, &test_xyz_move_command);
@@ -990,14 +1330,69 @@ static void test_home_is_refused_when_it_cannot_start(void) {
     expect_u32(fake_x_bench_starts, 0U, "HOME without a task context is ignored");
 }
 
-static void test_x_jog_starts_bench_move_when_idle(void) {
+static void run_x_jog(MotionTaskContext_t *context, int32_t delta_um) {
+    CommandDTO_t jog = test_x_jog_command;
+    jog.parameters.x_jog.delta_um = delta_um;
+    script_read(0U, osOK, &jog);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(context);
+}
+
+static void test_x_jog_is_a_relative_planned_move(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_read(0U, osOK, &test_x_jog_command);
-    test_block_when_empty = 1U;
-    (void)run_motion_task_until_scripted_stop(&context);
-    expect_u32(fake_x_jog_starts, 1U, "X_JOG starts a bench move");
-    expect_i64(fake_x_bench_last_signed_steps, -200, "X_JOG passes its signed step count");
+    context.machine_state.position_um[0] = 1000;
+    context.machine_state.position_um[1] = 500;
+    run_x_jog(&context, 2000);
+    MotionPlannerResult_t result = motion_task_test_get_last_planner_result();
+    expect_u32(result.status, MOTION_PLANNER_STATUS_OK, "X_JOG is planned like any other move");
+    expect_u32(result.block.sequence, 140U, "X_JOG keeps its sequence");
+    expect_i64(result.block.step_delta[0], 160, "X_JOG moves X by its distance");
+    expect_i64(result.block.step_delta[1], 0, "X_JOG leaves Y in place");
+    expect_u32(result.block.feedrate_um_per_s, 1000U, "X_JOG uses its speed");
+    expect_i64(context.machine_state.position_um[0], 3000, "the next move starts at the jog target");
+    expect_i64(context.machine_state.position_um[1], 500, "Y position is unchanged");
+    expect_u32(test_block_ready_notifications, 1U, "step generator is woken for the jog");
+    expect_u32(fake_x_bench_starts, 0U, "X_JOG no longer drives the axis directly");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    run_x_jog(&context, -200000);
+    expect_u32(
+        motion_task_get_last_planner_status(),
+        MOTION_PLANNER_STATUS_POSITION_OUT_OF_RANGE,
+        "X_JOG beyond the travel is rejected"
+    );
+    expect_i64(context.machine_state.position_um[0], 0, "rejected X_JOG keeps the position");
+    expect_u32(test_block_ready_notifications, 0U, "rejected X_JOG moves nothing");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    context.machine_state.homed_axes_mask = 0U;
+    run_x_jog(&context, 2000);
+    expect_u32(motion_task_get_last_planner_status(), MOTION_PLANNER_STATUS_NOT_HOMED, "X_JOG needs a homed X");
+
+    /* Targets beyond int32 are clamped instead of wrapping around. */
+    reset_receive_script();
+    context = valid_motion_context();
+    context.machine_state.position_um[0] = INT32_MAX;
+    run_x_jog(&context, 1);
+    expect_i64(motion_task_test_get_last_planner_result().block.step_delta[0], 0, "positive overflow is clamped");
+    expect_i64(context.machine_state.position_um[0], INT32_MAX, "clamped jog leaves X at the int32 limit");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    context.machine_state.position_um[0] = INT32_MIN;
+    run_x_jog(&context, -1);
+    expect_i64(context.machine_state.position_um[0], INT32_MIN, "negative overflow is clamped");
+
+    reset_receive_script();
+    run_x_jog(NULL, 2000);
+    expect_u32(
+        motion_task_get_last_planner_status(),
+        MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
+        "X_JOG without a task context is rejected by the planner"
+    );
 }
 
 static void test_stop_fault_acknowledgement_edges(void) {
@@ -1017,16 +1412,57 @@ static void test_stop_fault_acknowledgement_edges(void) {
     expect_u32(fake_x_status, MOTION_HARDWARE_X_STATUS_READY, "fault is cleared without a task context");
 }
 
+static void test_stored_calibration_sets_planner_limits(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const MotionPlannerAxisConfig_t default_y = context.planner_config.axis[1];
+    test_calibration_load_status = CALIBRATION_STORE_STATUS_OK;
+    test_stored_calibration.calibrated_axes_mask = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK;
+    test_stored_calibration.axis[0] = (AxisCalibration_t){.steps = 100000U, .distance_um = 50000U, .travel_um = 301000U};
+    /* Z is marked but its travel does not fit the planner, so it keeps the default limits. */
+    test_stored_calibration.axis[2] =
+        (AxisCalibration_t){.steps = 1U, .distance_um = 1U, .travel_um = (uint32_t)INT32_MAX + 1U};
+    const MotionPlannerAxisConfig_t default_z = context.planner_config.axis[2];
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+
+    expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 100000U, "X steps come from the calibration");
+    expect_u32(context.planner_config.axis[0].steps_per_um_denominator, 50000U, "X micrometres come from the calibration");
+    expect_u32((uint32_t)context.planner_config.axis[0].max_position_um, 301000U, "X travel comes from the calibration");
+    expect_u32(context.planner_config.axis[0].max_speed_um_per_s, 25000U, "X speed follows from the step-rate limit");
+    expect_u32(
+        context.planner_config.axis[1].steps_per_um_numerator,
+        default_y.steps_per_um_numerator,
+        "uncalibrated Y keeps its defaults"
+    );
+    expect_u32(
+        context.planner_config.axis[2].steps_per_um_numerator,
+        default_z.steps_per_um_numerator,
+        "unusable Z calibration is ignored"
+    );
+
+    reset_receive_script();
+    context = valid_motion_context();
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 80U, "missing calibration keeps defaults");
+}
+
 int main(void) {
+    test_stored_calibration_sets_planner_limits();
+    test_calibration_runs_after_homing_and_applies_result();
+    test_calibration_failures();
+    test_calibration_is_cancelled_and_guarded();
     test_x_hardware_is_initialized_before_first_command();
     test_home_phase_outcomes();
     test_home_start_failures();
     test_commands_during_home();
     test_home_is_refused_when_it_cannot_start();
-    test_x_jog_starts_bench_move_when_idle();
+    test_x_jog_is_a_relative_planned_move();
     test_stop_fault_acknowledgement_edges();
     test_stop_clears_runtime_fault_and_x_homing();
     test_stop_without_fault_keeps_homing();
+    test_stop_request_and_pipeline_reset();
     test_home_fast_seek_moves_toward_start_and_backs_off_on_pf10();
     test_home_fast_seek_aborts_on_end_limit();
     test_home_completes_only_on_pf10_during_fine_seek();

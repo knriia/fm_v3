@@ -103,6 +103,9 @@ void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
     *diagnostics = test_command_decoder_diagnostics;
 }
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) { *diagnostics = test_motion_task_diagnostics; }
+void motion_task_get_x_axis_diagnostics(MotionAxisDiagnostics *diagnostics) {
+    *diagnostics = (MotionAxisDiagnostics){.travel_um = 301000U, .scale_position_um = -5};
+}
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     *diagnostics = test_command_queue_diagnostics;
 }
@@ -860,6 +863,8 @@ static void test_diagnostic_task_network_paths(void) {
     expect_u32(test_captured_frame.payload.command_queue.full_rejections, 4U, "command queue full rejections diagnostic");
     expect_u32(test_captured_frame.payload.command_queue.enqueue_errors, 5U, "command queue enqueue errors diagnostic");
     expect_u32(test_captured_frame.payload.plan_buffer.initialized, 1U, "plan buffer initialized diagnostic");
+    expect_u32(test_captured_frame.payload.x_axis.travel_um, 301000U, "X axis travel diagnostic");
+    expect_u32((uint32_t)test_captured_frame.payload.x_axis.scale_position_um, (uint32_t)-5, "X axis scale diagnostic");
     expect_u32(test_captured_frame.payload.plan_buffer.capacity, PLAN_BUFFER_CAPACITY, "plan buffer capacity diagnostic");
     expect_u32(test_captured_frame.payload.plan_buffer.queued, 37U, "plan buffer current occupancy diagnostic");
     expect_u32(

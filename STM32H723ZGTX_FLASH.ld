@@ -45,11 +45,18 @@ MEMORY
 {
   ITCMRAM (xrw)    : ORIGIN = 0x00000000,   LENGTH = 64K
   DTCMRAM (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x08000000,   LENGTH = 1024K
+  FLASH    (rx)    : ORIGIN = 0x08000000,   LENGTH = 896K
+  /* Last 128 KB sector (sector 7) holds machine settings; it is erased separately, so no code may live here. */
+  SETTINGS (r)     : ORIGIN = 0x080E0000,   LENGTH = 128K
   RAM_D1  (xrw)    : ORIGIN = 0x24000000,   LENGTH = 320K
   RAM_D2  (xrw)    : ORIGIN = 0x30000000,   LENGTH = 32K
   RAM_D3  (xrw)    : ORIGIN = 0x38000000,   LENGTH = 16K
 }
+
+/* Settings sector contract used by the flash storage driver. */
+_settings_flash_start = ORIGIN(SETTINGS);
+_settings_flash_size = LENGTH(SETTINGS);
+_settings_flash_sector = 7;
 
 /* Ethernet memory layout contract. Keep these values in sync with the
  * descriptor counts and MEM_SIZE in the Ethernet/LwIP configuration. */
