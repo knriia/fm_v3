@@ -71,15 +71,12 @@ void telemetry_task_get_diagnostics(TelemetryTaskDiagnostics *diagnostics) {
 
 void TelemetryTask(void *argument) {
     NetworkTaskContext *context = argument;
-    if ((context == NULL) || (context->lwip_flags == NULL)) {
-        Error_Handler();
-        return;
-    }
+    configASSERT(context != NULL);
+    configASSERT(context->lwip_flags != NULL);
 
-    if (osEventFlagsWait(context->lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll, osWaitForever) & osFlagsError) {
-        Error_Handler();
-        return;
-    }
+    const uint32_t wait_result =
+        osEventFlagsWait(context->lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll | osFlagsNoClear, osWaitForever);
+    configASSERT((wait_result & osFlagsError) == 0U);
 
     uint32_t sequence = 0U;
     for (;;) {

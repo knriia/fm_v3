@@ -297,14 +297,12 @@ void DiagnosticTask(void *argument) {
         .motion_task_min_free_bytes = UINT32_MAX,
     };
 
-    if ((context == NULL) || (context->lwip_flags == NULL)) {
-        Error_Handler();
-    }
+    configASSERT(context != NULL);
+    configASSERT(context->lwip_flags != NULL);
 
-    osEventFlagsId_t lwip_flags = context->lwip_flags;
-    if (osEventFlagsWait(lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll, osWaitForever) & osFlagsError) {
-        Error_Handler();
-    }
+    const uint32_t wait_result =
+        osEventFlagsWait(context->lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll | osFlagsNoClear, osWaitForever);
+    configASSERT((wait_result & osFlagsError) == 0U);
 
     DiagnosticFrameDTO_t diagnostic_frame = {
         .header =

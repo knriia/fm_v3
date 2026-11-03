@@ -246,7 +246,7 @@ static int run_wait_error_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
     test_event_flags_wait_result = osFlagsErrorParameter;
 
-    TelemetryTask(&context);
+    run_until_delay(&context);
 
     expect_u32(test_event_flags_wait_calls, 1U, "telemetry wait error event calls");
     expect_u32(test_netconn_new_calls, 0U, "telemetry wait error listener creation calls");
@@ -255,7 +255,7 @@ static int run_wait_error_case(void) {
 }
 
 static int run_null_context_case(void) {
-    TelemetryTask(NULL);
+    run_until_delay(NULL);
 
     expect_u32(test_event_flags_wait_calls, 0U, "telemetry null context event calls");
     expect_u32(test_netconn_new_calls, 0U, "telemetry null context listener creation calls");
@@ -266,7 +266,7 @@ static int run_null_context_case(void) {
 static int run_null_flag_handle_case(void) {
     NetworkTaskContext context = {0};
 
-    TelemetryTask(&context);
+    run_until_delay(&context);
 
     expect_u32(test_event_flags_wait_calls, 0U, "null flags event wait calls");
     expect_u32(test_netconn_new_calls, 0U, "null flags listener creation calls");

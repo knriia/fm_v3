@@ -1,11 +1,10 @@
 #ifndef FM_V3_TEST_LWIP_NETBUF_H
 #define FM_V3_TEST_LWIP_NETBUF_H
 
+#include "lwip/arch.h"
 #include "lwip/err.h"
 
 #include <stdint.h>
-
-typedef uint16_t u16_t;
 
 struct netbuf;
 

@@ -11,6 +11,15 @@
 #define pdMS_TO_TICKS(milliseconds) (milliseconds)
 #define eInvalid 0
 
+/* The firmware assert halts the MCU; tests route it to Error_Handler so a failed check is observable. */
+void Error_Handler(void);
+#define configASSERT(condition)                                                                                        \
+    do {                                                                                                               \
+        if ((condition) == 0) {                                                                                        \
+            Error_Handler();                                                                                           \
+        }                                                                                                              \
+    } while (0)
+
 typedef uint32_t UBaseType_t;
 typedef uint32_t TickType_t;
 typedef uint32_t StackType_t;

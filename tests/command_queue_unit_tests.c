@@ -22,6 +22,9 @@ static uint32_t test_last_get_timeout;
 static uint8_t test_last_put_priority;
 static uint8_t test_attributes_were_null;
 static TestMessageQueue_t test_queue;
+static uint32_t test_space_listener_calls;
+
+static void test_space_listener(void) { ++test_space_listener_calls; }
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -97,6 +100,11 @@ uint32_t osMessageQueueGetCount(osMessageQueueId_t queue_id) {
     return test_queue.count;
 }
 
+uint32_t osMessageQueueGetSpace(osMessageQueueId_t queue_id) {
+    (void)queue_id;
+    return test_queue.capacity - test_queue.count;
+}
+
 static CommandDTO_t make_command(uint32_t sequence) {
     return (CommandDTO_t){
         .sequence = sequence,
@@ -122,6 +130,7 @@ static void test_command_queue_initialization_and_arguments(void) {
     expect_u32(command_queue_receive(&command, 0U), (uint32_t)osErrorResource, "receive before initialization fails");
     expect_u32(command_queue_try_send(NULL), COMMAND_QUEUE_PUT_ERROR, "null command cannot be queued");
     expect_u32(command_queue_receive(NULL, 0U), (uint32_t)osErrorParameter, "null receive output is rejected");
+    expect_u32(command_queue_free_slots(), 0U, "uninitialized queue has no free slots");
     command_queue_get_diagnostics(NULL);
     command_queue_get_diagnostics(&diagnostics);
     expect_u32(diagnostics.initialized, 0U, "diagnostics report queue is not initialized");
@@ -142,6 +151,30 @@ static void test_command_queue_initialization_and_arguments(void) {
     expect_u32(diagnostics.queued, 0U, "new queue has no queued commands");
     expect_u32(diagnostics.available, COMMAND_QUEUE_CAPACITY, "new queue has all slots available");
     expect_u32(command_queue_init(), (uint32_t)osErrorResource, "queue cannot be initialized twice");
+}
+
+static void test_command_queue_space_listener(void) {
+    CommandDTO_t input = make_command(300U);
+    CommandDTO_t output = {0};
+    while (command_queue_receive(&output, 0U) == osOK) {
+    }
+    const uint32_t free_before = command_queue_free_slots();
+    expect_u32(free_before, COMMAND_QUEUE_CAPACITY, "drained queue has every slot free");
+
+    command_queue_set_space_listener(test_space_listener);
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "command is queued for listener checks");
+    expect_u32(command_queue_free_slots(), free_before - 1U, "queued command takes one free slot");
+    expect_u32(test_space_listener_calls, 0U, "queuing a command does not report free space");
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osOK, "queued command is received for listener checks");
+    expect_u32(test_space_listener_calls, 1U, "taking a command reports free space");
+    expect_u32(command_queue_free_slots(), free_before, "received command frees its slot");
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osErrorResource, "empty queue has nothing to take");
+    expect_u32(test_space_listener_calls, 1U, "failed receive does not report free space");
+
+    command_queue_set_space_listener(NULL);
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "command is queued without a listener");
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osOK, "command is received without a listener");
+    expect_u32(test_space_listener_calls, 1U, "removed listener is not called");
 }
 
 static void test_command_queue_fifo_full_and_copy_semantics(void) {
@@ -221,6 +254,7 @@ static void test_command_queue_fifo_full_and_copy_semantics(void) {
 int main(void) {
     test_command_queue_initialization_and_arguments();
     test_command_queue_fifo_full_and_copy_semantics();
+    test_command_queue_space_listener();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Command queue unit tests failed: %u\n", test_failures);

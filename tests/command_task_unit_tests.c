@@ -6,7 +6,7 @@
 #include "cmsis_os.h"
 #include "lwip/api.h"
 #include "lwip/err.h"
-#include "lwip/netbuf.h"
+#include "lwip/pbuf.h"
 #include "main.h"
 #include "network_events.h"
 #include "task_context.h"
@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#define TEST_SCRIPT_LENGTH 32U
+#define TEST_PBUF_SEGMENTS 3U
+#define TEST_THREAD_ID ((osThreadId_t)(uintptr_t)0x1234U)
+
 static uint32_t test_failures;
 static uint32_t test_error_handler_calls;
 static jmp_buf test_jump_buffer;
@@ -24,7 +28,6 @@ static uint8_t test_jump_on_delay;
 static uint32_t test_jump_after_new_calls;
 static uint32_t test_jump_after_accept_calls;
 static uint8_t test_new_returns_null;
-static uint8_t test_accept_returns_null;
 static uint32_t test_event_flags_result;
 static err_t test_bind_result;
 static err_t test_listen_result;
@@ -32,8 +35,8 @@ static err_t test_accept_result;
 static err_t test_default_recv_result;
 static err_t test_write_result;
 static uint32_t test_tick_count;
-static uint32_t test_tick_after_receive[8];
-static uint8_t test_tick_after_receive_enabled[8];
+static uint32_t test_tick_after_receive[TEST_SCRIPT_LENGTH];
+static uint8_t test_tick_after_receive_enabled[TEST_SCRIPT_LENGTH];
 static uint32_t test_netconn_new_calls;
 static uint32_t test_netconn_bind_calls;
 static uint32_t test_netconn_listen_calls;
@@ -42,9 +45,19 @@ static uint32_t test_netconn_recv_calls;
 static uint32_t test_netconn_write_calls;
 static uint32_t test_netconn_close_calls;
 static uint32_t test_netconn_delete_calls;
-static uint32_t test_netbuf_delete_calls;
-static uint32_t test_recv_timeout;
+static uint32_t test_pbuf_free_calls;
+static uint8_t test_recv_apiflags;
+static netconn_callback test_listener_callback;
+static uint32_t test_thread_flags_clear_calls;
+static uint32_t test_thread_flags_cleared;
+static uint32_t test_thread_flags_set_calls;
+static uint32_t test_thread_flags_set_value;
+static osThreadId_t test_thread_flags_set_target;
+static uint32_t test_thread_flags_wait_calls;
+static uint32_t test_thread_flags_wait_timeouts[TEST_SCRIPT_LENGTH];
 static uint8_t test_write_mode;
+static uint8_t test_write_blocked;
+static int test_write_apiflags;
 static size_t test_captured_response_length;
 static uint8_t test_captured_response[COMMAND_MAX_FRAME_SIZE * 4U];
 static uint8_t test_force_assembler_next;
@@ -54,6 +67,10 @@ static uint8_t test_force_decoder_invalid_argument;
 static CommandQueuePutResult_t test_command_queue_put_result;
 static uint32_t test_command_queue_put_calls;
 static CommandDTO_t test_queued_command;
+static uint32_t test_queue_free_slots[TEST_SCRIPT_LENGTH];
+static uint32_t test_queue_free_slots_calls;
+static CommandQueueSpaceListener_t test_space_listener;
+static CommandFrameAssembler_t test_assembler;
 
 enum {
     TEST_WRITE_FULL = 0U,
@@ -78,24 +95,25 @@ struct netconn {
     uint32_t unused;
 };
 
-struct netbuf {
-    const uint8_t *parts[3];
-    u16_t lengths[3];
-    uint8_t part_count;
-    int8_t current;
-    err_t data_result;
-};
-
 typedef struct {
     err_t result;
-    struct netbuf *buffer;
+    struct pbuf *buffer;
 } TestReceive_t;
+
+typedef struct {
+    uint32_t result;
+    uint8_t set_tick;
+    uint32_t tick;
+    uint8_t unblock_writes;
+} TestFlagsWait_t;
 
 static struct netconn test_listener;
 static struct netconn test_client;
-static TestReceive_t test_receives[8];
+static TestReceive_t test_receives[TEST_SCRIPT_LENGTH];
 static uint32_t test_receive_script_count;
-static struct netbuf test_buffers[8];
+static struct pbuf test_buffers[TEST_SCRIPT_LENGTH][TEST_PBUF_SEGMENTS];
+static TestFlagsWait_t test_flags_waits[TEST_SCRIPT_LENGTH];
+static uint32_t test_flags_wait_script_count;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -142,9 +160,25 @@ uint32_t osDelay(uint32_t milliseconds) {
     return 0U;
 }
 
-struct netconn *netconn_new(int type) {
+osThreadId_t osThreadGetId(void) { return TEST_THREAD_ID; }
+
+uint32_t osThreadFlagsSet(osThreadId_t thread_id, uint32_t flags) {
+    ++test_thread_flags_set_calls;
+    test_thread_flags_set_target = thread_id;
+    test_thread_flags_set_value |= flags;
+    return test_thread_flags_set_value;
+}
+
+uint32_t osThreadFlagsClear(uint32_t flags) {
+    ++test_thread_flags_clear_calls;
+    test_thread_flags_cleared = flags;
+    return 0U;
+}
+
+struct netconn *netconn_new_with_callback(int type, netconn_callback callback) {
     (void)type;
     ++test_netconn_new_calls;
+    test_listener_callback = callback;
     if (test_jump_active != 0U && test_jump_after_new_calls != 0U &&
         test_netconn_new_calls > test_jump_after_new_calls) {
         longjmp(test_jump_buffer, 1);
@@ -174,13 +208,14 @@ err_t netconn_accept(struct netconn *connection, struct netconn **new_connection
         longjmp(test_jump_buffer, 1);
     }
     if (test_accept_result == ERR_OK) {
-        *new_connection = test_accept_returns_null != 0U ? NULL : &test_client;
+        *new_connection = &test_client;
     }
     return test_accept_result;
 }
 
-err_t netconn_recv(struct netconn *connection, struct netbuf **buffer) {
+err_t netconn_recv_tcp_pbuf_flags(struct netconn *connection, struct pbuf **buffer, u8_t apiflags) {
     (void)connection;
+    test_recv_apiflags = apiflags;
     ++test_netconn_recv_calls;
     const uint32_t index = test_netconn_recv_calls - 1U;
     if (index < test_receive_script_count) {
@@ -194,11 +229,6 @@ err_t netconn_recv(struct netconn *connection, struct netbuf **buffer) {
     return test_default_recv_result;
 }
 
-void netconn_set_recvtimeout(struct netconn *connection, int timeout) {
-    (void)connection;
-    test_recv_timeout = (uint32_t)timeout;
-}
-
 err_t netconn_write_partly(
     struct netconn *connection,
     const void *data,
@@ -207,8 +237,12 @@ err_t netconn_write_partly(
     size_t *bytes_written
 ) {
     (void)connection;
-    (void)apiflags;
+    test_write_apiflags = apiflags;
     ++test_netconn_write_calls;
+    if (test_write_blocked != 0U) {
+        *bytes_written = 0U;
+        return ERR_WOULDBLOCK;
+    }
 
     size_t reported = size;
     err_t result = test_write_result;
@@ -263,40 +297,10 @@ void netconn_delete(struct netconn *connection) {
     ++test_netconn_delete_calls;
 }
 
-void netbuf_first(struct netbuf *buffer) { buffer->current = 0; }
-
-int8_t netbuf_next(struct netbuf *buffer) {
-    if ((uint8_t)(buffer->current + 1) < buffer->part_count) {
-        ++buffer->current;
-        return 0;
-    }
-    buffer->current = -1;
-    return -1;
-}
-
-u16_t netbuf_len(struct netbuf *buffer) {
-    u16_t total = 0U;
-    for (uint8_t index = 0U; index < buffer->part_count; ++index) {
-        total = (u16_t)(total + buffer->lengths[index]);
-    }
-    return total;
-}
-
-err_t netbuf_data(struct netbuf *buffer, void **data, u16_t *length) {
-    if (buffer->data_result != ERR_OK) {
-        return buffer->data_result;
-    }
-    if (buffer->current < 0 || (uint8_t)buffer->current >= buffer->part_count) {
-        return ERR_BUF;
-    }
-    *data = (void *)buffer->parts[(uint8_t)buffer->current];
-    *length = buffer->lengths[(uint8_t)buffer->current];
-    return ERR_OK;
-}
-
-void netbuf_delete(struct netbuf *buffer) {
+u8_t pbuf_free(struct pbuf *buffer) {
     (void)buffer;
-    ++test_netbuf_delete_calls;
+    ++test_pbuf_free_calls;
+    return 1U;
 }
 
 static CommandFrameAssemblerEvent_t test_command_frame_assembler_next(const CommandFrameAssembler_t *assembler);
@@ -320,6 +324,27 @@ static CommandDecoderResult_t test_command_decoder_decode_request(const CommandR
 #undef command_frame_assembler_append
 #undef command_frame_assembler_next
 
+/* Scripted wait results; once the script ends the task is woken with RX so it reads the default result. */
+uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
+    (void)flags;
+    (void)options;
+    const uint32_t index = test_thread_flags_wait_calls;
+    ++test_thread_flags_wait_calls;
+    if (index < TEST_SCRIPT_LENGTH) {
+        test_thread_flags_wait_timeouts[index] = timeout;
+    }
+    if (index < test_flags_wait_script_count) {
+        if (test_flags_waits[index].set_tick != 0U) {
+            test_tick_count = test_flags_waits[index].tick;
+        }
+        if (test_flags_waits[index].unblock_writes != 0U) {
+            test_write_blocked = 0U;
+        }
+        return test_flags_waits[index].result;
+    }
+    return COMMAND_TASK_FLAG_RX;
+}
+
 CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command) {
     ++test_command_queue_put_calls;
     if (command == NULL) {
@@ -328,6 +353,18 @@ CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command) {
     test_queued_command = *command;
     return test_command_queue_put_result;
 }
+
+/* Free slots after each accepted command; unscripted calls report room so the ACK is sent at once. */
+uint32_t command_queue_free_slots(void) {
+    const uint32_t index = test_queue_free_slots_calls;
+    ++test_queue_free_slots_calls;
+    if (index < TEST_SCRIPT_LENGTH && test_queue_free_slots[index] != UINT32_MAX) {
+        return test_queue_free_slots[index];
+    }
+    return 1U;
+}
+
+void command_queue_set_space_listener(CommandQueueSpaceListener_t listener) { test_space_listener = listener; }
 
 static CommandFrameAssemblerEvent_t test_command_frame_assembler_next(const CommandFrameAssembler_t *assembler) {
     if (test_force_assembler_next == TEST_ASSEMBLER_NEXT_NEED_MORE) {
@@ -399,7 +436,6 @@ static void reset_fixture(void) {
     test_jump_after_new_calls = 0U;
     test_jump_after_accept_calls = 0U;
     test_new_returns_null = 0U;
-    test_accept_returns_null = 0U;
     test_event_flags_result = 0U;
     test_bind_result = ERR_OK;
     test_listen_result = ERR_OK;
@@ -417,11 +453,22 @@ static void reset_fixture(void) {
     test_netconn_write_calls = 0U;
     test_netconn_close_calls = 0U;
     test_netconn_delete_calls = 0U;
-    test_netbuf_delete_calls = 0U;
-    test_recv_timeout = 0U;
+    test_pbuf_free_calls = 0U;
+    test_recv_apiflags = 0U;
+    test_listener_callback = NULL;
+    test_thread_flags_clear_calls = 0U;
+    test_thread_flags_cleared = 0U;
+    test_thread_flags_set_calls = 0U;
+    test_thread_flags_set_value = 0U;
+    test_thread_flags_set_target = NULL;
+    test_thread_flags_wait_calls = 0U;
+    memset(test_thread_flags_wait_timeouts, 0, sizeof(test_thread_flags_wait_timeouts));
     test_write_mode = TEST_WRITE_FULL;
+    test_write_blocked = 0U;
+    test_write_apiflags = 0;
     test_captured_response_length = 0U;
     test_receive_script_count = 0U;
+    test_flags_wait_script_count = 0U;
     test_force_assembler_next = TEST_ASSEMBLER_NEXT_REAL;
     test_force_assembler_append_failure = 0U;
     test_force_assembler_consume_failure = 0U;
@@ -429,11 +476,55 @@ static void reset_fixture(void) {
     test_command_queue_put_result = COMMAND_QUEUE_PUT_OK;
     test_command_queue_put_calls = 0U;
     test_queued_command = (CommandDTO_t){0};
+    memset(test_queue_free_slots, 0xFF, sizeof(test_queue_free_slots));
+    test_queue_free_slots_calls = 0U;
+    test_space_listener = NULL;
     memset(test_receives, 0, sizeof(test_receives));
     memset(test_buffers, 0, sizeof(test_buffers));
+    memset(test_flags_waits, 0, sizeof(test_flags_waits));
     memset(test_captured_response, 0, sizeof(test_captured_response));
     command_task_diagnostics = (CommandTaskDiagnostics){0};
-    command_frame_assembler_init(&command_task_assembler);
+    command_task_thread_id = NULL;
+    command_frame_assembler_init(&test_assembler);
+}
+
+static CommandTaskAssemblerContext_t test_context(void) {
+    return (CommandTaskAssemblerContext_t){
+        .client = &test_client,
+        .assembler = &test_assembler,
+    };
+}
+
+/* Links up to three segments into one pbuf chain; tot_len of each segment covers the rest of the chain. */
+static struct pbuf *test_chain(
+    struct pbuf *segments,
+    const uint8_t *first,
+    u16_t first_length,
+    const uint8_t *second,
+    u16_t second_length,
+    const uint8_t *third,
+    u16_t third_length
+) {
+    const uint8_t *parts[TEST_PBUF_SEGMENTS] = {first, second, third};
+    const u16_t lengths[TEST_PBUF_SEGMENTS] = {first_length, second_length, third_length};
+    uint8_t count = 1U;
+    if (second != NULL || second_length != 0U) {
+        count = 2U;
+    }
+    if (third != NULL || third_length != 0U) {
+        count = 3U;
+    }
+
+    u16_t remaining = 0U;
+    for (uint8_t index = count; index > 0U; --index) {
+        struct pbuf *segment = &segments[index - 1U];
+        remaining = (u16_t)(remaining + lengths[index - 1U]);
+        segment->payload = (void *)(uintptr_t)parts[index - 1U];
+        segment->len = lengths[index - 1U];
+        segment->tot_len = remaining;
+        segment->next = index < count ? &segments[index] : NULL;
+    }
+    return &segments[0];
 }
 
 static void set_buffer(
@@ -445,23 +536,15 @@ static void set_buffer(
     const uint8_t *third,
     u16_t third_length
 ) {
-    struct netbuf *buffer = &test_buffers[receive_index];
-    buffer->parts[0] = first;
-    buffer->lengths[0] = first_length;
-    buffer->part_count = 1U;
-    if (second != NULL || second_length != 0U) {
-        buffer->parts[1] = second;
-        buffer->lengths[1] = second_length;
-        buffer->part_count = 2U;
-    }
-    if (third != NULL || third_length != 0U) {
-        buffer->parts[2] = third;
-        buffer->lengths[2] = third_length;
-        buffer->part_count = 3U;
-    }
-    buffer->current = 0;
-    buffer->data_result = ERR_OK;
-    test_receives[receive_index].buffer = buffer;
+    test_receives[receive_index].buffer = test_chain(
+        test_buffers[receive_index],
+        first,
+        first_length,
+        second,
+        second_length,
+        third,
+        third_length
+    );
     if (test_receive_script_count <= receive_index) {
         test_receive_script_count = receive_index + 1U;
     }
@@ -477,6 +560,19 @@ static void set_receive_result(uint32_t receive_index, err_t result) {
 static void set_tick_after_receive(uint32_t receive_index, uint32_t tick_count) {
     test_tick_after_receive[receive_index] = tick_count;
     test_tick_after_receive_enabled[receive_index] = 1U;
+}
+
+static void set_flags_wait(uint32_t wait_index, uint32_t result) {
+    test_flags_waits[wait_index].result = result;
+    if (test_flags_wait_script_count <= wait_index) {
+        test_flags_wait_script_count = wait_index + 1U;
+    }
+}
+
+static void set_flags_wait_timeout_at(uint32_t wait_index, uint32_t tick_count) {
+    set_flags_wait(wait_index, osFlagsErrorTimeout);
+    test_flags_waits[wait_index].set_tick = 1U;
+    test_flags_waits[wait_index].tick = tick_count;
 }
 
 static int run_task_until_jump(NetworkTaskContext *context) {
@@ -527,17 +623,17 @@ static void test_context_and_listener_failures(void) {
     NetworkTaskContext valid_context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
 
     reset_fixture();
-    CommandTask(NULL);
+    expect_u32((uint32_t)run_task_until_jump(NULL), 1U, "null task context stops the task");
     expect_u32(test_error_handler_calls, 1U, "null task context reports a fatal error");
 
     reset_fixture();
     NetworkTaskContext null_flags = {.lwip_flags = NULL};
-    CommandTask(&null_flags);
+    expect_u32((uint32_t)run_task_until_jump(&null_flags), 1U, "null event flags stop the task");
     expect_u32(test_error_handler_calls, 1U, "null event flags report a fatal error");
 
     reset_fixture();
     test_event_flags_result = osFlagsErrorParameter;
-    CommandTask(&valid_context);
+    expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "LwIP readiness error stops the task");
     expect_u32(test_error_handler_calls, 1U, "LwIP readiness error reports a fatal error");
     expect_u32(test_netconn_new_calls, 0U, "listener is not created before LwIP is ready");
 
@@ -546,6 +642,9 @@ static void test_context_and_listener_failures(void) {
     test_jump_on_delay = 1U;
     expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "listener allocation retry is interruptible in test");
     expect_u32(command_task_diagnostics.netconn_alloc_errors, 1U, "listener allocation failure is counted");
+    expect_true(test_listener_callback == command_task_netconn_event, "listener is created with the event callback");
+    expect_true(command_task_thread_id == TEST_THREAD_ID, "task stores its id for the callback");
+    expect_true(test_space_listener == command_task_queue_space_available, "task listens for free queue space");
 
     reset_fixture();
     test_bind_result = ERR_MEM;
@@ -572,11 +671,13 @@ static void test_context_and_listener_failures(void) {
     expect_u32(test_netconn_close_calls, 1U, "listener is closed after accept error");
 
     reset_fixture();
-    test_accept_returns_null = 1U;
-    test_jump_after_new_calls = 1U;
-    expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "null accepted client exits current listener");
-    expect_u32(command_task_diagnostics.accept_errors, 1U, "null client is counted as accept error");
-    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_CONN, "null client records connection error");
+    test_accept_result = ERR_ABRT;
+    test_jump_on_delay = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "aborted accept waits before retrying");
+    expect_u32(command_task_diagnostics.accept_errors, 1U, "aborted accept is counted");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ABRT, "aborted accept records ERR_ABRT");
+    expect_u32(test_netconn_close_calls, 0U, "listener is kept after aborted accept");
+    expect_u32(test_netconn_new_calls, 1U, "listener is not recreated after aborted accept");
 }
 
 static void run_one_receive(const uint8_t *frame, size_t frame_length) {
@@ -659,8 +760,11 @@ static void test_fragmented_receive_and_disconnect_cleanup(void) {
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "fragmented frame is handled before disconnect");
     expect_single_response(COMMAND_MESSAGE_TYPE_PONG, 51U, 0U);
-    expect_u32(test_netbuf_delete_calls, 2U, "each received buffer is released");
-    expect_u32(test_recv_timeout, COMMAND_TASK_RECEIVE_TIMEOUT_MS, "client receive timeout is configured");
+    expect_u32(test_pbuf_free_calls, 2U, "each received buffer is released");
+    expect_u32(test_recv_apiflags, NETCONN_DONTBLOCK, "client data is read without blocking");
+    expect_u32(test_thread_flags_wait_calls, 0U, "data already queued is read before waiting for flags");
+    expect_u32(test_thread_flags_clear_calls, 1U, "task flags are cleared for the new client");
+    expect_u32(test_thread_flags_cleared, COMMAND_TASK_FLAGS_ALL, "all task flags are cleared for the new client");
     expect_u32(command_task_diagnostics.connections_accepted, 1U, "client acceptance is counted");
     expect_u32(command_task_diagnostics.connections_closed, 1U, "client close is counted");
     expect_u32(command_task_diagnostics.active_connection, 0U, "active connection clears on disconnect");
@@ -677,32 +781,77 @@ static void test_fragmented_receive_and_disconnect_cleanup(void) {
     expect_u32(command_task_diagnostics.invalid_frame_length, 1U, "partial frame from prior connection is discarded");
 }
 
-static void test_receive_timeout_and_receive_errors(void) {
+static void test_flag_waits_and_receive_errors(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
     uint8_t frame[COMMAND_MAX_FRAME_SIZE];
-    (void)build_ping(frame, 61U);
+    const size_t frame_length = build_ping(frame, 61U);
+
+    reset_fixture();
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_buffer(1U, frame, (u16_t)frame_length, NULL, 0U, NULL, 0U);
+    set_receive_result(1U, ERR_OK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RX);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "RX flag wakes the task for new data");
+    expect_single_response(COMMAND_MESSAGE_TYPE_PONG, 61U, 0U);
+    expect_u32(test_thread_flags_wait_timeouts[0], osWaitForever, "task waits forever without a partial frame");
+
+    reset_fixture();
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_TX);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "TX flag alone is ignored");
+    expect_u32(test_thread_flags_wait_calls, 2U, "TX flag leads back to waiting");
+    expect_u32(test_netconn_recv_calls, 2U, "TX flag does not trigger a read");
+
+    reset_fixture();
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_receive_result(1U, ERR_RST);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_ERROR);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "ERROR flag closes the client through the read path");
+    expect_u32(command_task_diagnostics.recv_errors, 1U, "connection error is counted as a receive error");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_RST, "connection error code is recorded");
+    expect_u32(command_task_diagnostics.connections_closed, 1U, "client is closed after a connection error");
 
     reset_fixture();
     set_buffer(0U, frame, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
     set_receive_result(0U, ERR_OK);
-    set_receive_result(1U, ERR_TIMEOUT);
-    set_tick_after_receive(1U, COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS - 1U);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_flags_wait_timeout_at(0U, COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS - 1U);
+    set_flags_wait(1U, COMMAND_TASK_FLAG_RX);
     set_receive_result(2U, ERR_CONN);
     test_jump_after_accept_calls = 1U;
-    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "nonexpired frame survives receive timeout");
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "nonexpired frame survives a wait timeout");
+    expect_u32(
+        test_thread_flags_wait_timeouts[0],
+        pdMS_TO_TICKS(COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS),
+        "partial frame limits the wait to its deadline"
+    );
+    expect_u32(test_thread_flags_wait_timeouts[1], 1U, "wait resumes with the remaining deadline");
     expect_u32(test_netconn_write_calls, 0U, "no response is sent for a truncated request");
     expect_u32(command_task_diagnostics.invalid_frame_length, 1U, "disconnect records a truncated frame");
 
     reset_fixture();
     set_buffer(0U, frame, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
     set_receive_result(0U, ERR_OK);
-    set_receive_result(1U, ERR_TIMEOUT);
-    set_tick_after_receive(1U, COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_flags_wait_timeout_at(0U, COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS);
     test_write_mode = TEST_WRITE_FAIL;
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "failed timeout ERROR closes the client");
     expect_u32(test_netconn_write_calls, 1U, "truncation ERROR is attempted once");
     expect_u32(command_task_diagnostics.response_send_errors, 1U, "failed timeout response is counted");
+
+    reset_fixture();
+    set_buffer(0U, frame, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_tick_after_receive(1U, COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "frame expired before waiting is rejected at once");
+    expect_single_response(COMMAND_MESSAGE_TYPE_ERROR, 61U, COMMAND_ERROR_TRUNCATED_FRAME);
+    expect_u32(test_thread_flags_wait_timeouts[0], osWaitForever, "task waits forever after rejecting the frame");
 
     reset_fixture();
     set_receive_result(0U, ERR_MEM);
@@ -718,111 +867,246 @@ static void test_receive_timeout_and_receive_errors(void) {
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "missing buffer records ERR_BUF");
 
     reset_fixture();
-    set_buffer(0U, frame, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
-    test_buffers[0].data_result = ERR_MEM;
+    set_buffer(0U, NULL, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
     set_receive_result(0U, ERR_OK);
     test_jump_after_accept_calls = 1U;
-    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "netbuf assembly error closes current connection");
-    expect_u32(command_task_diagnostics.recv_errors, 1U, "netbuf assembly error is counted");
-    expect_u32(test_netbuf_delete_calls, 1U, "buffer is deleted after assembly error");
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "pbuf assembly error closes current connection");
+    expect_u32(command_task_diagnostics.recv_errors, 1U, "pbuf assembly error is counted");
+    expect_u32(test_pbuf_free_calls, 1U, "buffer is released after assembly error");
+}
+
+static void test_netconn_event_callback(void) {
+    reset_fixture();
+    command_task_netconn_event(&test_client, NETCONN_EVT_RCVPLUS, 1U);
+    expect_u32(test_thread_flags_set_calls, 0U, "callback is ignored before the task id is known");
+
+    command_task_thread_id = TEST_THREAD_ID;
+    command_task_netconn_event(&test_client, NETCONN_EVT_RCVPLUS, 1U);
+    expect_u32(test_thread_flags_set_value, COMMAND_TASK_FLAG_RX, "received data sets the RX flag");
+    expect_true(test_thread_flags_set_target == TEST_THREAD_ID, "flag goes to the command task");
+
+    test_thread_flags_set_value = 0U;
+    command_task_netconn_event(&test_client, NETCONN_EVT_SENDPLUS, 0U);
+    expect_u32(test_thread_flags_set_value, COMMAND_TASK_FLAG_TX, "free send space sets the TX flag");
+
+    test_thread_flags_set_value = 0U;
+    command_task_netconn_event(&test_client, NETCONN_EVT_ERROR, 0U);
+    expect_u32(test_thread_flags_set_value, COMMAND_TASK_FLAG_ERROR, "connection error sets the ERROR flag");
+
+    test_thread_flags_set_calls = 0U;
+    command_task_netconn_event(&test_client, NETCONN_EVT_RCVMINUS, 0U);
+    command_task_netconn_event(&test_client, NETCONN_EVT_SENDMINUS, 0U);
+    expect_u32(test_thread_flags_set_calls, 0U, "consumed-data events set no flags");
+}
+
+static void expect_ack_at(size_t offset, uint32_t sequence, const char *message) {
+    CommandFrameHeaderDTO_t header = {0};
+    const size_t ack_length = 14U;
+    const uint8_t present = test_captured_response_length >= offset + ack_length ? 1U : 0U;
+    expect_true(present, message);
+    if (present == 0U) {
+        return;
+    }
+    expect_u32(
+        command_protocol_validate_frame(&test_captured_response[offset], ack_length, &header),
+        COMMAND_FRAME_VALID,
+        message
+    );
+    expect_u32(header.type, COMMAND_MESSAGE_TYPE_ACK, message);
+    expect_u32(header.sequence, sequence, message);
+}
+
+static void test_deferred_ack(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    uint8_t first[COMMAND_MAX_FRAME_SIZE];
+    uint8_t second[COMMAND_MAX_FRAME_SIZE];
+    const size_t first_length = build_stop_command(first, 101U);
+    const size_t second_length = build_stop_command(second, 102U);
+
+    reset_fixture();
+    test_queue_free_slots[0] = 0U;
+    set_buffer(0U, first, (u16_t)first_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_QUEUE_SPACE);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "command that fills the queue is accepted");
+    expect_u32(test_command_queue_put_calls, 1U, "command filling the queue is queued");
+    expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 101U, 0U);
+    expect_u32(test_thread_flags_wait_calls, 2U, "ACK waits for the queue space flag");
+    expect_u32(test_netconn_recv_calls, 3U, "queue space flag alone does not read the socket");
+
+    reset_fixture();
+    test_queue_free_slots[0] = 0U;
+    set_buffer(0U, first, (u16_t)first_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_TX);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "held ACK survives unrelated flags");
+    expect_u32((uint32_t)test_captured_response_length, 0U, "ACK is not sent without free queue space");
+    expect_u32(command_task_diagnostics.connections_closed, 1U, "client closes with the ACK still held");
+
+    reset_fixture();
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_QUEUE_SPACE);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "queue space without a held ACK is ignored");
+    expect_u32(test_netconn_write_calls, 0U, "nothing is sent without a held ACK");
+
+    reset_fixture();
+    test_queue_free_slots[0] = 0U;
+    test_queue_free_slots[1] = 1U;
+    set_buffer(0U, first, (u16_t)first_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_buffer(1U, second, (u16_t)second_length, NULL, 0U, NULL, 0U);
+    set_receive_result(1U, ERR_OK);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "held ACK is released by the next queued command");
+    expect_u32((uint32_t)test_captured_response_length, 28U, "both commands are acknowledged");
+    expect_ack_at(0U, 101U, "older held ACK is sent first");
+    expect_ack_at(14U, 102U, "newer ACK follows the held one");
+
+    reset_fixture();
+    test_queue_free_slots[0] = 0U;
+    set_buffer(0U, first, (u16_t)first_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_QUEUE_SPACE);
+    test_write_mode = TEST_WRITE_FAIL;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "failed held ACK closes the client");
+    expect_u32(test_netconn_write_calls, 1U, "held ACK is attempted once");
+    expect_u32(test_netconn_recv_calls, 2U, "socket is not read after a failed held ACK");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "failed held ACK is counted");
+
+    reset_fixture();
+    command_task_queue_space_available();
+    expect_u32(test_thread_flags_set_calls, 0U, "queue space is ignored before the task id is known");
+    command_task_thread_id = TEST_THREAD_ID;
+    command_task_queue_space_available();
+    expect_u32(test_thread_flags_set_value, COMMAND_TASK_FLAG_QUEUE_SPACE, "queue space sets its task flag");
+}
+
+static void test_flags_wait_timeout_helper(void) {
+    reset_fixture();
+    CommandTaskAssemblerContext_t context = test_context();
+    expect_u32(command_task_flags_wait_timeout(&context), osWaitForever, "no partial frame waits forever");
+
+    context.partial_frame_active = 1U;
+    context.partial_frame_started_at = 100U;
+    test_tick_count = 400U;
+    expect_u32(
+        command_task_flags_wait_timeout(&context),
+        pdMS_TO_TICKS(COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS) - 300U,
+        "partial frame waits for the rest of its deadline"
+    );
+
+    test_tick_count = 100U + COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS;
+    expect_u32(command_task_flags_wait_timeout(&context), 0U, "expired partial frame does not wait");
 }
 
 static void test_assembler_errors_and_boundary_paths(void) {
-    reset_fixture();
-    struct netbuf buffer = {.parts = {(const uint8_t[]){1U}}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_MEM};
-    CommandTaskAssemblyEvent_t event = command_task_assemble_netbuf(&buffer, NULL);
-    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "netbuf extraction error becomes assembly error");
-    expect_u32(command_task_diagnostics.recv_errors, 1U, "netbuf extraction error is counted");
+    struct pbuf segments[TEST_PBUF_SEGMENTS];
+    CommandTaskAssemblerContext_t context;
 
     reset_fixture();
-    buffer = (struct netbuf){.parts = {NULL}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
-    event = command_task_assemble_netbuf(&buffer, NULL);
+    struct pbuf *buffer = test_chain(segments, (const uint8_t[]){1U}, 1U, NULL, 0U, NULL, 0U);
+    CommandTaskAssemblyEvent_t event = command_task_assemble_pbuf(buffer, NULL);
+    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "missing context is rejected");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ARG, "missing context records ERR_ARG");
+
+    reset_fixture();
+    context = (CommandTaskAssemblerContext_t){.client = &test_client};
+    event = command_task_assemble_pbuf(buffer, &context);
+    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "context without an assembler is rejected");
+
+    reset_fixture();
+    context = test_context();
+    event = command_task_assemble_pbuf(NULL, &context);
+    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "missing pbuf is rejected");
+
+    reset_fixture();
+    buffer = test_chain(segments, NULL, 1U, NULL, 0U, NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "null data with nonzero length is rejected");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "null data records ERR_BUF");
 
     reset_fixture();
-    buffer = (struct netbuf){.parts = {NULL}, .lengths = {0U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
-    event = command_task_assemble_netbuf(&buffer, NULL);
-    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_NEED_MORE, "empty netbuf part is ignored");
+    buffer = test_chain(segments, NULL, 0U, NULL, 0U, NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
+    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_NEED_MORE, "empty pbuf segment is ignored");
 
     reset_fixture();
-    buffer = (struct netbuf){.parts = {(const uint8_t[]){1U}}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
-    command_task_assembler.length = COMMAND_MAX_FRAME_SIZE + 1U;
-    event = command_task_assemble_netbuf(&buffer, NULL);
+    buffer = test_chain(segments, (const uint8_t[]){1U}, 1U, NULL, 0U, NULL, 0U);
+    test_assembler.length = COMMAND_MAX_FRAME_SIZE + 1U;
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "invalid assembler state is rejected");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ARG, "invalid assembler state records ERR_ARG");
 
     reset_fixture();
-    buffer = (struct netbuf){.parts = {(const uint8_t[]){1U}}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
+    buffer = test_chain(segments, (const uint8_t[]){1U}, 1U, NULL, 0U, NULL, 0U);
     test_force_assembler_next = TEST_ASSEMBLER_NEXT_NEED_MORE;
     test_force_assembler_append_failure = 1U;
-    event = command_task_assemble_netbuf(&buffer, NULL);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "zero-byte append is handled as assembly failure");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "zero-byte append records ERR_BUF");
 
     reset_fixture();
-    buffer = (struct netbuf){.parts = {(const uint8_t[]){1U}}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
+    buffer = test_chain(segments, (const uint8_t[]){1U}, 1U, NULL, 0U, NULL, 0U);
     test_force_assembler_next = TEST_ASSEMBLER_NEXT_INVALID_ARGUMENT;
-    event = command_task_assemble_netbuf(&buffer, NULL);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "assembler invalid-argument event is propagated");
 
     reset_fixture();
-    buffer = (struct netbuf){.parts = {(const uint8_t[]){1U}}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
+    buffer = test_chain(segments, (const uint8_t[]){1U}, 1U, NULL, 0U, NULL, 0U);
     test_force_assembler_next = TEST_ASSEMBLER_NEXT_INVALID_FRAME_VALIDATION;
-    event = command_task_assemble_netbuf(&buffer, NULL);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "unmapped frame validation result becomes error");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ARG, "unmapped frame result records ERR_ARG");
 
     reset_fixture();
     uint8_t frame[COMMAND_MAX_FRAME_SIZE];
     size_t frame_length = build_stop_command(frame, 71U);
-    buffer = (struct netbuf){
-        .parts = {frame},
-        .lengths = {(u16_t)frame_length},
-        .part_count = 1U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
+    buffer = test_chain(segments, frame, (u16_t)frame_length, NULL, 0U, NULL, 0U);
     test_force_assembler_next = TEST_ASSEMBLER_NEXT_COMMAND_READY;
     test_force_assembler_consume_failure = 1U;
-    event = command_task_assemble_netbuf(&buffer, &(CommandTaskAssemblerContext_t){0});
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "assembler consume failure is handled");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "consume failure records ERR_BUF");
 
     reset_fixture();
-    command_task_assembler.length = 1U;
-    buffer = (struct netbuf){.parts = {(const uint8_t[]){1U}}, .lengths = {1U}, .part_count = 1U, .current = 0, .data_result = ERR_OK};
+    test_assembler.length = 1U;
+    buffer = test_chain(segments, (const uint8_t[]){1U}, 1U, NULL, 0U, NULL, 0U);
     test_force_assembler_next = TEST_ASSEMBLER_NEXT_COMMAND_READY;
-    CommandTaskAssemblerContext_t disconnect_context = {.disconnect_requested = 1U};
-    event = command_task_assemble_netbuf(&buffer, &disconnect_context);
+    context = test_context();
+    context.disconnect_requested = 1U;
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "pending disconnect stops assembly after consume");
 
     reset_fixture();
     frame_length = build_stop_command(frame, 72U);
     const uint8_t trailing[] = {0xA5U};
-    buffer = (struct netbuf){
-        .parts = {frame, trailing},
-        .lengths = {(u16_t)frame_length, sizeof(trailing)},
-        .part_count = 2U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
-    event = command_task_assemble_netbuf(&buffer, &(CommandTaskAssemblerContext_t){0});
+    buffer = test_chain(segments, frame, (u16_t)frame_length, trailing, sizeof(trailing), NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "trailing bytes after a complete frame are rejected");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_VAL, "trailing bytes record ERR_VAL");
 
     reset_fixture();
     frame_length = build_stop_command(frame, 73U);
     const uint8_t next_frame[COMMAND_MAX_FRAME_SIZE] = {0};
-    buffer = (struct netbuf){
-        .parts = {frame, next_frame},
-        .lengths = {(u16_t)frame_length, 1U},
-        .part_count = 2U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
-    event = command_task_assemble_netbuf(&buffer, &(CommandTaskAssemblerContext_t){0});
-    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "unread later netbuf segments are rejected");
+    buffer = test_chain(segments, frame, (u16_t)frame_length, next_frame, 1U, NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
+    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "unread later pbuf segments are rejected");
 }
 
 static void test_frame_errors_timeout_helpers_and_response_writes(void) {
@@ -862,7 +1146,7 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
 
     reset_fixture();
     expect_u32(command_task_finalize_incomplete_frame(NULL, 1U), 1U, "null timeout context is ignored");
-    CommandTaskAssemblerContext_t timeout_context = {.client = &test_client, .partial_frame_active = 0U};
+    CommandTaskAssemblerContext_t timeout_context = test_context();
     expect_u32(command_task_finalize_incomplete_frame(&timeout_context, 1U), 1U, "inactive partial frame is ignored");
     timeout_context.disconnect_requested = 1U;
     timeout_context.partial_frame_active = 1U;
@@ -871,13 +1155,9 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
     reset_fixture();
     uint8_t stop_frame[COMMAND_MAX_FRAME_SIZE];
     (void)build_stop_command(stop_frame, 82U);
-    memcpy(command_task_assembler.buffer, stop_frame, COMMAND_FRAME_HEADER_SIZE);
-    command_task_assembler.length = COMMAND_FRAME_HEADER_SIZE;
-    timeout_context = (CommandTaskAssemblerContext_t){
-        .client = &test_client,
-        .partial_frame_active = 0U,
-        .disconnect_requested = 0U,
-    };
+    memcpy(test_assembler.buffer, stop_frame, COMMAND_FRAME_HEADER_SIZE);
+    test_assembler.length = COMMAND_FRAME_HEADER_SIZE;
+    timeout_context = test_context();
     test_tick_count = 100U;
     command_task_update_partial_frame_tracking(&timeout_context);
     expect_u32(timeout_context.partial_frame_active, 1U, "incomplete frame starts tracking");
@@ -886,7 +1166,7 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
     command_task_update_partial_frame_tracking(&timeout_context);
     expect_u32(timeout_context.partial_frame_started_at, 100U, "active deadline is not restarted");
     expect_u32(command_task_reject_expired_incomplete_frame(NULL), 1U, "null timeout check is ignored");
-    CommandTaskAssemblerContext_t inactive_timeout_context = {.partial_frame_active = 0U};
+    CommandTaskAssemblerContext_t inactive_timeout_context = test_context();
     expect_u32(
         command_task_reject_expired_incomplete_frame(&inactive_timeout_context),
         1U,
@@ -896,121 +1176,205 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
     test_tick_count = 100U + COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS;
     expect_u32(command_task_reject_expired_incomplete_frame(&timeout_context), 1U, "expired frame gets a truncation response");
     expect_single_response(COMMAND_MESSAGE_TYPE_ERROR, 82U, COMMAND_ERROR_TRUNCATED_FRAME);
-    expect_u32(command_task_assembler.length, 0U, "timeout clears assembler state");
+    expect_u32(test_assembler.length, 0U, "timeout clears assembler state");
 
     reset_fixture();
-    command_task_assembler.length = 3U;
-    memcpy(command_task_assembler.buffer, stop_frame, 3U);
-    timeout_context = (CommandTaskAssemblerContext_t){
-        .client = &test_client,
-        .partial_frame_active = 1U,
-    };
+    test_assembler.length = 3U;
+    memcpy(test_assembler.buffer, stop_frame, 3U);
+    timeout_context = test_context();
+    timeout_context.partial_frame_active = 1U;
     expect_u32(command_task_finalize_incomplete_frame(&timeout_context, 1U), 1U, "short header records truncation without reply");
     expect_u32(test_netconn_write_calls, 0U, "no response is sent until sequence is parseable");
 
     reset_fixture();
-    memcpy(command_task_assembler.buffer, stop_frame, COMMAND_FRAME_HEADER_SIZE);
-    command_task_assembler.length = COMMAND_FRAME_HEADER_SIZE;
-    timeout_context = (CommandTaskAssemblerContext_t){
-        .client = NULL,
-        .partial_frame_active = 1U,
-    };
+    memcpy(test_assembler.buffer, stop_frame, COMMAND_FRAME_HEADER_SIZE);
+    test_assembler.length = COMMAND_FRAME_HEADER_SIZE;
+    timeout_context = test_context();
+    timeout_context.client = NULL;
+    timeout_context.partial_frame_active = 1U;
     expect_u32(command_task_finalize_incomplete_frame(&timeout_context, 1U), 0U, "failed truncation response closes connection");
     expect_u32(timeout_context.disconnect_requested, 1U, "failed truncation response marks disconnect");
 
     reset_fixture();
-    expect_u32(command_task_send_response(NULL, ping, ping_length), 0U, "null client cannot receive a response");
-    expect_u32(command_task_send_response(&test_client, NULL, ping_length), 0U, "null response bytes are rejected");
-    expect_u32(command_task_send_response(&test_client, ping, 0U), 0U, "empty response is rejected");
+    CommandTaskAssemblerContext_t send_context = test_context();
+    expect_u32(command_task_send_response(NULL, ping, ping_length), 0U, "missing session cannot send a response");
+    send_context.client = NULL;
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "null client cannot receive a response");
+    send_context = test_context();
+    expect_u32(command_task_send_response(&send_context, NULL, ping_length), 0U, "null response bytes are rejected");
+    expect_u32(command_task_send_response(&send_context, ping, 0U), 0U, "empty response is rejected");
     expect_u32(
-        command_task_send_response(&test_client, ping, COMMAND_MAX_FRAME_SIZE + 1U),
+        command_task_send_response(&send_context, ping, COMMAND_MAX_FRAME_SIZE + 1U),
         0U,
         "oversized response is rejected"
     );
-    expect_u32(command_task_send_protocol_response(&test_client, 0xFEU, 1U, 0U), 0U, "unsupported response type is rejected");
-    reset_fixture();
-    test_write_mode = TEST_WRITE_PARTIAL_THEN_FULL;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 1U, "partial successful writes finish response");
-    expect_u32(test_netconn_write_calls, 2U, "partial response continues from the remaining byte");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "successful partial response is counted");
-    expect_u32(command_task_diagnostics.response_successes, 1U, "completed response is counted");
+    expect_u32(command_task_send_protocol_response(&send_context, 0xFEU, 1U, 0U), 0U, "unsupported response type is rejected");
 
     reset_fixture();
+    send_context = test_context();
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "response is written at once");
+    expect_u32((uint32_t)test_write_apiflags, NETCONN_COPY | NETCONN_DONTBLOCK, "responses are written without blocking");
+    expect_u32((uint32_t)send_context.tx_length, 0U, "fully written response leaves the send buffer empty");
+    expect_u32((uint32_t)test_captured_response_length, (uint32_t)ping_length, "whole response reaches LwIP");
+
+    reset_fixture();
+    send_context = test_context();
+    test_write_mode = TEST_WRITE_PARTIAL_THEN_FULL;
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "partial write keeps the client");
+    expect_u32(test_netconn_write_calls, 1U, "partial write waits for the TX flag");
+    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial write is counted");
+    expect_u32((uint32_t)send_context.tx_sent, 3U, "written bytes are tracked");
+    expect_u32(command_task_flush_responses(&send_context), 1U, "TX flag finishes the partial response");
+    expect_u32(test_netconn_write_calls, 2U, "rest of the response is written");
+    expect_u32((uint32_t)send_context.tx_length, 0U, "send buffer is empty after the rest is written");
+    expect_u32((uint32_t)test_captured_response_length, (uint32_t)ping_length, "whole response reaches LwIP");
+    expect_u32(command_task_diagnostics.response_successes, 1U, "queued response is counted");
+
+    reset_fixture();
+    send_context = test_context();
+    test_write_blocked = 1U;
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "full LwIP buffer keeps the client");
+    expect_u32((uint32_t)send_context.tx_length, (uint32_t)ping_length, "blocked response stays buffered");
+    expect_u32((uint32_t)test_captured_response_length, 0U, "blocked response is not written");
+    test_write_blocked = 0U;
+    expect_u32(command_task_flush_responses(&send_context), 1U, "buffered response is written later");
+    expect_u32((uint32_t)test_captured_response_length, (uint32_t)ping_length, "buffered response reaches LwIP");
+
+    reset_fixture();
+    send_context = test_context();
     test_write_mode = TEST_WRITE_OVERREPORT;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "overreported initial write is rejected");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "overreported write is rejected");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ARG, "overreport records argument error");
 
     reset_fixture();
+    send_context = test_context();
     test_write_mode = TEST_WRITE_PARTIAL_THEN_OVERREPORT;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "overreport after partial progress is rejected");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial overreported response increments partial count");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "first partial write is accepted");
+    expect_u32(command_task_flush_responses(&send_context), 0U, "overreport after partial progress is rejected");
+    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial write before overreport is counted");
 
     reset_fixture();
-    test_write_result = ERR_OK;
+    send_context = test_context();
     test_write_mode = TEST_WRITE_FAIL;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "zero-progress write is rejected");
-    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "zero progress maps to buffer error");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "failed write is rejected");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "failed write records its error");
 
     reset_fixture();
+    send_context = test_context();
     test_write_result = ERR_BUF;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "transport write error is propagated");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "transport write error is propagated");
     expect_u32(command_task_diagnostics.partial_writes, 0U, "failure before progress is not partial");
 
     reset_fixture();
+    send_context = test_context();
     test_write_mode = TEST_WRITE_FAIL_AFTER_PARTIAL;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "failure after partial progress is rejected");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "failure after progress is counted partial");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "partial write before failure keeps the client");
+    expect_u32(command_task_flush_responses(&send_context), 0U, "failure after partial progress is rejected");
+    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial write before failure is counted");
 
     reset_fixture();
+    send_context = test_context();
     test_write_mode = TEST_WRITE_ERROR_WITH_PARTIAL_FIRST;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "write error with initial progress is rejected");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "initial progress before error is counted partial");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "write error with progress is rejected");
+    expect_u32(command_task_diagnostics.bytes_sent, 3U, "bytes written before the error are counted");
 
     reset_fixture();
+    send_context = test_context();
     test_write_mode = TEST_WRITE_ZERO_PROGRESS;
-    expect_u32(command_task_send_response(&test_client, ping, ping_length), 0U, "zero progress without transport error is rejected");
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "zero progress without error is rejected");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_BUF, "zero progress maps to buffer error");
+
+    reset_fixture();
+    send_context = test_context();
+    send_context.tx_length = COMMAND_TASK_TX_BUFFER_SIZE - 1U;
+    test_write_blocked = 1U;
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "response that does not fit is rejected");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_MEM, "send buffer overflow records ERR_MEM");
+    expect_u32(test_netconn_write_calls, 0U, "overflowing response is not written");
+
+    reset_fixture();
+    send_context = test_context();
+    send_context.tx_sent = COMMAND_TASK_TX_BUFFER_SIZE - 10U;
+    send_context.tx_length = COMMAND_TASK_TX_BUFFER_SIZE - 4U;
+    test_write_blocked = 1U;
+    expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "response fits after compaction");
+    expect_u32((uint32_t)send_context.tx_sent, 0U, "unsent bytes move to the buffer start");
+    expect_u32((uint32_t)send_context.tx_length, 6U + (uint32_t)ping_length, "new response follows the unsent bytes");
+}
+
+static void test_nonblocking_responses_pause_reading(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    static uint8_t pings[20][COMMAND_MAX_FRAME_SIZE];
+    const uint32_t ping_count = 20U;
+    const size_t pong_length = 14U;
+
+    reset_fixture();
+    for (uint32_t index = 0U; index < ping_count; ++index) {
+        const size_t ping_length = build_ping(pings[index], 200U + index);
+        set_buffer(index, pings[index], (u16_t)ping_length, NULL, 0U, NULL, 0U);
+        set_receive_result(index, ERR_OK);
+    }
+    test_write_blocked = 1U;
+    set_flags_wait(0U, COMMAND_TASK_FLAG_TX);
+    test_flags_waits[0].unblock_writes = 1U;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "client is served while LwIP cannot take responses");
+    expect_u32(test_thread_flags_wait_calls, 1U, "reading pauses until queued responses drain");
+    expect_u32(test_netconn_recv_calls, ping_count + 1U, "reading resumes after the TX flag without a new RX flag");
+    expect_u32(
+        (uint32_t)test_captured_response_length,
+        ping_count * (uint32_t)pong_length,
+        "every PING gets its PONG"
+    );
+    CommandFrameHeaderDTO_t header = {0};
+    (void)command_protocol_validate_frame(
+        &test_captured_response[(ping_count - 1U) * pong_length],
+        pong_length,
+        &header
+    );
+    expect_u32(header.sequence, 200U + ping_count - 1U, "PONGs keep the request order");
 }
 
 static void test_incomplete_frame_tracking_edges(void) {
     reset_fixture();
     expect_u32(command_task_assembler_has_incomplete_command(NULL), 0U, "null assembler is not incomplete");
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 0U, "empty assembler is not incomplete");
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 0U, "empty assembler is not incomplete");
 
-    command_task_assembler.length = 1U;
-    command_task_assembler.buffer[0] = (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU);
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 1U, "magic prefix is incomplete");
-    command_task_assembler.buffer[0] ^= 1U;
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 0U, "unrelated byte is not incomplete");
+    test_assembler.length = 1U;
+    test_assembler.buffer[0] = (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU);
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 1U, "magic prefix is incomplete");
+    test_assembler.buffer[0] ^= 1U;
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 0U, "unrelated byte is not incomplete");
 
-    command_task_assembler.length = 2U;
-    command_task_assembler.buffer[0] = (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU);
-    command_task_assembler.buffer[1] = (uint8_t)(COMMAND_PROTOCOL_MAGIC >> 8U);
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 1U, "valid magic prefix is incomplete");
-    command_task_assembler.buffer[1] ^= 1U;
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 0U, "bad second magic byte is discarded");
+    test_assembler.length = 2U;
+    test_assembler.buffer[0] = (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU);
+    test_assembler.buffer[1] = (uint8_t)(COMMAND_PROTOCOL_MAGIC >> 8U);
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 1U, "valid magic prefix is incomplete");
+    test_assembler.buffer[1] ^= 1U;
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 0U, "bad second magic byte is discarded");
 
     uint8_t ping[COMMAND_MAX_FRAME_SIZE];
     const size_t ping_length = build_ping(ping, 86U);
-    command_task_assembler.length = COMMAND_FRAME_HEADER_SIZE;
-    memcpy(command_task_assembler.buffer, ping, COMMAND_FRAME_HEADER_SIZE);
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 1U, "valid short header is incomplete");
-    command_task_assembler.length = ping_length;
-    memcpy(command_task_assembler.buffer, ping, ping_length);
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 0U, "complete frame is not incomplete");
-    command_task_assembler.length = COMMAND_FRAME_HEADER_SIZE;
-    command_task_assembler.buffer[4] = (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) & 0xFFU);
-    command_task_assembler.buffer[5] = (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) >> 8U);
-    expect_u32(command_task_assembler_has_incomplete_command(&command_task_assembler), 0U, "invalid header length is not incomplete");
+    test_assembler.length = COMMAND_FRAME_HEADER_SIZE;
+    memcpy(test_assembler.buffer, ping, COMMAND_FRAME_HEADER_SIZE);
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 1U, "valid short header is incomplete");
+    test_assembler.length = ping_length;
+    memcpy(test_assembler.buffer, ping, ping_length);
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 0U, "complete frame is not incomplete");
+    test_assembler.length = COMMAND_FRAME_HEADER_SIZE;
+    test_assembler.buffer[4] = (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) & 0xFFU);
+    test_assembler.buffer[5] = (uint8_t)((COMMAND_MAX_PAYLOAD_SIZE + 1U) >> 8U);
+    expect_u32(command_task_assembler_has_incomplete_command(&test_assembler), 0U, "invalid header length is not incomplete");
 
-    CommandTaskAssemblerContext_t context = {.partial_frame_active = 1U};
-    command_frame_assembler_init(&command_task_assembler);
+    CommandTaskAssemblerContext_t context = test_context();
+    context.partial_frame_active = 1U;
+    command_frame_assembler_init(&test_assembler);
     command_task_update_partial_frame_tracking(&context);
     expect_u32(context.partial_frame_active, 0U, "tracking clears when no partial command remains");
     command_task_update_partial_frame_tracking(NULL);
 
-    command_task_assembler.length = 1U;
-    command_task_assembler.buffer[0] = (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU);
+    test_assembler.length = 1U;
+    test_assembler.buffer[0] = (uint8_t)(COMMAND_PROTOCOL_MAGIC & 0xFFU);
     context.partial_frame_active = 0U;
     test_tick_count = 87U;
     command_task_update_partial_frame_tracking(&context);
@@ -1018,47 +1382,33 @@ static void test_incomplete_frame_tracking_edges(void) {
     expect_u32(context.partial_frame_started_at, 87U, "tracking records the first partial tick");
 }
 
-static void test_assembly_netbuf_segment_and_trailing_cases(void) {
+static void test_assembly_pbuf_segment_and_trailing_cases(void) {
+    struct pbuf segments[TEST_PBUF_SEGMENTS];
+
     reset_fixture();
     uint8_t frame[COMMAND_MAX_FRAME_SIZE];
     const size_t frame_length = build_ping(frame, 88U);
-    struct netbuf buffer = {
-        .parts = {frame, &frame[3]},
-        .lengths = {3U, (u16_t)(frame_length - 3U)},
-        .part_count = 2U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
-    CommandTaskAssemblerContext_t context = {0};
-    CommandTaskAssemblyEvent_t event = command_task_assemble_netbuf(&buffer, &context);
-    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_COMMAND_READY, "frame split across netbuf parts is assembled");
-    expect_u32(event.command.header.sequence, 88U, "segmented netbuf returns the full request");
+    struct pbuf *buffer = test_chain(segments, frame, 3U, &frame[3], (u16_t)(frame_length - 3U), NULL, 0U);
+    CommandTaskAssemblerContext_t context = test_context();
+    CommandTaskAssemblyEvent_t event = command_task_assemble_pbuf(buffer, &context);
+    expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_COMMAND_READY, "frame split across pbuf segments is assembled");
+    expect_u32(event.command.header.sequence, 88U, "segmented pbuf returns the full request");
 
     reset_fixture();
     command_task_diagnostics.buffer_max_bytes = 100U;
     const uint8_t partial_byte[] = {0x5AU};
-    buffer = (struct netbuf){
-        .parts = {partial_byte},
-        .lengths = {sizeof(partial_byte)},
-        .part_count = 1U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
-    event = command_task_assemble_netbuf(&buffer, NULL);
+    buffer = test_chain(segments, partial_byte, sizeof(partial_byte), NULL, 0U, NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_NEED_MORE, "partial byte stays in assembler");
     expect_u32(command_task_diagnostics.buffer_max_bytes, 100U, "diagnostic high-water mark does not decrease");
 
     reset_fixture();
     uint8_t with_trailing_data[COMMAND_MAX_FRAME_SIZE + 20U] = {0};
     (void)memcpy(with_trailing_data, frame, frame_length);
-    buffer = (struct netbuf){
-        .parts = {with_trailing_data},
-        .lengths = {(u16_t)sizeof(with_trailing_data)},
-        .part_count = 1U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
-    event = command_task_assemble_netbuf(&buffer, &context);
+    buffer = test_chain(segments, with_trailing_data, (u16_t)sizeof(with_trailing_data), NULL, 0U, NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "unappended bytes in a large segment are rejected");
 
     reset_fixture();
@@ -1067,17 +1417,11 @@ static void test_assembly_netbuf_segment_and_trailing_cases(void) {
     uint8_t combined[COMMAND_MAX_FRAME_SIZE * 2U];
     memcpy(combined, frame, frame_length);
     memcpy(&combined[frame_length], second_frame, second_length);
-    buffer = (struct netbuf){
-        .parts = {combined},
-        .lengths = {(u16_t)(frame_length + second_length)},
-        .part_count = 1U,
-        .current = 0,
-        .data_result = ERR_OK,
-    };
-    context = (CommandTaskAssemblerContext_t){0};
-    event = command_task_assemble_netbuf(&buffer, &context);
+    buffer = test_chain(segments, combined, (u16_t)(frame_length + second_length), NULL, 0U, NULL, 0U);
+    context = test_context();
+    event = command_task_assemble_pbuf(buffer, &context);
     expect_u32((uint32_t)event.result, COMMAND_TASK_ASSEMBLY_ERROR, "second complete frame in one receive is rejected");
-    expect_u32((uint32_t)command_task_assembler.length, (uint32_t)second_length, "assembler retains the unexpected second frame");
+    expect_u32((uint32_t)test_assembler.length, (uint32_t)second_length, "assembler retains the unexpected second frame");
 }
 
 static void test_diagnostics_and_internal_edges(void) {
@@ -1191,11 +1535,15 @@ int main(void) {
     test_context_and_listener_failures();
     test_ping_ack_and_error_responses();
     test_fragmented_receive_and_disconnect_cleanup();
-    test_receive_timeout_and_receive_errors();
+    test_flag_waits_and_receive_errors();
+    test_netconn_event_callback();
+    test_deferred_ack();
+    test_flags_wait_timeout_helper();
     test_assembler_errors_and_boundary_paths();
     test_incomplete_frame_tracking_edges();
-    test_assembly_netbuf_segment_and_trailing_cases();
+    test_assembly_pbuf_segment_and_trailing_cases();
     test_frame_errors_timeout_helpers_and_response_writes();
+    test_nonblocking_responses_pause_reading();
     test_diagnostics_and_internal_edges();
     test_decoder_failure_and_error_response_send_failure();
 
