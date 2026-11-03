@@ -174,6 +174,7 @@ static uint32_t fake_x_init_calls;
 static uint32_t fake_x_init_receive_calls;
 static uint32_t fake_x_stop_requests;
 static uint32_t fake_x_clear_fault_calls;
+static uint32_t fake_x_ready_after_home_calls;
 static uint32_t fake_x_bench_starts;
 static int32_t fake_x_bench_last_signed_steps;
 static uint32_t fake_x_release_stop_arms;
@@ -198,6 +199,14 @@ MotionHardwareXStatus_t motion_hardware_x_clear_fault(void) {
     ++fake_x_clear_fault_calls;
     if (fake_x_status >= MOTION_HARDWARE_X_STATUS_FAULT_LIMIT &&
         fake_x_status <= MOTION_HARDWARE_X_STATUS_FAULT_TIMING) {
+        fake_x_status = MOTION_HARDWARE_X_STATUS_READY;
+    }
+    return fake_x_status;
+}
+
+MotionHardwareXStatus_t motion_hardware_x_ready_after_home(void) {
+    ++fake_x_ready_after_home_calls;
+    if (fake_x_status == MOTION_HARDWARE_X_STATUS_STOPPED && fake_x_start_limit_active != 0U) {
         fake_x_status = MOTION_HARDWARE_X_STATUS_READY;
     }
     return fake_x_status;
@@ -310,6 +319,7 @@ static void reset_receive_script(void) {
     fake_x_init_receive_calls = UINT32_MAX;
     fake_x_stop_requests = 0U;
     fake_x_clear_fault_calls = 0U;
+    fake_x_ready_after_home_calls = 0U;
     fake_x_bench_starts = 0U;
     test_jump_active = 0U;
     test_jump_on_delay = 0U;
@@ -1019,6 +1029,7 @@ static void test_home_completes_only_on_pf10_during_fine_seek(void) {
     expect_u32(fake_x_bench_starts, 4U, "fast seek, backoff, extra backoff and fine seek are started");
     expect_i64(fake_x_bench_last_signed_steps, -400, "fine seek returns toward PF10 by backoff plus extra steps");
     expect_u32(fake_x_stop_requests, 1U, "only the backoff stop is requested");
+    expect_u32(fake_x_ready_after_home_calls, 1U, "successful home readies the X hardware");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "successful homing marks X homed");
     expect_i64(context.machine_state.position_um[0], 0, "successful homing zeroes X");
 
