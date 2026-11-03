@@ -8,28 +8,18 @@
 #define COMMAND_TASK_FRAME_ASSEMBLY_TIMEOUT_MS 1000U
 
 typedef struct {
-    uint32_t port;
     uint32_t connections_accepted;
     uint32_t connections_closed;
     uint32_t active_connection;
-    uint32_t bytes_received;
     uint32_t complete_frames_received;
-    uint32_t invalid_magic;
-    uint32_t invalid_frame_length;
-    uint32_t invalid_crc;
-    uint32_t buffer_current_bytes;
+    /* Bad magic, bad length, bad CRC, or a frame cut off by the assembly timeout or a disconnect. */
+    uint32_t invalid_frames;
     uint32_t buffer_max_bytes;
-    uint32_t bytes_sent;
-    uint32_t response_attempts;
-    uint32_t response_successes;
     uint32_t response_send_errors;
-    uint32_t partial_writes;
-    uint32_t netconn_alloc_errors;
-    uint32_t bind_errors;
-    uint32_t listen_errors;
-    uint32_t accept_errors;
     uint32_t recv_errors;
     uint32_t decoder_errors;
+    /* ACKs held back because the command took the last free slot of the command queue. */
+    uint32_t acks_deferred;
     int32_t last_error;
 } CommandTaskDiagnostics;
 

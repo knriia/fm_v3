@@ -12,31 +12,6 @@ static void command_decoder_counter_increment(volatile uint32_t *counter) {
 
 static void command_decoder_record_error(int32_t error) { command_decoder_diagnostics.last_error = error; }
 
-static void command_decoder_record_request_error(uint16_t error_code) {
-    command_decoder_record_error((int32_t)error_code);
-    switch (error_code) {
-    case COMMAND_ERROR_UNSUPPORTED_VERSION:
-        command_decoder_counter_increment(&command_decoder_diagnostics.unsupported_version);
-        break;
-    case COMMAND_ERROR_UNEXPECTED_TYPE:
-        command_decoder_counter_increment(&command_decoder_diagnostics.unexpected_type);
-        break;
-    case COMMAND_ERROR_INVALID_LENGTH:
-        command_decoder_counter_increment(&command_decoder_diagnostics.invalid_payload_length);
-        break;
-    case COMMAND_ERROR_INVALID_SEQUENCE:
-        command_decoder_counter_increment(&command_decoder_diagnostics.invalid_sequence);
-        break;
-    case COMMAND_ERROR_UNKNOWN_COMMAND:
-        command_decoder_counter_increment(&command_decoder_diagnostics.unknown_commands);
-        break;
-    case COMMAND_ERROR_INVALID_STATE:
-        command_decoder_counter_increment(&command_decoder_diagnostics.invalid_states);
-        break;
-    default:
-        break;
-    }
-}
 
 static uint16_t command_decoder_read_u16_le(const uint8_t *data) {
     return (uint16_t)data[0] | ((uint16_t)data[1] << 8U);
@@ -181,11 +156,8 @@ CommandDecoderResult_t command_decoder_decode_request(const CommandRequestDTO_t 
     }
 
     const CommandFrameHeaderDTO_t *header = &request->header;
-    command_decoder_counter_increment(&command_decoder_diagnostics.requests_received);
     if (header->type == COMMAND_MESSAGE_TYPE_COMMAND) {
         command_decoder_counter_increment(&command_decoder_diagnostics.commands_received);
-    } else if (header->type == COMMAND_MESSAGE_TYPE_PING) {
-        command_decoder_counter_increment(&command_decoder_diagnostics.pings_received);
     }
 
     uint16_t error_code = command_protocol_validate_request_dto(request);
@@ -203,20 +175,16 @@ CommandDecoderResult_t command_decoder_decode_request(const CommandRequestDTO_t 
         command_decoder_counter_increment(&command_decoder_diagnostics.commands_rejected);
     }
     if (error_code != 0U) {
-        command_decoder_record_request_error(error_code);
+        command_decoder_record_error((int32_t)error_code);
         result.type = COMMAND_DECODER_RESULT_RESPONSE_READY;
         result.response_type = COMMAND_MESSAGE_TYPE_ERROR;
         result.error_code = error_code;
-        command_decoder_counter_increment(&command_decoder_diagnostics.errors_formed);
-        command_decoder_counter_increment(&command_decoder_diagnostics.responses_formed);
         return result;
     }
 
     result.type = COMMAND_DECODER_RESULT_RESPONSE_READY;
     result.response_type = COMMAND_MESSAGE_TYPE_PONG;
     result.error_code = 0U;
-    command_decoder_counter_increment(&command_decoder_diagnostics.pongs_formed);
-    command_decoder_counter_increment(&command_decoder_diagnostics.responses_formed);
     return result;
 }
 
@@ -225,24 +193,7 @@ void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
         return;
     }
 
-    diagnostics->protocol_version = COMMAND_PROTOCOL_VERSION;
-    diagnostics->max_payload_size = COMMAND_MAX_PAYLOAD_SIZE;
-    diagnostics->max_frame_size = COMMAND_MAX_FRAME_SIZE;
-    diagnostics->requests_received = command_decoder_diagnostics.requests_received;
-    diagnostics->request_queue_overflows = 0U;
-    diagnostics->request_bytes_dropped = 0U;
     diagnostics->commands_received = command_decoder_diagnostics.commands_received;
     diagnostics->commands_rejected = command_decoder_diagnostics.commands_rejected;
-    diagnostics->pings_received = command_decoder_diagnostics.pings_received;
-    diagnostics->responses_formed = command_decoder_diagnostics.responses_formed;
-    diagnostics->pongs_formed = command_decoder_diagnostics.pongs_formed;
-    diagnostics->errors_formed = command_decoder_diagnostics.errors_formed;
-    diagnostics->invalid_payload_length = command_decoder_diagnostics.invalid_payload_length;
-    diagnostics->unsupported_version = command_decoder_diagnostics.unsupported_version;
-    diagnostics->unexpected_type = command_decoder_diagnostics.unexpected_type;
-    diagnostics->invalid_sequence = command_decoder_diagnostics.invalid_sequence;
-    diagnostics->unknown_commands = command_decoder_diagnostics.unknown_commands;
-    diagnostics->invalid_states = command_decoder_diagnostics.invalid_states;
-    diagnostics->response_queue_overflows = 0U;
     diagnostics->last_error = command_decoder_diagnostics.last_error;
 }

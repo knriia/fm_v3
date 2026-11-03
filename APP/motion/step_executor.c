@@ -14,6 +14,8 @@ typedef enum {
 
 static StepExecutorState_t step_executor_state;
 static uint8_t step_executor_current_is_last;
+/* Written only by the step ISR; a 32-bit read from a task is atomic. */
+static volatile uint32_t step_executor_underruns;
 
 static StepExecutorStatus_t step_executor_take_event(MotionExecutionEvent_t *event) {
     if (execution_buffer_try_pop(event) != EXECUTION_BUFFER_STATUS_OK) {
@@ -64,7 +66,12 @@ StepExecutorStatus_t step_executor_pulse_complete(MotionExecutionEvent_t *next_e
         return STEP_EXECUTOR_STATUS_COMPLETE;
     }
 
-    return step_executor_take_event(next_event);
+    const StepExecutorStatus_t status = step_executor_take_event(next_event);
+    if (status == STEP_EXECUTOR_STATUS_UNDERRUN) {
+        /* One per fault, and every fault needs a STOP, so the counter cannot realistically wrap. */
+        ++step_executor_underruns;
+    }
+    return status;
 }
 
 StepExecutorStatus_t step_executor_get_status(void) {
@@ -79,6 +86,8 @@ StepExecutorStatus_t step_executor_get_status(void) {
         return STEP_EXECUTOR_STATUS_NOT_RUNNING;
     }
 }
+
+uint32_t step_executor_get_underrun_count(void) { return step_executor_underruns; }
 
 void step_executor_reset(void) {
     step_executor_state = STEP_EXECUTOR_STATE_IDLE;

@@ -3,7 +3,6 @@
 #include "task_context.h"
 #include "telemetry_dto.h"
 #include "telemetry_task.h"
-#include "telemetry_test_hooks.h"
 
 #include "lwip/api.h"
 #include "lwip/err.h"
@@ -201,7 +200,6 @@ static void run_until_delay(NetworkTaskContext *context) {
 
 static int run_reconnect_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_jump_active = 1U;
     if (setjmp(test_jump_buffer) == 0) {
@@ -221,24 +219,6 @@ static int run_reconnect_case(void) {
     expect_u32(test_error_handler_calls, 0U, "telemetry Error_Handler calls");
     expect_frame(&test_first_frame, 1U, "telemetry first frame type");
     expect_frame(&test_success_frame, 2U, "telemetry recovered frame type");
-    telemetry_task_get_diagnostics(NULL);
-    telemetry_task_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.port, TELEMETRY_NETWORK_TASK_PORT, "telemetry diagnostics port");
-    expect_u32(diagnostics.interval_ms, TELEMETRY_NETWORK_TASK_INTERVAL_MS, "telemetry diagnostics interval");
-    expect_u32(diagnostics.send_timeout_ms, TELEMETRY_NETWORK_SEND_TIMEOUT_MS, "telemetry diagnostics send timeout");
-    expect_u32(diagnostics.connections_accepted, 2U, "telemetry diagnostics accepted connections");
-    expect_u32(diagnostics.connections_closed, 1U, "telemetry diagnostics closed connections");
-    expect_u32(diagnostics.active_connection, 1U, "telemetry diagnostics active connection");
-    expect_u32(diagnostics.send_attempts, 2U, "telemetry diagnostics send attempts");
-    expect_u32(diagnostics.send_successes, 1U, "telemetry diagnostics send successes");
-    expect_u32(diagnostics.send_errors, 1U, "telemetry diagnostics send errors");
-    expect_u32(diagnostics.partial_writes, 1U, "telemetry diagnostics partial writes");
-    expect_u32(diagnostics.bytes_sent, sizeof(TelemetryFrameDTO_t), "telemetry diagnostics bytes sent");
-    expect_u32(diagnostics.netconn_alloc_errors, 0U, "telemetry diagnostics allocation errors");
-    expect_u32(diagnostics.bind_errors, 0U, "telemetry diagnostics bind errors");
-    expect_u32(diagnostics.listen_errors, 0U, "telemetry diagnostics listen errors");
-    expect_u32(diagnostics.accept_errors, 0U, "telemetry diagnostics accept errors");
-    expect_i32(diagnostics.last_error, ERR_BUF, "telemetry diagnostics last error");
     return test_failures == 0U ? 0 : 1;
 }
 
@@ -276,90 +256,68 @@ static int run_null_flag_handle_case(void) {
 
 static int run_allocation_error_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_netconn_new_fail_on_call = 1U;
     run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
 
     expect_u32(test_event_flags_wait_calls, 1U, "allocation error event wait calls");
     expect_u32(test_netconn_new_calls, 1U, "allocation error listener creation calls");
     expect_u32(test_netconn_bind_calls, 0U, "allocation error bind calls");
-    expect_u32(diagnostics.netconn_alloc_errors, 1U, "telemetry allocation error count");
-    expect_i32(diagnostics.last_error, ERR_MEM, "telemetry allocation error last error");
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_bind_error_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_netconn_bind_result = ERR_CONN;
     run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
 
     expect_u32(test_netconn_bind_calls, 1U, "bind error bind calls");
     expect_u32(test_netconn_listen_calls, 0U, "bind error listen calls");
     expect_u32(test_netconn_close_calls, 0U, "bind error close calls");
     expect_u32(test_netconn_delete_calls, 1U, "bind error delete calls");
-    expect_u32(diagnostics.bind_errors, 1U, "telemetry bind error count");
-    expect_i32(diagnostics.last_error, ERR_CONN, "telemetry bind last error");
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_listen_error_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_netconn_listen_result = ERR_TIMEOUT;
     run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
 
     expect_u32(test_netconn_bind_calls, 1U, "listen error bind calls");
     expect_u32(test_netconn_listen_calls, 1U, "listen error listen calls");
     expect_u32(test_netconn_close_calls, 1U, "listen error close calls");
     expect_u32(test_netconn_delete_calls, 1U, "listen error delete calls");
-    expect_u32(diagnostics.listen_errors, 1U, "telemetry listen error count");
-    expect_i32(diagnostics.last_error, ERR_TIMEOUT, "telemetry listen last error");
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_accept_error_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_netconn_accept_fail_on_call = 1U;
     test_netconn_accept_error = ERR_TIMEOUT;
     test_netconn_new_fail_on_call = 2U;
     run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
 
+    expect_u32(test_netconn_new_calls, 2U, "accept error recreates the listener");
     expect_u32(test_netconn_accept_calls, 1U, "accept error accept calls");
     expect_u32(test_netconn_close_calls, 1U, "accept error listener close calls");
     expect_u32(test_netconn_delete_calls, 1U, "accept error listener delete calls");
-    expect_u32(diagnostics.accept_errors, 1U, "telemetry accept error count");
-    expect_u32(diagnostics.netconn_alloc_errors, 1U, "allocation retry after accept error");
-    expect_i32(diagnostics.last_error, ERR_MEM, "last error after allocation retry");
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_short_write_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_write_override = 1U;
     test_write_override_result = ERR_OK;
     test_write_override_bytes = sizeof(TelemetryFrameDTO_t) - 1U;
     test_longjmp_on_accept_call = 2U;
     run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
 
-    expect_u32(diagnostics.send_errors, 1U, "short write error count");
-    expect_u32(diagnostics.partial_writes, 1U, "short write partial count");
-    expect_u32(diagnostics.bytes_sent, sizeof(TelemetryFrameDTO_t) - 1U, "short write bytes sent");
-    expect_i32(diagnostics.last_error, ERR_BUF, "short successful write last error");
-    expect_u32(diagnostics.active_connection, 0U, "short write clears active connection");
-    expect_u32(diagnostics.connections_closed, 1U, "short write closed connection count");
+    expect_u32(test_netconn_write_calls, 1U, "short write is not retried on the same client");
+    expect_u32(test_netconn_accept_calls, 2U, "short write waits for a new client");
     expect_u32(test_netconn_close_calls, 1U, "short write client close");
     expect_u32(test_netconn_delete_calls, 1U, "short write client delete");
     return test_failures == 0U ? 0 : 1;
@@ -367,66 +325,17 @@ static int run_short_write_case(void) {
 
 static int run_full_write_error_case(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
 
     test_write_override = 1U;
     test_write_override_result = ERR_CONN;
     test_write_override_bytes = sizeof(TelemetryFrameDTO_t);
     test_longjmp_on_accept_call = 2U;
     run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
 
-    expect_u32(diagnostics.send_errors, 1U, "full write transport error count");
-    expect_u32(diagnostics.partial_writes, 0U, "full byte count is not a partial write");
-    expect_u32(diagnostics.bytes_sent, sizeof(TelemetryFrameDTO_t), "full write bytes sent before error");
-    expect_i32(diagnostics.last_error, ERR_CONN, "full write transport last error");
-    expect_u32(diagnostics.active_connection, 0U, "full write error clears active connection");
-    expect_u32(diagnostics.connections_closed, 1U, "full write error closed connection count");
+    expect_u32(test_netconn_write_calls, 1U, "write error is not retried on the same client");
+    expect_u32(test_netconn_accept_calls, 2U, "write error waits for a new client");
     expect_u32(test_netconn_close_calls, 1U, "full write error client close");
     expect_u32(test_netconn_delete_calls, 1U, "full write error client delete");
-    return test_failures == 0U ? 0 : 1;
-}
-
-static int run_counter_saturation_case(void) {
-    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
-
-    telemetry_task_test_seed_counters(UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX - 10U);
-    test_write_override = 1U;
-    test_write_override_result = ERR_OK;
-    test_write_override_bytes = sizeof(TelemetryFrameDTO_t);
-    run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
-
-    expect_u32(diagnostics.connections_accepted, UINT32_MAX, "accepted connection counter saturation");
-    expect_u32(diagnostics.send_attempts, UINT32_MAX, "send attempt counter saturation");
-    expect_u32(diagnostics.send_successes, UINT32_MAX, "send success counter saturation");
-    expect_u32(diagnostics.bytes_sent, UINT32_MAX, "bytes sent counter saturation");
-    return test_failures == 0U ? 0 : 1;
-}
-
-static int run_oversized_write_count_case(void) {
-    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    TelemetryTaskDiagnostics diagnostics = {0};
-
-    test_write_override = 1U;
-    test_write_override_result = ERR_OK;
-    /* Inject an impossible LwIP byte count to exercise the defensive size_t overflow guard. */
-#if SIZE_MAX > UINT32_MAX
-    test_write_override_bytes = (size_t)UINT32_MAX + 1U;
-#else
-    test_write_override_bytes = SIZE_MAX;
-#endif
-    test_longjmp_on_accept_call = 2U;
-    run_until_delay(&context);
-    telemetry_task_get_diagnostics(&diagnostics);
-
-    expect_u32(diagnostics.bytes_sent, UINT32_MAX, "oversized write count saturates bytes counter");
-    expect_u32(diagnostics.send_errors, 1U, "oversized write count send error");
-    expect_u32(diagnostics.partial_writes, 1U, "oversized write count is not a full frame");
-    expect_i32(diagnostics.last_error, ERR_BUF, "oversized successful write last error");
-    expect_u32(diagnostics.active_connection, 0U, "oversized write count clears active connection");
-    expect_u32(diagnostics.connections_closed, 1U, "oversized write count closed connection");
     return test_failures == 0U ? 0 : 1;
 }
 
@@ -465,12 +374,6 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "full_write_error") == 0) {
         return run_full_write_error_case();
-    }
-    if (strcmp(argv[1], "counter_saturation") == 0) {
-        return run_counter_saturation_case();
-    }
-    if (strcmp(argv[1], "oversized_write_count") == 0) {
-        return run_oversized_write_count_case();
     }
 
     (void)fprintf(stderr, "Unknown test case: %s\n", argv[1]);

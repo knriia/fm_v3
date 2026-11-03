@@ -61,8 +61,6 @@ extern "C" {
 typedef struct {
     ETH_HandleTypeDef *heth;
     uint32_t address;
-    uint32_t phy_id1;
-    uint32_t phy_id2;
 } DP83848_HandleTypeDef;
 
 typedef struct {
@@ -75,7 +73,6 @@ typedef struct {
 HAL_StatusTypeDef DP83848_Init(DP83848_HandleTypeDef *phy, ETH_HandleTypeDef *heth);
 HAL_StatusTypeDef DP83848_GetLinkState(const DP83848_HandleTypeDef *phy, DP83848_LinkStateTypeDef *state);
 HAL_StatusTypeDef DP83848_ReadInterruptStatus(const DP83848_HandleTypeDef *phy, uint32_t *status);
-HAL_StatusTypeDef DP83848_GetIdentity(const DP83848_HandleTypeDef *phy, uint32_t *id1, uint32_t *id2);
 
 #ifdef __cplusplus
 }

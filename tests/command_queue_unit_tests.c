@@ -145,10 +145,7 @@ static void test_command_queue_initialization_and_arguments(void) {
     expect_u32(test_reset_calls, 0U, "uninitialized queue has nothing to discard");
     command_queue_get_diagnostics(NULL);
     command_queue_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.initialized, 0U, "diagnostics report queue is not initialized");
-    expect_u32(diagnostics.capacity, COMMAND_QUEUE_CAPACITY, "diagnostics report configured capacity");
     expect_u32(diagnostics.queued, 0U, "uninitialized queue reports no queued commands");
-    expect_u32(diagnostics.available, 0U, "uninitialized queue reports no available slots");
     expect_u32(diagnostics.enqueue_errors, 2U, "pre-initialization and null sends are counted as errors");
 
     test_create_fails = 1U;
@@ -159,9 +156,7 @@ static void test_command_queue_initialization_and_arguments(void) {
     expect_u32(test_queue.message_size, sizeof(CommandDTO_t), "queue stores complete command DTOs");
     expect_u32(test_attributes_were_null, 1U, "queue uses CMSIS default allocation attributes");
     command_queue_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.initialized, 1U, "diagnostics report initialized queue");
     expect_u32(diagnostics.queued, 0U, "new queue has no queued commands");
-    expect_u32(diagnostics.available, COMMAND_QUEUE_CAPACITY, "new queue has all slots available");
     expect_u32(command_queue_init(), (uint32_t)osErrorResource, "queue cannot be initialized twice");
 }
 
@@ -211,9 +206,7 @@ static void test_command_queue_fifo_full_and_copy_semantics(void) {
 
     CommandQueueDiagnostics_t diagnostics = {0};
     command_queue_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.capacity, COMMAND_QUEUE_CAPACITY, "diagnostics report queue capacity");
     expect_u32(diagnostics.queued, COMMAND_QUEUE_CAPACITY, "diagnostics report current queue occupancy");
-    expect_u32(diagnostics.available, 0U, "full queue reports no free slots");
     expect_u32(diagnostics.max_queued, COMMAND_QUEUE_CAPACITY, "diagnostics record maximum occupancy");
     expect_u32(diagnostics.enqueued_total, COMMAND_QUEUE_CAPACITY, "diagnostics count accepted commands");
     expect_u32(diagnostics.full_rejections, 1U, "diagnostics count full queue rejections");
@@ -240,7 +233,6 @@ static void test_command_queue_fifo_full_and_copy_semantics(void) {
 
     command_queue_get_diagnostics(&diagnostics);
     expect_u32(diagnostics.queued, 0U, "diagnostics report drained queue");
-    expect_u32(diagnostics.available, COMMAND_QUEUE_CAPACITY, "drained queue reports all slots available");
     expect_u32(diagnostics.max_queued, COMMAND_QUEUE_CAPACITY, "maximum occupancy survives queue draining");
 
     input = make_command(200U);

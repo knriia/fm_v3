@@ -167,22 +167,11 @@ void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics)
     return;
   }
 
-  diagnostics->rx_interrupts = ethernet_rx_diagnostics.rx_interrupts;
-  diagnostics->rx_packets = ethernet_rx_diagnostics.rx_packets;
-  diagnostics->rx_segments = ethernet_rx_diagnostics.rx_segments;
-  diagnostics->rx_bytes = ethernet_rx_diagnostics.rx_bytes;
-  diagnostics->rx_pool_exhausted = RxAllocStatus == RX_ALLOC_ERROR;
   diagnostics->rx_pool_exhaustions = ethernet_rx_diagnostics.rx_pool_exhaustions;
   diagnostics->hal_read_data_errors = ethernet_rx_diagnostics.hal_read_data_errors;
   diagnostics->dma_receive_buffer_unavailable = ethernet_rx_diagnostics.dma_receive_buffer_unavailable;
   diagnostics->dropped_packets = ethernet_rx_diagnostics.dropped_packets;
-  diagnostics->rx_pool_base_address = (uint32_t)(uintptr_t)memp_RX_POOL.base;
-  diagnostics->rx_pool_element_size = memp_RX_POOL.size;
-  diagnostics->rx_pool_capacity = memp_RX_POOL.num;
-  diagnostics->rx_pool_used = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->used : 0U;
   diagnostics->rx_pool_max_used = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->max : 0U;
-  diagnostics->rx_pool_errors = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->err : 0U;
-  diagnostics->rx_pool_illegal = memp_RX_POOL.stats != NULL ? memp_RX_POOL.stats->illegal : 0U;
 }
 
 /**
@@ -192,7 +181,6 @@ void ethernetif_get_rx_diagnostics(EthernetRxDiagnostics *diagnostics)
   */
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *handlerEth)
 {
-  ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_interrupts);
   osSemaphoreRelease(RxPktSemaphore);
 }
 /**
@@ -421,7 +409,6 @@ void ethernetif_input(void* argument)
         p = low_level_input( netif );
         if (p != NULL)
         {
-          ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_packets);
           if (netif->input( p, netif) != ERR_OK )
           {
             ethernet_rx_counter_increment(&ethernet_rx_diagnostics.dropped_packets);
@@ -661,8 +648,6 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
 
   /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale. */
   SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
-  ethernet_rx_counter_increment(&ethernet_rx_diagnostics.rx_segments);
-  ethernet_rx_diagnostics.rx_bytes += Length;
 
 /* USER CODE END HAL ETH RxLinkCallback */
 }

@@ -71,21 +71,9 @@ command_task_send_response(CommandTaskAssemblerContext_t *assembler_context, con
 static CommandTaskAssemblyEvent_t
 command_task_assemble_pbuf(struct pbuf *buffer, CommandTaskAssemblerContext_t *assembler_context);
 
-static struct netconn *command_task_get_client(const CommandTaskAssemblerContext_t *assembler_context) {
-    return assembler_context == NULL ? NULL : assembler_context->client;
-}
-
 static void command_counter_increment(volatile uint32_t *counter) {
     if (*counter != UINT32_MAX) {
         ++(*counter);
-    }
-}
-
-static void command_counter_add(volatile uint32_t *counter, size_t value) {
-    if (value > UINT32_MAX || UINT32_MAX - *counter < (uint32_t)value) {
-        *counter = UINT32_MAX;
-    } else {
-        *counter += (uint32_t)value;
     }
 }
 
@@ -163,7 +151,7 @@ command_task_finalize_incomplete_frame(CommandTaskAssemblerContext_t *assembler_
         sequence_available = 1U;
     }
 
-    command_counter_increment(&command_task_diagnostics.invalid_frame_length);
+    command_counter_increment(&command_task_diagnostics.invalid_frames);
     command_task_diagnostics.last_error = (int32_t)COMMAND_ERROR_TRUNCATED_FRAME;
     uint8_t response_sent = 1U;
     if (send_rejection != 0U && sequence_available != 0U) {
@@ -176,7 +164,6 @@ command_task_finalize_incomplete_frame(CommandTaskAssemblerContext_t *assembler_
     }
     assembler_context->partial_frame_active = 0U;
     command_frame_assembler_init(assembler_context->assembler);
-    command_task_diagnostics.buffer_current_bytes = 0U;
     if (response_sent == 0U) {
         assembler_context->disconnect_requested = 1U;
         return 0U;
@@ -214,13 +201,9 @@ static uint16_t command_task_record_frame_error(
     command_task_diagnostics.last_error = (int32_t)result;
     switch (result) {
     case COMMAND_FRAME_INVALID_MAGIC:
-        command_counter_increment(&command_task_diagnostics.invalid_magic);
-        break;
     case COMMAND_FRAME_INVALID_LENGTH:
-        command_counter_increment(&command_task_diagnostics.invalid_frame_length);
-        break;
     case COMMAND_FRAME_INVALID_CRC:
-        command_counter_increment(&command_task_diagnostics.invalid_crc);
+        command_counter_increment(&command_task_diagnostics.invalid_frames);
         break;
     default:
         break;
@@ -247,28 +230,16 @@ void command_task_get_diagnostics(CommandTaskDiagnostics *diagnostics) {
         return;
     }
 
-    diagnostics->port = COMMAND_NETWORK_TASK_PORT;
     diagnostics->connections_accepted = command_task_diagnostics.connections_accepted;
     diagnostics->connections_closed = command_task_diagnostics.connections_closed;
     diagnostics->active_connection = command_task_diagnostics.active_connection;
-    diagnostics->bytes_received = command_task_diagnostics.bytes_received;
     diagnostics->complete_frames_received = command_task_diagnostics.complete_frames_received;
-    diagnostics->invalid_magic = command_task_diagnostics.invalid_magic;
-    diagnostics->invalid_frame_length = command_task_diagnostics.invalid_frame_length;
-    diagnostics->invalid_crc = command_task_diagnostics.invalid_crc;
-    diagnostics->buffer_current_bytes = command_task_diagnostics.buffer_current_bytes;
+    diagnostics->invalid_frames = command_task_diagnostics.invalid_frames;
     diagnostics->buffer_max_bytes = command_task_diagnostics.buffer_max_bytes;
-    diagnostics->bytes_sent = command_task_diagnostics.bytes_sent;
-    diagnostics->response_attempts = command_task_diagnostics.response_attempts;
-    diagnostics->response_successes = command_task_diagnostics.response_successes;
     diagnostics->response_send_errors = command_task_diagnostics.response_send_errors;
-    diagnostics->partial_writes = command_task_diagnostics.partial_writes;
-    diagnostics->netconn_alloc_errors = command_task_diagnostics.netconn_alloc_errors;
-    diagnostics->bind_errors = command_task_diagnostics.bind_errors;
-    diagnostics->listen_errors = command_task_diagnostics.listen_errors;
-    diagnostics->accept_errors = command_task_diagnostics.accept_errors;
     diagnostics->recv_errors = command_task_diagnostics.recv_errors;
     diagnostics->decoder_errors = command_task_diagnostics.decoder_errors;
+    diagnostics->acks_deferred = command_task_diagnostics.acks_deferred;
     diagnostics->last_error = command_task_diagnostics.last_error;
 }
 
@@ -298,7 +269,6 @@ static uint8_t command_task_flush_responses(CommandTaskAssemblerContext_t *assem
             command_record_error(ERR_ARG);
             return 0U;
         }
-        command_counter_add(&command_task_diagnostics.bytes_sent, bytes_written);
         if (write_error != ERR_OK || bytes_written == 0U) {
             command_counter_increment(&command_task_diagnostics.response_send_errors);
             command_record_error(write_error == ERR_OK ? ERR_BUF : write_error);
@@ -307,7 +277,6 @@ static uint8_t command_task_flush_responses(CommandTaskAssemblerContext_t *assem
 
         assembler_context->tx_sent += bytes_written;
         if (bytes_written < remaining) {
-            command_counter_increment(&command_task_diagnostics.partial_writes);
             return 1U;
         }
     }
@@ -330,7 +299,6 @@ static uint8_t command_task_send_response(
         return 0U;
     }
 
-    command_counter_increment(&command_task_diagnostics.response_attempts);
     if (command_task_tx_free_space(assembler_context) < frame_length) {
         command_counter_increment(&command_task_diagnostics.response_send_errors);
         command_record_error(ERR_MEM);
@@ -344,7 +312,6 @@ static uint8_t command_task_send_response(
     }
     (void)memcpy(&assembler_context->tx_buffer[assembler_context->tx_length], frame, frame_length);
     assembler_context->tx_length += frame_length;
-    command_counter_increment(&command_task_diagnostics.response_successes);
 
     return command_task_flush_responses(assembler_context);
 }
@@ -376,7 +343,6 @@ command_task_assemble_pbuf(struct pbuf *buffer, CommandTaskAssemblerContext_t *a
             continue;
         }
 
-        command_counter_add(&command_task_diagnostics.bytes_received, data_length);
         size_t data_offset = 0U;
         for (;;) {
             const CommandFrameAssemblerEvent_t assembler_event =
@@ -402,7 +368,6 @@ command_task_assemble_pbuf(struct pbuf *buffer, CommandTaskAssemblerContext_t *a
                 if (assembler_context->assembler->max_length > command_task_diagnostics.buffer_max_bytes) {
                     command_task_diagnostics.buffer_max_bytes = (uint32_t)assembler_context->assembler->max_length;
                 }
-                command_task_diagnostics.buffer_current_bytes = (uint32_t)assembler_context->assembler->length;
                 command_task_update_partial_frame_tracking(assembler_context);
                 continue;
             }
@@ -430,7 +395,6 @@ command_task_assemble_pbuf(struct pbuf *buffer, CommandTaskAssemblerContext_t *a
                 task_event.result = COMMAND_TASK_ASSEMBLY_FRAME_ERROR;
                 command_frame_assembler_init(assembler_context->assembler);
                 assembler_context->partial_frame_active = 0U;
-                command_task_diagnostics.buffer_current_bytes = 0U;
                 return task_event;
             }
 
@@ -439,7 +403,6 @@ command_task_assemble_pbuf(struct pbuf *buffer, CommandTaskAssemblerContext_t *a
                 task_event.result = COMMAND_TASK_ASSEMBLY_ERROR;
                 return task_event;
             }
-            command_task_diagnostics.buffer_current_bytes = (uint32_t)assembler_context->assembler->length;
             command_task_update_partial_frame_tracking(assembler_context);
             if (assembler_context->disconnect_requested != 0U) {
                 task_event.result = COMMAND_TASK_ASSEMBLY_ERROR;
@@ -563,6 +526,7 @@ static uint8_t command_task_handle_assembly_event(
                 return 0U;
             }
             if (command_queue_free_slots() == 0U) {
+                command_counter_increment(&command_task_diagnostics.acks_deferred);
                 assembler_context->ack_pending = 1U;
                 assembler_context->pending_ack_sequence = response_sequence;
                 return 1U;
@@ -708,7 +672,6 @@ void CommandTask(void *argument) {
     for (;;) {
         struct netconn *listener = netconn_new_with_callback(NETCONN_TCP, command_task_netconn_event);
         if (listener == NULL) {
-            command_counter_increment(&command_task_diagnostics.netconn_alloc_errors);
             command_record_error(ERR_MEM);
             osDelay(10U);
             continue;
@@ -716,7 +679,6 @@ void CommandTask(void *argument) {
 
         const err_t bind_error = netconn_bind(listener, IP_ADDR_ANY, COMMAND_NETWORK_TASK_PORT);
         if (bind_error != ERR_OK) {
-            command_counter_increment(&command_task_diagnostics.bind_errors);
             command_record_error(bind_error);
             netconn_delete(listener);
             osDelay(10U);
@@ -725,7 +687,6 @@ void CommandTask(void *argument) {
 
         const err_t listen_error = netconn_listen(listener);
         if (listen_error != ERR_OK) {
-            command_counter_increment(&command_task_diagnostics.listen_errors);
             command_record_error(listen_error);
             netconn_close(listener);
             netconn_delete(listener);
@@ -738,7 +699,6 @@ void CommandTask(void *argument) {
             const err_t accept_error = netconn_accept(listener, &client);
 
             if (accept_error != ERR_OK) {
-                command_counter_increment(&command_task_diagnostics.accept_errors);
                 command_record_error(accept_error);
                 if (accept_error == ERR_ABRT) {
                     osDelay(10U);
@@ -747,7 +707,6 @@ void CommandTask(void *argument) {
                 break;
             }
             osThreadFlagsClear(COMMAND_TASK_FLAGS_ALL);
-            command_task_diagnostics.buffer_current_bytes = 0U;
             command_counter_increment(&command_task_diagnostics.connections_accepted);
             command_task_diagnostics.active_connection = 1U;
 
@@ -755,7 +714,6 @@ void CommandTask(void *argument) {
 
             netconn_close(client);
             netconn_delete(client);
-            command_task_diagnostics.buffer_current_bytes = 0U;
             command_task_diagnostics.active_connection = 0U;
             command_counter_increment(&command_task_diagnostics.connections_closed);
         }

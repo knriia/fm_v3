@@ -58,22 +58,8 @@ static void expect_u32(uint32_t actual, uint32_t expected, const char *message) 
     }
 }
 
-static void expect_diagnostics(
-    const StartupTaskDiagnostics *diagnostics,
-    uint32_t init_completed,
-    uint32_t flag_attempts,
-    uint32_t flag_errors
-) {
-    expect_u32(diagnostics->lwip_init_completed, init_completed, "lwip_init_completed");
-    expect_u32(diagnostics->lwip_ready_flag_set_attempts, flag_attempts, "lwip_ready_flag_set_attempts");
-    expect_u32(diagnostics->lwip_ready_flag_set_errors, flag_errors, "lwip_ready_flag_set_errors");
-}
-
 static int run_success_case(void) {
-    StartupTaskDiagnostics diagnostics = {0};
     osEventFlagsId_t lwip_flags = (osEventFlagsId_t)(uintptr_t)1U;
-
-    startup_task_get_diagnostics(NULL);
 
     test_jump_active = 1U;
     if (setjmp(test_jump_buffer) == 0) {
@@ -81,17 +67,14 @@ static int run_success_case(void) {
     }
     test_jump_active = 0U;
 
-    startup_task_get_diagnostics(&diagnostics);
     expect_u32(test_lwip_init_calls, 1U, "MX_LWIP_Init calls");
     expect_u32(test_event_flags_set_calls, 1U, "osEventFlagsSet calls");
     expect_u32(test_gpio_toggle_calls, 1U, "LED toggle calls");
     expect_u32(test_error_handler_calls, 0U, "Error_Handler calls");
-    expect_diagnostics(&diagnostics, 1U, 1U, 0U);
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_event_error_case(void) {
-    StartupTaskDiagnostics diagnostics = {0};
     osEventFlagsId_t lwip_flags = (osEventFlagsId_t)(uintptr_t)1U;
 
     test_event_flags_result = osFlagsErrorParameter;
@@ -101,17 +84,14 @@ static int run_event_error_case(void) {
     }
     test_jump_active = 0U;
 
-    startup_task_get_diagnostics(&diagnostics);
     expect_u32(test_lwip_init_calls, 1U, "MX_LWIP_Init calls");
     expect_u32(test_event_flags_set_calls, 1U, "osEventFlagsSet calls");
     expect_u32(test_gpio_toggle_calls, 0U, "LED toggle calls");
     expect_u32(test_error_handler_calls, 1U, "Error_Handler calls");
-    expect_diagnostics(&diagnostics, 1U, 1U, 1U);
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_null_context_case(void) {
-    StartupTaskDiagnostics diagnostics = {0};
 
     test_jump_active = 1U;
     if (setjmp(test_jump_buffer) == 0) {
@@ -119,17 +99,14 @@ static int run_null_context_case(void) {
     }
     test_jump_active = 0U;
 
-    startup_task_get_diagnostics(&diagnostics);
     expect_u32(test_lwip_init_calls, 1U, "MX_LWIP_Init calls");
     expect_u32(test_event_flags_set_calls, 0U, "osEventFlagsSet calls");
     expect_u32(test_gpio_toggle_calls, 0U, "LED toggle calls");
     expect_u32(test_error_handler_calls, 1U, "Error_Handler calls");
-    expect_diagnostics(&diagnostics, 1U, 0U, 0U);
     return test_failures == 0U ? 0 : 1;
 }
 
 static int run_null_flag_handle_case(void) {
-    StartupTaskDiagnostics diagnostics = {0};
     osEventFlagsId_t lwip_flags = NULL;
 
     test_jump_active = 1U;
@@ -138,12 +115,10 @@ static int run_null_flag_handle_case(void) {
     }
     test_jump_active = 0U;
 
-    startup_task_get_diagnostics(&diagnostics);
     expect_u32(test_lwip_init_calls, 1U, "MX_LWIP_Init calls");
     expect_u32(test_event_flags_set_calls, 0U, "osEventFlagsSet calls");
     expect_u32(test_gpio_toggle_calls, 0U, "LED toggle calls");
     expect_u32(test_error_handler_calls, 1U, "Error_Handler calls");
-    expect_diagnostics(&diagnostics, 1U, 0U, 0U);
     return test_failures == 0U ? 0 : 1;
 }
 

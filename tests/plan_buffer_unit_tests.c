@@ -144,8 +144,8 @@ static void test_mutex_guards_every_operation(void) {
     test_mutex_new_fails = 1U;
     expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_NO_MEMORY, "missing mutex fails initialization");
     PlanBufferDiagnostics_t diagnostics = {0};
+    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "buffer stays uninitialized without a mutex");
     (void)plan_buffer_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.initialized, 0U, "buffer stays uninitialized without a mutex");
     expect_u32(test_mutex_acquire_calls, 0U, "uninitialized buffer does not lock");
 
     test_mutex_new_fails = 0U;
@@ -191,16 +191,11 @@ static void test_initialization_and_preinit_results(void) {
     expect_u32(plan_buffer_try_pop(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null pop before init is rejected");
     plan_buffer_get_diagnostics(NULL);
     expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "preinit diagnostics are available");
-    expect_u32(diagnostics.initialized, 0U, "diagnostics report uninitialized buffer");
-    expect_u32(diagnostics.capacity, PLAN_BUFFER_CAPACITY, "diagnostics report fixed capacity");
     expect_u32(diagnostics.queued, 0U, "uninitialized buffer reports no queued blocks");
-    expect_u32(diagnostics.available, 0U, "uninitialized buffer reports no available slots");
 
     expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_OK, "buffer initializes");
     expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_ALREADY_INITIALIZED, "buffer cannot be initialized twice");
     expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "initialized diagnostics are available");
-    expect_u32(diagnostics.initialized, 1U, "diagnostics report initialized buffer");
-    expect_u32(diagnostics.available, PLAN_BUFFER_CAPACITY, "initialized buffer reports all slots available");
     expect_u32(diagnostics.queued, 0U, "new buffer starts empty");
 }
 
@@ -231,7 +226,6 @@ static void test_fifo_full_wraparound_and_copy(void) {
     PlanBufferDiagnostics_t diagnostics = {0};
     expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "full-buffer diagnostics are available");
     expect_u32(diagnostics.queued, PLAN_BUFFER_CAPACITY, "buffer reports full occupancy after wraparound");
-    expect_u32(diagnostics.available, 0U, "full buffer reports no available slots");
     expect_u32(diagnostics.max_queued, PLAN_BUFFER_CAPACITY, "buffer records maximum occupancy");
     expect_u32(diagnostics.enqueued_total, PLAN_BUFFER_CAPACITY + PLAN_BUFFER_CAPACITY / 2U, "buffer counts successful pushes");
     expect_u32(diagnostics.dequeued_total, PLAN_BUFFER_CAPACITY / 2U, "buffer counts successful pops");
@@ -246,8 +240,6 @@ static void test_fifo_full_wraparound_and_copy(void) {
     expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_EMPTY, "empty buffer reports empty result");
     expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "drained diagnostics are available");
     expect_u32(diagnostics.queued, 0U, "drained buffer reports zero occupancy");
-    expect_u32(diagnostics.available, PLAN_BUFFER_CAPACITY, "drained buffer reports full availability");
-    expect_u32(diagnostics.empty_reads, 1U, "buffer counts empty reads");
 }
 
 static void test_clear_cancels_only_pending_blocks(void) {
@@ -262,7 +254,6 @@ static void test_clear_cancels_only_pending_blocks(void) {
     PlanBufferDiagnostics_t diagnostics = {0};
     (void)plan_buffer_get_diagnostics(&diagnostics);
     expect_u32(diagnostics.queued, 0U, "clear empties the buffer");
-    expect_u32(diagnostics.clear_calls, 1U, "clear request is counted");
     expect_u32(diagnostics.cancelled_blocks, 2U, "clear counts cancelled blocks");
 
     const MotionPlanBlock_t after_clear = make_block(12U);
@@ -272,7 +263,6 @@ static void test_clear_cancels_only_pending_blocks(void) {
     expect_block_equal(&output, 12U);
     expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_OK, "clearing an empty buffer succeeds");
     (void)plan_buffer_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.clear_calls, 2U, "empty clear is counted");
     expect_u32(diagnostics.cancelled_blocks, 2U, "empty clear cancels no additional blocks");
 }
 
@@ -304,9 +294,7 @@ static void test_diagnostic_counters_saturate(void) {
         .enqueued_total = UINT32_MAX - 1U,
         .dequeued_total = UINT32_MAX - 1U,
         .full_rejections = UINT32_MAX,
-        .empty_reads = UINT32_MAX,
         .rejected_operations = UINT32_MAX,
-        .clear_calls = UINT32_MAX,
         .cancelled_blocks = UINT32_MAX - 1U,
     };
     plan_buffer_test_seed_counters(&saturated);
@@ -330,9 +318,7 @@ static void test_diagnostic_counters_saturate(void) {
     expect_u32(diagnostics.enqueued_total, UINT32_MAX, "enqueued counter saturates");
     expect_u32(diagnostics.dequeued_total, UINT32_MAX, "dequeued counter saturates");
     expect_u32(diagnostics.full_rejections, UINT32_MAX, "full counter saturates");
-    expect_u32(diagnostics.empty_reads, UINT32_MAX, "empty counter saturates");
     expect_u32(diagnostics.rejected_operations, UINT32_MAX, "rejected operation counter saturates");
-    expect_u32(diagnostics.clear_calls, UINT32_MAX, "clear counter saturates");
     expect_u32(diagnostics.cancelled_blocks, UINT32_MAX, "cancelled block counter saturates");
 }
 

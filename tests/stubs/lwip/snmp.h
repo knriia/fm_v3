@@ -1,4 +1,0 @@
-#ifndef FM_V3_TEST_LWIP_SNMP_H
-#define FM_V3_TEST_LWIP_SNMP_H
-
-#endif /* FM_V3_TEST_LWIP_SNMP_H */

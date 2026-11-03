@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 
-#define configTOTAL_HEAP_SIZE 65536U
 #define pdFALSE 0
 #define pdTRUE 1
 #define pdPASS pdTRUE
@@ -43,7 +42,6 @@ uint32_t xPortGetFreeHeapSize(void);
 uint32_t xPortGetMinimumEverFreeHeapSize(void);
 UBaseType_t uxTaskGetNumberOfTasks(void);
 UBaseType_t uxTaskGetSystemState(TaskStatus_t *task_statuses, UBaseType_t array_size, uint32_t *total_runtime_ticks);
-uint32_t xTaskGetSchedulerState(void);
 TickType_t xTaskGetTickCount(void);
 TaskHandle_t xTaskGetIdleTaskHandle(void);
 TaskHandle_t xTaskGetCurrentTaskHandle(void);

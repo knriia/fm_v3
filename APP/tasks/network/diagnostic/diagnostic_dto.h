@@ -2,108 +2,101 @@
 #define FM_V3_DIAGNOSTIC_DTO_H
 
 #include "command/command_queue.h"
-#include "command_decoder.h"
-#include "command_task.h"
 #include "dto.h"
-#include "ethernet_port.h"
-#include "ethernetif.h"
 #include "lwip_diagnostics.h"
 #include "motion/plan_buffer.h"
 #include "motion_task.h"
-#include "startup_task.h"
+#include "step_generator_task.h"
 #include "system_diagnostics.h"
-#include "telemetry_task.h"
 
 #include <stdint.h>
 
+/* Wire format of the diagnostic snapshot. Only values that change at run time and help to find a problem are sent;
+ * constants and configuration stay out. Every field is a little-endian 32-bit value. */
+
+/* FreeRTOS state of one task; a task that does not exist reports priority and state -1. stack_min_free_bytes is the
+ * lowest free stack since start (high-water mark). */
 typedef struct {
-    uint32_t stack_size_bytes;
-    uint32_t stack_free_bytes;
     uint32_t stack_min_free_bytes;
-    uint32_t stack_base_address;
     int32_t priority;
+    /* Differs from priority while the task holds a mutex and has inherited a higher priority. */
     int32_t base_priority;
     uint32_t state;
-    uint32_t runtime_ticks;
     uint32_t runtime_percent;
 } TaskDiagnosticsDTO_t;
 
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    EthernetRxDiagnostics ethernet_rx;
-} EthIfTaskDiagnosticsDTO_t;
+/* Position of each task in DiagnosticPayloadDTO_t.tasks. */
+typedef enum {
+    DIAGNOSTIC_TASK_SLOT_STARTUP = 0,
+    DIAGNOSTIC_TASK_SLOT_COMMAND,
+    DIAGNOSTIC_TASK_SLOT_MOTION,
+    DIAGNOSTIC_TASK_SLOT_STEP_GENERATOR,
+    DIAGNOSTIC_TASK_SLOT_TELEMETRY,
+    DIAGNOSTIC_TASK_SLOT_DIAGNOSTIC,
+    DIAGNOSTIC_TASK_SLOT_ETH_IF,
+    DIAGNOSTIC_TASK_SLOT_ETH_LINK,
+    DIAGNOSTIC_TASK_SLOT_TCPIP,
+    DIAGNOSTIC_TASK_SLOT_COUNT
+} DiagnosticTaskSlot_t;
 
+/* Command connection and decoder. */
 typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    EthernetPortDiagnostics ethernet_port;
-} EthLinkTaskDiagnosticsDTO_t;
-
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    LwipDiagnostics lwip;
-} TcpipTaskDiagnosticsDTO_t;
-
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    StartupTaskDiagnostics startup;
-} StartupTaskDiagnosticsDTO_t;
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    CommandTaskDiagnostics command;
-} CommandTaskDiagnosticsDTO_t;
-
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    CommandDecoderDiagnostics decoder;
-} CommandDecoderDiagnosticsDTO_t;
-
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    TelemetryTaskDiagnostics telemetry;
-} TelemetryTaskDiagnosticsDTO_t;
-
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    MotionTaskDiagnostics motion;
-} MotionTaskDiagnosticsDTO_t;
-
-typedef struct {
-    TaskDiagnosticsDTO_t runtime;
-    uint32_t port;
-    uint32_t interval_ms;
-    uint32_t send_timeout_ms;
     uint32_t connections_accepted;
     uint32_t connections_closed;
     uint32_t active_connection;
-    uint32_t send_attempts;
-    uint32_t send_successes;
+    uint32_t frames_received;
+    /* Bad magic, bad length, bad CRC, or a frame cut off by the assembly timeout or a disconnect. */
+    uint32_t invalid_frames;
+    uint32_t rx_buffer_max_bytes;
+    uint32_t recv_errors;
     uint32_t send_errors;
-    uint32_t partial_writes;
-    uint32_t bytes_sent;
-    uint32_t netconn_alloc_errors;
-    uint32_t bind_errors;
-    uint32_t listen_errors;
-    uint32_t accept_errors;
-    uint32_t snapshot_errors;
+    uint32_t decoder_errors;
+    /* ACKs held back because the command took the last free slot of the command queue. */
+    uint32_t acks_deferred;
     int32_t last_error;
-} DiagnosticTaskDiagnosticsDTO_t;
+    uint32_t commands_received;
+    uint32_t commands_rejected;
+    int32_t decoder_last_error;
+} CommandChannelDiagnosticsDTO_t;
 
+typedef struct {
+    uint32_t level;
+    /* The step timer found no event while the axis was moving; each one stops the axis with a fault. */
+    uint32_t underruns;
+} ExecutionBufferDiagnosticsDTO_t;
+
+typedef struct {
+    uint32_t link_up;
+    uint32_t speed;
+    uint32_t duplex;
+    uint32_t link_up_events;
+    uint32_t link_down_events;
+    uint32_t link_state_read_errors;
+    uint32_t dma_error;
+    uint32_t tx_errors;
+    uint32_t tx_descriptor_overflows;
+    uint32_t mutex_timeouts;
+    uint32_t rx_pool_max_used;
+    uint32_t rx_pool_exhaustions;
+    uint32_t rx_dma_buffer_unavailable;
+    uint32_t rx_dropped_packets;
+    uint32_t rx_read_errors;
+} EthernetDiagnosticsDTO_t;
+
+/* Ordered along the path of a command: connection, queue, MotionTask, plan buffer, generator, step timer. */
 typedef struct {
     uint32_t sequence;
     SystemDiagnostics system;
-    StartupTaskDiagnosticsDTO_t startup_task;
-    CommandTaskDiagnosticsDTO_t command_task;
-    CommandDecoderDiagnosticsDTO_t command_decoder;
-    TelemetryTaskDiagnosticsDTO_t telemetry_task;
-    DiagnosticTaskDiagnosticsDTO_t diagnostic_task;
-    EthIfTaskDiagnosticsDTO_t eth_if;
-    EthLinkTaskDiagnosticsDTO_t eth_link;
-    TcpipTaskDiagnosticsDTO_t tcpip_thread;
+    TaskDiagnosticsDTO_t tasks[DIAGNOSTIC_TASK_SLOT_COUNT];
+    CommandChannelDiagnosticsDTO_t command_channel;
     CommandQueueDiagnostics_t command_queue;
-    MotionTaskDiagnosticsDTO_t motion_task;
+    MotionTaskDiagnostics motion;
     PlanBufferDiagnostics_t plan_buffer;
-    /* Appended last so the offsets of all earlier fields stay the same for existing clients. */
+    StepGeneratorTaskDiagnostics step_generator;
+    ExecutionBufferDiagnosticsDTO_t execution_buffer;
     MotionAxisDiagnostics x_axis;
+    EthernetDiagnosticsDTO_t ethernet;
+    LwipDiagnostics lwip;
 } DiagnosticPayloadDTO_t;
 
 typedef struct {
@@ -111,30 +104,18 @@ typedef struct {
     DiagnosticPayloadDTO_t payload;
 } DiagnosticFrameDTO_t;
 
-typedef DiagnosticPayloadDTO_t DiagnosticDTO_t;
-
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) <= UINT16_MAX, "Diagnostic payload exceeds protocol limit");
-_Static_assert(sizeof(TaskDiagnosticsDTO_t) == 36U, "Invalid common task diagnostics size");
-_Static_assert(sizeof(EthIfTaskDiagnosticsDTO_t) == 100U, "Invalid EthIf diagnostics size");
-_Static_assert(sizeof(EthLinkTaskDiagnosticsDTO_t) == 216U, "Invalid EthLink diagnostics size");
-_Static_assert(sizeof(MemoryRegionDiagnostics) == 20U, "Invalid memory region diagnostics size");
-_Static_assert(sizeof(MemoryDiagnostics) == 100U, "Invalid memory diagnostics size");
-_Static_assert(sizeof(FreeRtosDiagnostics) == 64U, "Invalid FreeRTOS diagnostics size");
-_Static_assert(sizeof(SystemDiagnostics) == 320U, "Invalid system diagnostics size");
-_Static_assert(sizeof(LwipMemoryPoolDiagnostics) == 24U, "Invalid LwIP memory pool diagnostics size");
-_Static_assert(sizeof(LwipMib2Diagnostics) == 192U, "Invalid LwIP MIB2 diagnostics size");
-_Static_assert(sizeof(LwipDiagnostics) == 916U, "Invalid LwIP diagnostics size");
-_Static_assert(sizeof(TcpipTaskDiagnosticsDTO_t) == 952U, "Invalid tcpip diagnostics size");
-_Static_assert(sizeof(StartupTaskDiagnosticsDTO_t) == 48U, "Invalid StartupTask diagnostics size");
-_Static_assert(sizeof(CommandTaskDiagnosticsDTO_t) == 128U, "Invalid CommandTask diagnostics size");
-_Static_assert(sizeof(CommandDecoderDiagnosticsDTO_t) == 116U, "Invalid CommandDecoder diagnostics size");
-_Static_assert(sizeof(TelemetryTaskDiagnosticsDTO_t) == 100U, "Invalid TelemetryTask diagnostics size");
-_Static_assert(sizeof(MotionTaskDiagnosticsDTO_t) == 76U, "Invalid MotionTask diagnostics size");
-_Static_assert(sizeof(DiagnosticTaskDiagnosticsDTO_t) == 104U, "Invalid DiagnosticTask diagnostics size");
-_Static_assert(sizeof(CommandQueueDiagnostics_t) == 32U, "Invalid CommandQueue diagnostics size");
-_Static_assert(sizeof(PlanBufferDiagnostics_t) == 48U, "Invalid PlanBuffer diagnostics size");
+_Static_assert(sizeof(SystemDiagnostics) == 32U, "Invalid system diagnostics size");
+_Static_assert(sizeof(TaskDiagnosticsDTO_t) == 20U, "Invalid task diagnostics size");
+_Static_assert(sizeof(CommandChannelDiagnosticsDTO_t) == 56U, "Invalid command channel diagnostics size");
+_Static_assert(sizeof(CommandQueueDiagnostics_t) == 20U, "Invalid command queue diagnostics size");
+_Static_assert(sizeof(MotionTaskDiagnostics) == 40U, "Invalid MotionTask diagnostics size");
+_Static_assert(sizeof(PlanBufferDiagnostics_t) == 28U, "Invalid plan buffer diagnostics size");
+_Static_assert(sizeof(StepGeneratorTaskDiagnostics) == 32U, "Invalid step generator diagnostics size");
+_Static_assert(sizeof(ExecutionBufferDiagnosticsDTO_t) == 8U, "Invalid execution buffer diagnostics size");
 _Static_assert(sizeof(MotionAxisDiagnostics) == 48U, "Invalid axis diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 2292U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 2300U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(EthernetDiagnosticsDTO_t) == 60U, "Invalid Ethernet diagnostics size");
+_Static_assert(sizeof(LwipDiagnostics) == 100U, "Invalid LwIP diagnostics size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 608U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 616U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

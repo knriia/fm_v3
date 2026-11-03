@@ -651,7 +651,7 @@ static void test_context_and_listener_failures(void) {
     test_new_returns_null = 1U;
     test_jump_on_delay = 1U;
     expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "listener allocation retry is interruptible in test");
-    expect_u32(command_task_diagnostics.netconn_alloc_errors, 1U, "listener allocation failure is counted");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_MEM, "allocation failure is recorded");
     expect_true(test_listener_callback == command_task_netconn_event, "listener is created with the event callback");
     expect_true(command_task_thread_id == TEST_THREAD_ID, "task stores its id for the callback");
     expect_true(test_space_listener == command_task_queue_space_available, "task listens for free queue space");
@@ -663,7 +663,7 @@ static void test_context_and_listener_failures(void) {
     expect_u32(test_netconn_bind_calls, 1U, "listener bind is attempted");
     expect_u32(test_netconn_listen_calls, 0U, "listen is skipped after bind failure");
     expect_u32(test_netconn_delete_calls, 1U, "unbound listener is deleted");
-    expect_u32(command_task_diagnostics.bind_errors, 1U, "bind failure is counted");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_MEM, "bind failure is recorded");
 
     reset_fixture();
     test_listen_result = ERR_MEM;
@@ -671,20 +671,19 @@ static void test_context_and_listener_failures(void) {
     expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "listen retry is interruptible in test");
     expect_u32(test_netconn_close_calls, 1U, "listener is closed after listen failure");
     expect_u32(test_netconn_delete_calls, 1U, "listener is deleted after listen failure");
-    expect_u32(command_task_diagnostics.listen_errors, 1U, "listen failure is counted");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_MEM, "listen failure is recorded");
 
     reset_fixture();
     test_accept_result = ERR_MEM;
     test_jump_after_new_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "accept error exits the current listener");
-    expect_u32(command_task_diagnostics.accept_errors, 1U, "accept error is counted");
+    expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_MEM, "accept error is recorded");
     expect_u32(test_netconn_close_calls, 1U, "listener is closed after accept error");
 
     reset_fixture();
     test_accept_result = ERR_ABRT;
     test_jump_on_delay = 1U;
     expect_u32((uint32_t)run_task_until_jump(&valid_context), 1U, "aborted accept waits before retrying");
-    expect_u32(command_task_diagnostics.accept_errors, 1U, "aborted accept is counted");
     expect_u32((uint32_t)command_task_diagnostics.last_error, (uint32_t)ERR_ABRT, "aborted accept records ERR_ABRT");
     expect_u32(test_netconn_close_calls, 0U, "listener is kept after aborted accept");
     expect_u32(test_netconn_new_calls, 1U, "listener is not recreated after aborted accept");
@@ -804,7 +803,7 @@ static void test_fragmented_receive_and_disconnect_cleanup(void) {
     test_jump_after_accept_calls = 2U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "new connection starts with an empty assembler");
     expect_single_response(COMMAND_MESSAGE_TYPE_PONG, 51U, 0U);
-    expect_u32(command_task_diagnostics.invalid_frame_length, 1U, "partial frame from prior connection is discarded");
+    expect_u32(command_task_diagnostics.invalid_frames, 1U, "partial frame from prior connection is discarded");
 }
 
 static void test_flag_waits_and_receive_errors(void) {
@@ -878,7 +877,7 @@ static void test_flag_waits_and_receive_errors(void) {
     );
     expect_u32(test_thread_flags_wait_timeouts[1], 1U, "wait resumes with the remaining deadline");
     expect_u32(test_netconn_write_calls, 0U, "no response is sent for a truncated request");
-    expect_u32(command_task_diagnostics.invalid_frame_length, 1U, "disconnect records a truncated frame");
+    expect_u32(command_task_diagnostics.invalid_frames, 1U, "disconnect records a truncated frame");
 
     reset_fixture();
     set_buffer(0U, frame, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
@@ -980,6 +979,7 @@ static void test_deferred_ack(void) {
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "command that fills the queue is accepted");
     expect_u32(test_command_queue_put_calls, 1U, "command filling the queue is queued");
+    expect_u32(command_task_diagnostics.acks_deferred, 1U, "held ACK is counted");
     expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 101U, 0U);
     expect_u32(test_thread_flags_wait_calls, 2U, "ACK waits for the queue space flag");
     expect_u32(test_netconn_recv_calls, 3U, "queue space flag alone does not read the socket");
@@ -1285,13 +1285,11 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
     test_write_mode = TEST_WRITE_PARTIAL_THEN_FULL;
     expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "partial write keeps the client");
     expect_u32(test_netconn_write_calls, 1U, "partial write waits for the TX flag");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial write is counted");
     expect_u32((uint32_t)send_context.tx_sent, 3U, "written bytes are tracked");
     expect_u32(command_task_flush_responses(&send_context), 1U, "TX flag finishes the partial response");
     expect_u32(test_netconn_write_calls, 2U, "rest of the response is written");
     expect_u32((uint32_t)send_context.tx_length, 0U, "send buffer is empty after the rest is written");
     expect_u32((uint32_t)test_captured_response_length, (uint32_t)ping_length, "whole response reaches LwIP");
-    expect_u32(command_task_diagnostics.response_successes, 1U, "queued response is counted");
 
     reset_fixture();
     send_context = test_context();
@@ -1314,7 +1312,6 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
     test_write_mode = TEST_WRITE_PARTIAL_THEN_OVERREPORT;
     expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "first partial write is accepted");
     expect_u32(command_task_flush_responses(&send_context), 0U, "overreport after partial progress is rejected");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial write before overreport is counted");
 
     reset_fixture();
     send_context = test_context();
@@ -1326,20 +1323,20 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
     send_context = test_context();
     test_write_result = ERR_BUF;
     expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "transport write error is propagated");
-    expect_u32(command_task_diagnostics.partial_writes, 0U, "failure before progress is not partial");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "failure before progress is counted");
 
     reset_fixture();
     send_context = test_context();
     test_write_mode = TEST_WRITE_FAIL_AFTER_PARTIAL;
     expect_u32(command_task_send_response(&send_context, ping, ping_length), 1U, "partial write before failure keeps the client");
     expect_u32(command_task_flush_responses(&send_context), 0U, "failure after partial progress is rejected");
-    expect_u32(command_task_diagnostics.partial_writes, 1U, "partial write before failure is counted");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "failure after partial progress is counted");
 
     reset_fixture();
     send_context = test_context();
     test_write_mode = TEST_WRITE_ERROR_WITH_PARTIAL_FIRST;
     expect_u32(command_task_send_response(&send_context, ping, ping_length), 0U, "write error with progress is rejected");
-    expect_u32(command_task_diagnostics.bytes_sent, 3U, "bytes written before the error are counted");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "write error with progress is counted");
 
     reset_fixture();
     send_context = test_context();
@@ -1495,69 +1492,31 @@ static void test_diagnostics_and_internal_edges(void) {
         .connections_accepted = 1U,
         .connections_closed = 2U,
         .active_connection = 3U,
-        .bytes_received = 4U,
         .complete_frames_received = 5U,
-        .invalid_magic = 6U,
-        .invalid_frame_length = 7U,
-        .invalid_crc = 8U,
-        .buffer_current_bytes = 9U,
+        .invalid_frames = 6U,
         .buffer_max_bytes = 10U,
-        .bytes_sent = 11U,
-        .response_attempts = 12U,
-        .response_successes = 13U,
         .response_send_errors = 14U,
-        .partial_writes = 15U,
-        .netconn_alloc_errors = 16U,
-        .bind_errors = 17U,
-        .listen_errors = 18U,
-        .accept_errors = 19U,
         .recv_errors = 20U,
         .decoder_errors = 21U,
+        .acks_deferred = 23U,
         .last_error = -22,
     };
     command_task_get_diagnostics(&output);
-    expect_u32(output.port, COMMAND_NETWORK_TASK_PORT, "diagnostics include command port");
     expect_u32(output.connections_accepted, 1U, "diagnostics copy accepted connections");
     expect_u32(output.connections_closed, 2U, "diagnostics copy closed connections");
     expect_u32(output.active_connection, 3U, "diagnostics copy active flag");
-    expect_u32(output.bytes_received, 4U, "diagnostics copy receive bytes");
     expect_u32(output.complete_frames_received, 5U, "diagnostics copy complete frames");
-    expect_u32(output.invalid_magic, 6U, "diagnostics copy invalid magic");
-    expect_u32(output.invalid_frame_length, 7U, "diagnostics copy invalid lengths");
-    expect_u32(output.invalid_crc, 8U, "diagnostics copy invalid CRC");
-    expect_u32(output.buffer_current_bytes, 9U, "diagnostics copy current buffer size");
+    expect_u32(output.invalid_frames, 6U, "diagnostics copy invalid frames");
     expect_u32(output.buffer_max_bytes, 10U, "diagnostics copy maximum buffer size");
-    expect_u32(output.bytes_sent, 11U, "diagnostics copy sent bytes");
-    expect_u32(output.response_attempts, 12U, "diagnostics copy response attempts");
-    expect_u32(output.response_successes, 13U, "diagnostics copy successful responses");
     expect_u32(output.response_send_errors, 14U, "diagnostics copy response errors");
-    expect_u32(output.partial_writes, 15U, "diagnostics copy partial writes");
-    expect_u32(output.netconn_alloc_errors, 16U, "diagnostics copy allocation errors");
-    expect_u32(output.bind_errors, 17U, "diagnostics copy bind errors");
-    expect_u32(output.listen_errors, 18U, "diagnostics copy listen errors");
-    expect_u32(output.accept_errors, 19U, "diagnostics copy accept errors");
     expect_u32(output.recv_errors, 20U, "diagnostics copy receive errors");
     expect_u32(output.decoder_errors, 21U, "diagnostics copy decoder errors");
+    expect_u32(output.acks_deferred, 23U, "diagnostics copy held ACKs");
     expect_u32((uint32_t)output.last_error, (uint32_t)-22, "diagnostics copy last error");
 
     volatile uint32_t counter = UINT32_MAX;
     command_counter_increment(&counter);
     expect_u32(counter, UINT32_MAX, "diagnostic counter saturates at maximum");
-    counter = UINT32_MAX - 1U;
-    command_counter_add(&counter, 2U);
-    expect_u32(counter, UINT32_MAX, "diagnostic addition saturates on overflow");
-    counter = 2U;
-    command_counter_add(&counter, 3U);
-    expect_u32(counter, 5U, "diagnostic addition succeeds without overflow");
-    if (SIZE_MAX > UINT32_MAX) {
-        counter = 0U;
-        command_counter_add(&counter, (size_t)UINT32_MAX + 1U);
-        expect_u32(counter, UINT32_MAX, "oversized size addition saturates");
-    }
-
-    CommandTaskAssemblerContext_t context = {.client = &test_client};
-    expect_true(command_task_get_client(NULL) == NULL, "null assembler context has no client");
-    expect_true(command_task_get_client(&context) == &test_client, "assembler context returns its client");
 }
 
 static void test_decoder_failure_and_error_response_send_failure(void) {
