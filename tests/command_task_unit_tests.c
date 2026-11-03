@@ -815,6 +815,28 @@ static void test_flag_waits_and_receive_errors(void) {
     expect_u32(command_task_diagnostics.connections_closed, 1U, "client is closed after a connection error");
 
     reset_fixture();
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, osFlagsErrorParameter);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "task flag wait error stops the task");
+    expect_u32(test_error_handler_calls, 1U, "task flag wait error is fatal");
+
+    reset_fixture();
+    set_buffer(0U, frame, (u16_t)frame_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    test_write_blocked = 1U;
+    test_write_mode = TEST_WRITE_FAIL;
+    set_flags_wait(0U, COMMAND_TASK_FLAG_TX);
+    test_flags_waits[0].unblock_writes = 1U;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "failed write on the TX flag closes the client");
+    expect_u32(test_netconn_write_calls, 2U, "buffered response is retried on the TX flag");
+    expect_u32(test_netconn_recv_calls, 2U, "socket is not read after a failed write");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "failed buffered write is counted");
+    expect_u32(command_task_diagnostics.connections_closed, 1U, "client is closed after a failed buffered write");
+
+    reset_fixture();
     set_buffer(0U, frame, COMMAND_FRAME_HEADER_SIZE, NULL, 0U, NULL, 0U);
     set_receive_result(0U, ERR_OK);
     set_receive_result(1U, ERR_WOULDBLOCK);
@@ -979,6 +1001,21 @@ static void test_deferred_ack(void) {
     expect_u32(test_netconn_write_calls, 1U, "held ACK is attempted once");
     expect_u32(test_netconn_recv_calls, 2U, "socket is not read after a failed held ACK");
     expect_u32(command_task_diagnostics.response_send_errors, 1U, "failed held ACK is counted");
+
+    reset_fixture();
+    test_queue_free_slots[0] = 0U;
+    test_queue_free_slots[1] = 1U;
+    set_buffer(0U, first, (u16_t)first_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_buffer(1U, second, (u16_t)second_length, NULL, 0U, NULL, 0U);
+    set_receive_result(1U, ERR_OK);
+    test_write_mode = TEST_WRITE_FAIL;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "failed held ACK before the next ACK closes the client");
+    expect_u32(test_command_queue_put_calls, 2U, "next command was queued before the held ACK failed");
+    expect_u32(test_netconn_write_calls, 1U, "only the held ACK is attempted");
+    expect_u32(test_queue_free_slots_calls, 1U, "next ACK is not prepared after the held ACK failed");
+    expect_u32(command_task_diagnostics.connections_closed, 1U, "client closes after the failed held ACK");
 
     reset_fixture();
     command_task_queue_space_available();
@@ -1316,10 +1353,11 @@ static void test_nonblocking_responses_pause_reading(void) {
     }
     test_write_blocked = 1U;
     set_flags_wait(0U, COMMAND_TASK_FLAG_TX);
-    test_flags_waits[0].unblock_writes = 1U;
+    set_flags_wait(1U, COMMAND_TASK_FLAG_TX);
+    test_flags_waits[1].unblock_writes = 1U;
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "client is served while LwIP cannot take responses");
-    expect_u32(test_thread_flags_wait_calls, 1U, "reading pauses until queued responses drain");
+    expect_u32(test_thread_flags_wait_calls, 2U, "reading stays paused while responses cannot drain");
     expect_u32(test_netconn_recv_calls, ping_count + 1U, "reading resumes after the TX flag without a new RX flag");
     expect_u32(
         (uint32_t)test_captured_response_length,
