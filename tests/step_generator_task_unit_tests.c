@@ -1,7 +1,7 @@
 #include "motion/execution_buffer.h"
 #include "motion/motion_segment_generator.h"
 #include "motion/plan_buffer.h"
-#include "motion_hardware_x.h"
+#include "motion_axis_hardware.h"
 #include "step_generator_task.h"
 
 #include "FreeRTOS.h"
@@ -28,8 +28,8 @@ static uint8_t test_wait_pushes_block[TEST_WAIT_SCRIPT_LENGTH];
 static uint32_t test_wait_script_count;
 static uint32_t test_wait_last_timeout;
 static uint8_t test_force_next_error;
-static MotionHardwareXStatus_t test_axis_status;
-static MotionHardwareXStatus_t test_axis_start_result;
+static MotionAxisHardwareStatus_t test_axis_status;
+static MotionAxisHardwareStatus_t test_axis_start_result;
 static uint32_t test_axis_start_calls;
 static uint32_t test_kernel_lock_depth;
 static uint32_t test_kernel_lock_calls;
@@ -110,9 +110,20 @@ int32_t osKernelUnlock(void) {
     return 1;
 }
 
-MotionHardwareXStatus_t motion_hardware_x_get_status(void) { return test_axis_status; }
+/* Only X runs the planned stream; a call for any other axis is counted as a defect. */
+static uint32_t test_other_axis_calls;
 
-MotionHardwareXStatus_t motion_hardware_x_start(void) {
+MotionAxisHardwareStatus_t motion_axis_hardware_get_status(MotionAxis_t axis) {
+    if (axis != MOTION_AXIS_X) {
+        ++test_other_axis_calls;
+    }
+    return test_axis_status;
+}
+
+MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis) {
+    if (axis != MOTION_AXIS_X) {
+        ++test_other_axis_calls;
+    }
     ++test_axis_start_calls;
     if (test_kernel_lock_depth == 0U) {
         ++test_axis_started_unlocked;
@@ -179,8 +190,8 @@ static void reset_fixture(void) {
     test_wait_script_count = 0U;
     test_wait_last_timeout = 0U;
     test_force_next_error = 0U;
-    test_axis_status = MOTION_HARDWARE_X_STATUS_RUNNING;
-    test_axis_start_result = MOTION_HARDWARE_X_STATUS_STARTING;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_RUNNING;
+    test_axis_start_result = MOTION_AXIS_HARDWARE_STATUS_STARTING;
     test_axis_start_calls = 0U;
     test_kernel_lock_depth = 0U;
     test_kernel_lock_calls = 0U;
@@ -306,27 +317,27 @@ static void test_invalid_blocks_are_skipped(void) {
 
 static void test_axis_start(void) {
     reset_fixture();
-    test_axis_status = MOTION_HARDWARE_X_STATUS_READY;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_READY;
     step_generator_task_start_axis();
     expect_u32(test_axis_start_calls, 0U, "axis is not started without events");
 
     push_block(7U, 2U);
-    test_axis_status = MOTION_HARDWARE_X_STATUS_READY;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_READY;
     expect_u32((uint32_t)run_task_until_jump(), 2U, "task fills and starts the idle axis");
     expect_u32(test_axis_start_calls, 1U, "idle axis is started once events are queued");
     expect_u32(test_axis_started_unlocked, 0U, "axis is started with task switching paused");
     expect_u32(test_kernel_lock_depth, 0U, "task switching is resumed after the start");
     expect_u32(step_generator_task_diagnostics.axis_starts, 1U, "axis start is counted");
 
-    test_axis_status = MOTION_HARDWARE_X_STATUS_COMPLETE;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
     step_generator_task_start_axis();
     expect_u32(test_axis_start_calls, 2U, "axis that finished earlier is restarted for new events");
 
-    const MotionHardwareXStatus_t busy_or_halted[] = {
-        MOTION_HARDWARE_X_STATUS_STARTING,
-        MOTION_HARDWARE_X_STATUS_RUNNING,
-        MOTION_HARDWARE_X_STATUS_STOPPED,
-        MOTION_HARDWARE_X_STATUS_FAULT_LIMIT,
+    const MotionAxisHardwareStatus_t busy_or_halted[] = {
+        MOTION_AXIS_HARDWARE_STATUS_STARTING,
+        MOTION_AXIS_HARDWARE_STATUS_RUNNING,
+        MOTION_AXIS_HARDWARE_STATUS_STOPPED,
+        MOTION_AXIS_HARDWARE_STATUS_FAULT_LIMIT,
     };
     for (uint32_t index = 0U; index < sizeof(busy_or_halted) / sizeof(busy_or_halted[0]); ++index) {
         test_axis_status = busy_or_halted[index];
@@ -335,8 +346,8 @@ static void test_axis_start(void) {
     expect_u32(test_axis_start_calls, 2U, "running, stopped or faulted axis is not started");
     expect_u32(test_kernel_lock_depth, 0U, "every pause of task switching is undone");
 
-    test_axis_status = MOTION_HARDWARE_X_STATUS_READY;
-    test_axis_start_result = MOTION_HARDWARE_X_STATUS_FAULT_UNDERRUN;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_READY;
+    test_axis_start_result = MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN;
     step_generator_task_start_axis();
     expect_u32(step_generator_task_diagnostics.axis_start_errors, 1U, "failed axis start is counted");
 }
@@ -344,7 +355,7 @@ static void test_axis_start(void) {
 static void test_stop_halts_and_resets(void) {
     reset_fixture();
     push_block(8U, 3U);
-    test_axis_status = MOTION_HARDWARE_X_STATUS_READY;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_READY;
     step_generator_task_halt();
     test_wait_script_count = 1U;
     test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
@@ -359,7 +370,7 @@ static void test_stop_halts_and_resets(void) {
     reset_fixture();
     const MotionExecutionEvent_t leftover = {.interval_ns = 1000U, .step_mask = MOTION_PLANNER_AXIS_X_MASK};
     expect_u32(execution_buffer_try_push(&leftover), EXECUTION_BUFFER_STATUS_OK, "leftover event is queued");
-    test_axis_status = MOTION_HARDWARE_X_STATUS_STOPPED;
+    test_axis_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     test_wait_script_count = 1U;
     test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
     step_generator_task_halt();
@@ -403,6 +414,7 @@ int main(void) {
     test_axis_start();
     test_stop_halts_and_resets();
     test_notifications();
+    expect_u32(test_other_axis_calls, 0U, "the generator drives only X");
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Step generator task unit tests failed: %u\n", (unsigned int)test_failures);

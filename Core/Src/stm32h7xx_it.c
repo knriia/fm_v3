@@ -23,7 +23,7 @@
 #include "ethernetif.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "motion_hardware_x.h"
+#include "motion_axis_hardware.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -204,29 +204,46 @@ void EXTI0_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+/* Step timers: X on TIM4; Y on TIM1, whose update and compare interrupts have separate vectors. */
 void TIM4_IRQHandler(void)
 {
-  motion_hardware_x_timer_irq();
+  motion_axis_hardware_timer_irq(MOTION_AXIS_X);
+}
+
+void TIM1_UP_IRQHandler(void)
+{
+  motion_axis_hardware_timer_irq(MOTION_AXIS_Y);
+}
+
+void TIM1_CC_IRQHandler(void)
+{
+  motion_axis_hardware_timer_irq(MOTION_AXIS_Y);
+}
+
+/* Axis switches: Y end PE4 (line 4), Y start PE5 (line 5), X end PF9 (line 9), X start PF10 (line 10). */
+static void motion_limit_lines_irq(uint32_t lines)
+{
+  const uint32_t pending = EXTI->PR1 & lines;
+  if (pending != 0U)
+  {
+    EXTI->PR1 = pending;
+    motion_axis_hardware_limit_irq(pending);
+  }
+}
+
+void EXTI4_IRQHandler(void)
+{
+  motion_limit_lines_irq(1UL << 4U);
 }
 
 void EXTI9_5_IRQHandler(void)
 {
-  const uint32_t pending = EXTI->PR1 & (1UL << 9U);
-  if (pending != 0U)
-  {
-    EXTI->PR1 = pending;
-    motion_hardware_x_limit_irq(pending);
-  }
+  motion_limit_lines_irq((1UL << 5U) | (1UL << 9U));
 }
 
 void EXTI15_10_IRQHandler(void)
 {
-  const uint32_t pending = EXTI->PR1 & (1UL << 10U);
-  if (pending != 0U)
-  {
-    EXTI->PR1 = pending;
-    motion_hardware_x_limit_irq(pending);
-  }
+  motion_limit_lines_irq(1UL << 10U);
 }
 
 /* USER CODE END 1 */

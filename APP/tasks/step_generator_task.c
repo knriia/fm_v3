@@ -3,7 +3,7 @@
 #include "motion/execution_buffer.h"
 #include "motion/motion_segment_generator.h"
 #include "motion/plan_buffer.h"
-#include "motion_hardware_x.h"
+#include "motion_axis_hardware.h"
 
 #include "cmsis_os.h"
 #include "FreeRTOS.h"
@@ -96,8 +96,8 @@ static void step_generator_task_fill(StepGeneratorState_t *state) {
     }
 }
 
-/* Starts the idle axis when events are waiting. A running axis picks new events up by itself, and one that
- * stopped or faulted is left alone until MotionTask recovers it. */
+/* Starts the idle X axis when events are waiting; X is the only axis on the planned stream for now. A running axis
+ * picks new events up by itself, and one that stopped or faulted is left alone until MotionTask recovers it. */
 static void step_generator_task_start_axis(void) {
     if (step_generator_task_halted != 0U || execution_buffer_count() == 0U) {
         return;
@@ -106,9 +106,9 @@ static void step_generator_task_start_axis(void) {
     /* MotionTask also starts this axis (homing, X_JOG). With task switching paused, the status check and the
      * start cannot interleave with its start; interrupts keep running. */
     (void)osKernelLock();
-    const MotionHardwareXStatus_t status = motion_hardware_x_get_status();
-    if (status == MOTION_HARDWARE_X_STATUS_READY || status == MOTION_HARDWARE_X_STATUS_COMPLETE) {
-        if (motion_hardware_x_start() == MOTION_HARDWARE_X_STATUS_STARTING) {
+    const MotionAxisHardwareStatus_t status = motion_axis_hardware_get_status(MOTION_AXIS_X);
+    if (status == MOTION_AXIS_HARDWARE_STATUS_READY || status == MOTION_AXIS_HARDWARE_STATUS_COMPLETE) {
+        if (motion_axis_hardware_start(MOTION_AXIS_X) == MOTION_AXIS_HARDWARE_STATUS_STARTING) {
             step_generator_counter_increment(&step_generator_task_diagnostics.axis_starts);
         } else {
             step_generator_counter_increment(&step_generator_task_diagnostics.axis_start_errors);

@@ -3,6 +3,7 @@
 
 #include "motion/axis_calibration.h"
 #include "motion/motion_planner.h"
+#include "motion_axis_hardware.h"
 #include "motion_stop.h"
 
 #include <stdint.h>
@@ -11,7 +12,7 @@
 #define MOTION_TASK_ERROR_RETRY_DELAY_MS 10U
 /* Highest STEP rate the motor driver accepts; the speed limit of every calibrated axis follows from it. */
 #define MOTION_TASK_MAX_STEP_RATE_HZ 150000U
-/* STOP waits this long for the axis to come to rest before the step pipeline is reset. */
+/* STOP waits this long for every axis to come to rest before the step pipeline is reset. */
 #define MOTION_TASK_STOP_SETTLE_TIMEOUT_MS 1000U
 
 typedef struct {
@@ -52,7 +53,8 @@ typedef struct {
 
 void MotionTask(void *argument);
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics);
-void motion_task_get_x_axis_diagnostics(MotionAxisDiagnostics *diagnostics);
+/* An axis outside MotionAxis_t leaves `diagnostics` untouched. */
+void motion_task_get_axis_diagnostics(MotionAxis_t axis, MotionAxisDiagnostics *diagnostics);
 MotionPlannerStatus_t motion_task_get_last_planner_status(void);
 
 #ifdef FM_V3_ENABLE_TEST_HOOKS

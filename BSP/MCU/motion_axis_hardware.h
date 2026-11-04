@@ -1,0 +1,111 @@
+#ifndef FM_V3_MOTION_AXIS_HARDWARE_H
+#define FM_V3_MOTION_AXIS_HARDWARE_H
+
+#include <stdint.h>
+
+#define MOTION_AXIS_HARDWARE_DM556_MIN_STEP_PULSE_NS 2500U
+#define MOTION_AXIS_HARDWARE_DM556_MIN_STEP_LOW_NS 2500U
+#define MOTION_AXIS_HARDWARE_DM556_MIN_DIRECTION_SETUP_NS 5000U
+#define MOTION_AXIS_HARDWARE_DM556_MIN_ENABLE_LEAD_NS 5000U
+
+/* One STEP/DIR/ENA output with its own timer, two switches and a scale. The value is the planner axis index.
+ *   X: TIM4 CH1 STEP PB6, DIR PB7, ENA PB8; start switch PF10, end switch PF9.
+ *   Y: TIM1 CH2 STEP PA9, DIR PA10, ENA PA11; start switch PE5, end switch PE4. */
+typedef enum { MOTION_AXIS_X = 0, MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_COUNT } MotionAxis_t;
+
+typedef enum {
+    MOTION_AXIS_HARDWARE_LIMIT_PULL_NONE = 0,
+    MOTION_AXIS_HARDWARE_LIMIT_PULL_UP,
+    MOTION_AXIS_HARDWARE_LIMIT_PULL_DOWN
+} MotionAxisHardwareLimitPull_t;
+
+/* Reads the axis position in um; called from the switch interrupt, so it must be short and must not block. */
+typedef int32_t (*MotionAxisHardwarePositionReader_t)(void);
+
+typedef struct {
+    uint8_t step_active_high;                 /* Must be 1: the STEP output is active-high. */
+    uint8_t enable_active_high;               /* ENA active level. */
+    uint8_t positive_direction_high;          /* DIR level for positive motion. */
+    uint8_t positive_moves_toward_end;        /* Positive motion heads toward the end switch when set. */
+    uint8_t start_limit_active_high;          /* Start switch active level. */
+    uint8_t end_limit_active_high;            /* End switch active level. */
+    MotionAxisHardwareLimitPull_t limit_pull; /* External board pull resistors may make NONE correct. */
+    uint32_t step_pulse_width_ns;             /* Must satisfy the motor-driver data sheet. */
+    uint32_t step_low_time_ns;                /* Minimum inactive STEP interval from the data sheet. */
+    uint32_t direction_setup_ns;
+    uint32_t direction_hold_ns; /* This backend requires hold <= STEP high/active width. */
+    uint32_t enable_setup_ns;   /* Minimum ENA-to-DIR lead time. */
+    uint32_t enable_hold_ns;    /* This backend requires hold <= STEP high/active width. */
+    /* A switch that a profiled move (start_jog_profile) runs into brakes it at this rate instead of stopping it
+     * dead; 0 keeps the hard stop. Planned moves and STOP always stop at once. */
+    uint32_t limit_deceleration_steps_per_s2;
+    /* Read when a switch fires, so the switch point is known even though the axis brakes past it; may be NULL. */
+    MotionAxisHardwarePositionReader_t position_reader;
+} MotionAxisHardwareConfig_t;
+
+typedef enum {
+    MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED = 0,
+    MOTION_AXIS_HARDWARE_STATUS_READY,
+    MOTION_AXIS_HARDWARE_STATUS_STARTING,
+    MOTION_AXIS_HARDWARE_STATUS_WAITING,
+    MOTION_AXIS_HARDWARE_STATUS_RUNNING,
+    MOTION_AXIS_HARDWARE_STATUS_COMPLETE,
+    MOTION_AXIS_HARDWARE_STATUS_FAULT_LIMIT,
+    MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN,
+    MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT,
+    MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING,
+    MOTION_AXIS_HARDWARE_STATUS_FAULT_CONFIG,
+    MOTION_AXIS_HARDWARE_STATUS_FAULT_CLOCK,
+    MOTION_AXIS_HARDWARE_STATUS_STOPPED
+} MotionAxisHardwareStatus_t;
+
+/* Why the last move ended with MOTION_AXIS_HARDWARE_STATUS_STOPPED; reset to NONE on every start. */
+typedef enum {
+    MOTION_AXIS_HARDWARE_STOP_REASON_NONE = 0,
+    MOTION_AXIS_HARDWARE_STOP_REASON_REQUEST,
+    MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT,
+    MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT,
+    MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE
+} MotionAxisHardwareStopReason_t;
+
+/* Runs in interrupt context: must be short and must not block. */
+typedef void (*MotionAxisHardwareStartLimitHook_t)(void);
+
+/* Every call takes the axis; an axis outside MotionAxis_t is ignored (status UNINITIALIZED, values 0).
+ * Electrical levels and driver timing are mandatory; no board defaults are assumed. */
+MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const MotionAxisHardwareConfig_t *config);
+/* Runs the planned step stream from step_executor. The stream is shared, so only one axis may use it at a time;
+ * until per-axis streams exist that axis is X. */
+MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis);
+MotionAxisHardwareStatus_t motion_axis_hardware_start_jog_profile(
+    MotionAxis_t axis,
+    int32_t signed_steps,
+    uint32_t initial_step_rate_hz,
+    uint32_t target_step_rate_hz,
+    uint32_t acceleration_steps_per_s2
+);
+/* Stops active motion at the next timer interrupt. */
+void motion_axis_hardware_request_stop(MotionAxis_t axis);
+/* Returns a runtime fault (limit, underrun, event, timing) to READY. Config and clock faults need init. */
+MotionAxisHardwareStatus_t motion_axis_hardware_clear_fault(MotionAxis_t axis);
+MotionAxisHardwareStatus_t motion_axis_hardware_ready_after_home(MotionAxis_t axis);
+MotionAxisHardwareStatus_t motion_axis_hardware_get_status(MotionAxis_t axis);
+MotionAxisHardwareStopReason_t motion_axis_hardware_get_last_stop_reason(MotionAxis_t axis);
+uint8_t motion_axis_hardware_start_limit_is_active(MotionAxis_t axis);
+uint8_t motion_axis_hardware_end_limit_is_active(MotionAxis_t axis);
+uint32_t motion_axis_hardware_get_last_jog_steps_completed(MotionAxis_t axis);
+/* Position reader value at the moment a switch fired during the last move; 0 when no reader is configured. */
+int32_t motion_axis_hardware_get_limit_trigger_position(MotionAxis_t axis);
+/* While armed, the start switch release during a move toward the end switch stops that move. */
+void motion_axis_hardware_arm_start_limit_release_stop(MotionAxis_t axis);
+void motion_axis_hardware_disarm_start_limit_release_stop(MotionAxis_t axis);
+/* One shot: `hook` runs in the same interrupt that stops the next move on the start switch, so it sees the exact
+ * switch point. Any stop clears it; NULL disarms it. */
+void motion_axis_hardware_arm_start_limit_hook(MotionAxis_t axis, MotionAxisHardwareStartLimitHook_t hook);
+
+/* Called only by the CMSIS interrupt handlers: the axis timer vectors, and the EXTI vectors with the pending lines
+ * they own (already cleared); lines of every axis may be passed together. */
+void motion_axis_hardware_timer_irq(MotionAxis_t axis);
+void motion_axis_hardware_limit_irq(uint32_t pending_lines);
+
+#endif /* FM_V3_MOTION_AXIS_HARDWARE_H */
