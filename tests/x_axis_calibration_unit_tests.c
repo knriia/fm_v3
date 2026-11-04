@@ -40,6 +40,11 @@ void motion_hardware_x_request_stop(void) { ++fake_stop_requests; }
 
 int32_t encoder_ox_get_coordinate(void) { return fake_encoder_um; }
 
+/* The switch point latched by the hardware; the axis then brakes on to fake_encoder_um. */
+static int32_t fake_limit_trigger_um;
+
+int32_t motion_hardware_x_get_limit_trigger_position(void) { return fake_limit_trigger_um; }
+
 XAxisBenchStatus_t x_axis_bench_start_profile(
     const MotionHardwareXConfig_t *hardware_config,
     int32_t signed_steps,
@@ -70,6 +75,7 @@ static void reset_fakes(void) {
     fake_stop_reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     fake_jog_steps_completed = 0U;
     fake_encoder_um = 0;
+    fake_limit_trigger_um = 0;
     fake_stop_requests = 0U;
     fake_profile_starts = 0U;
     fake_last_steps = 0;
@@ -85,6 +91,7 @@ static void reach_take_up(XAxisCalibration_t *calibration, const MotionHardwareX
     expect_u32(x_axis_calibration_begin(calibration, config), X_AXIS_CALIBRATION_RESULT_RUNNING, "seek starts");
     fake_status = MOTION_HARDWARE_X_STATUS_STOPPED;
     fake_stop_reason = MOTION_HARDWARE_X_STOP_REASON_END_LIMIT;
+    fake_limit_trigger_um = end_um;
     fake_encoder_um = end_um;
     expect_u32(
         x_axis_calibration_poll(calibration, config, &result),
@@ -132,9 +139,11 @@ static void test_successful_calibration(void) {
 
     fake_status = MOTION_HARDWARE_X_STATUS_STOPPED;
     fake_stop_reason = MOTION_HARDWARE_X_STOP_REASON_END_LIMIT;
-    fake_encoder_um = 179500;
+    fake_limit_trigger_um = 179500;
+    /* The seek brakes about 1 mm past the switch; the travel still ends where the switch fired. */
+    fake_encoder_um = 180400;
     expect_u32(x_axis_calibration_poll(&calibration, &config, &result), X_AXIS_CALIBRATION_RESULT_RUNNING, "take-up");
-    expect_u32(calibration.travel_um, 179500U, "travel is the scale reading at the end switch");
+    expect_u32(calibration.travel_um, 179500U, "travel is the scale reading latched when the end switch fired");
     expect_u32(calibration.phase, X_AXIS_CALIBRATION_PHASE_TAKE_UP, "the slack is taken up first");
     expect_u32((uint32_t)fake_last_steps, (uint32_t)-(int32_t)X_AXIS_CALIBRATION_TAKE_UP_STEPS, "take-up heads back");
     expect_u32(fake_last_initial_rate_hz, X_AXIS_CALIBRATION_MEASURE_INITIAL_STEP_RATE_HZ, "take-up ramps up");
@@ -216,7 +225,7 @@ static void test_failures_during_seek(void) {
     (void)x_axis_calibration_begin(&calibration, &config);
     fake_status = MOTION_HARDWARE_X_STATUS_STOPPED;
     fake_stop_reason = MOTION_HARDWARE_X_STOP_REASON_END_LIMIT;
-    fake_encoder_um = 0;
+    fake_limit_trigger_um = 0;
     expect_u32(
         x_axis_calibration_poll(&calibration, &config, &result),
         X_AXIS_CALIBRATION_RESULT_NO_DISTANCE,
@@ -227,7 +236,7 @@ static void test_failures_during_seek(void) {
     (void)x_axis_calibration_begin(&calibration, &config);
     fake_status = MOTION_HARDWARE_X_STATUS_STOPPED;
     fake_stop_reason = MOTION_HARDWARE_X_STOP_REASON_END_LIMIT;
-    fake_encoder_um = 1000;
+    fake_limit_trigger_um = 1000;
     fake_profile_result = X_AXIS_BENCH_STATUS_HARDWARE_ERROR;
     expect_u32(
         x_axis_calibration_poll(&calibration, &config, &result),

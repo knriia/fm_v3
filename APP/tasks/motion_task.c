@@ -17,7 +17,11 @@
 #define MOTION_TASK_X_HOME_FAST_STEP_RATE_HZ 50000U
 #define MOTION_TASK_X_HOME_INITIAL_STEP_RATE_HZ 1000U
 #define MOTION_TASK_X_HOME_ACCELERATION_STEPS_PER_S2 100000U
-/* The backoff and the approach run slowly so PF10 stops the axis within a step of its edge. */
+/* The fast seek brakes past PF10, so the backoff has up to 1 mm to cover; its speed does not affect the zero. */
+#define MOTION_TASK_X_HOME_BACKOFF_STEP_RATE_HZ 2000U
+#define MOTION_TASK_X_HOME_BACKOFF_INITIAL_STEP_RATE_HZ 100U
+#define MOTION_TASK_X_HOME_BACKOFF_ACCELERATION_STEPS_PER_S2 2000U
+/* The approach runs slowly so PF10 stops the axis within a step of its edge. */
 #define MOTION_TASK_X_HOME_SLOW_STEP_RATE_HZ 100U
 #define MOTION_TASK_X_HOME_SLOW_INITIAL_STEP_RATE_HZ 10U
 #define MOTION_TASK_X_HOME_SLOW_ACCELERATION_STEPS_PER_S2 500U
@@ -45,6 +49,9 @@ static const MotionHardwareXConfig_t motion_task_x_hardware_config = {
     .direction_hold_ns = 0U,
     .enable_setup_ns = MOTION_HARDWARE_X_DM556_MIN_ENABLE_LEAD_NS,
     .enable_hold_ns = 0U,
+    /* Brakes a 50 kHz seek within about 2100 steps, i.e. under 1 mm at 1/51200. */
+    .limit_deceleration_steps_per_s2 = 600000U,
+    .position_reader = encoder_ox_get_coordinate,
 };
 
 typedef enum {
@@ -252,9 +259,9 @@ static void motion_task_x_home_start_backoff(MotionTaskXHomeContext_t *homing, M
         homing,
         context,
         motion_task_x_home_away_from_start(MOTION_TASK_X_HOME_MOVE_STEPS),
-        MOTION_TASK_X_HOME_SLOW_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_SLOW_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_SLOW_ACCELERATION_STEPS_PER_S2,
+        MOTION_TASK_X_HOME_BACKOFF_INITIAL_STEP_RATE_HZ,
+        MOTION_TASK_X_HOME_BACKOFF_STEP_RATE_HZ,
+        MOTION_TASK_X_HOME_BACKOFF_ACCELERATION_STEPS_PER_S2,
         MOTION_TASK_X_HOME_BACKOFF
     );
 }

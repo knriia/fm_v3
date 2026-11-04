@@ -73,7 +73,8 @@ x_axis_calibration_begin(XAxisCalibration_t *calibration, const MotionHardwareXC
     return X_AXIS_CALIBRATION_RESULT_RUNNING;
 }
 
-/* The end switch stops the seek; the scale, zeroed at the start switch, then reads the whole travel. */
+/* The end switch stops the seek; the scale reading latched when it fired, zeroed at the start switch, is the
+ * whole travel. The axis brakes a little past that point. */
 static XAxisCalibrationResult_t
 x_axis_calibration_poll_seek_end(XAxisCalibration_t *calibration, const MotionHardwareXConfig_t *config) {
     const MotionHardwareXStatus_t status = motion_hardware_x_get_status();
@@ -85,7 +86,7 @@ x_axis_calibration_poll_seek_end(XAxisCalibration_t *calibration, const MotionHa
         return x_axis_calibration_fail(calibration, X_AXIS_CALIBRATION_RESULT_END_NOT_REACHED);
     }
 
-    calibration->travel_um = x_axis_calibration_distance_um(0, encoder_ox_get_coordinate());
+    calibration->travel_um = x_axis_calibration_distance_um(0, motion_hardware_x_get_limit_trigger_position());
     if (calibration->travel_um == 0U) {
         return x_axis_calibration_fail(calibration, X_AXIS_CALIBRATION_RESULT_NO_DISTANCE);
     }
