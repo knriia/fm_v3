@@ -14,8 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 704U
-#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 712U
+#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 752U
+#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 760U
 
 struct netif gnetif;
 struct stats lwip_stats;
@@ -130,6 +130,11 @@ static void test_payload_layout(void) {
     expect_u32(offsetof(DiagnosticPayloadDTO_t, z_axis), 496U, "Z axis offset");
     expect_u32(offsetof(DiagnosticPayloadDTO_t, ethernet), 544U, "Ethernet offset");
     expect_u32(offsetof(DiagnosticPayloadDTO_t, lwip), 604U, "LwIP offset");
+    expect_u32(offsetof(DiagnosticPayloadDTO_t, step_timing), 704U, "step timing offset");
+    expect_u32(offsetof(MotionAxisHardwareTiming_t, status), 0U, "step timing status offset");
+    expect_u32(offsetof(MotionAxisHardwareTiming_t, timing_faults), 4U, "step timing faults offset");
+    expect_u32(offsetof(MotionAxisHardwareTiming_t, isr_max_ns), 8U, "step timing ISR maximum offset");
+    expect_u32(offsetof(MotionAxisHardwareTiming_t, min_slack_ns), 12U, "step timing slack offset");
     expect_u32(DIAGNOSTIC_TASK_SLOT_COUNT, 9U, "task slot count");
     expect_u32(DIAGNOSTIC_TASK_SLOT_TCPIP, 8U, "tcpip is the last task slot");
 }

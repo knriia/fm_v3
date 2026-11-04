@@ -99,6 +99,8 @@ typedef struct {
     MotionAxisDiagnostics z_axis;
     EthernetDiagnosticsDTO_t ethernet;
     LwipDiagnostics lwip;
+    /* Step-timer health in MotionAxis_t order (X, Y, Z). Kept last so the earlier offsets did not move. */
+    MotionAxisHardwareTiming_t step_timing[MOTION_AXIS_HARDWARE_COUNT];
 } DiagnosticPayloadDTO_t;
 
 typedef struct {
@@ -117,7 +119,9 @@ _Static_assert(sizeof(ExecutionBufferDiagnosticsDTO_t) == 8U, "Invalid execution
 _Static_assert(sizeof(MotionAxisDiagnostics) == 48U, "Invalid axis diagnostics size");
 _Static_assert(sizeof(EthernetDiagnosticsDTO_t) == 60U, "Invalid Ethernet diagnostics size");
 _Static_assert(sizeof(LwipDiagnostics) == 100U, "Invalid LwIP diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 704U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 712U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(MotionAxisHardwareTiming_t) == 16U, "Invalid step timing diagnostics size");
+_Static_assert(MOTION_AXIS_HARDWARE_COUNT == 3, "The frame carries step timing for X, Y and Z");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 752U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 760U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

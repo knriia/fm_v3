@@ -51,24 +51,23 @@ typedef struct {
 /* X and Y are belt axes at about 0.5 um per step. */
 #define MOTION_TASK_BELT_HOME_SETTINGS                                                                                 \
     {                                                                                                                  \
-        .fast_seek = {1000U, 25000U, 100000U},                                                                         \
+        .fast_seek = {1000U, 50000U, 100000U},                                                                         \
         .backoff = {100U, 2000U, 2000U},                                                                               \
         .approach = {10U, 100U, 500U},                                                                                 \
     }
 
 #define MOTION_TASK_BELT_CALIBRATION_SETTINGS                                                                          \
     {                                                                                                                  \
-        .seek = {1000U, 25000U, 100000U},                                                                              \
+        .seek = {1000U, 50000U, 100000U},                                                                              \
         .measure = {100U, 2000U, 2000U},                                                                               \
         .take_up_steps = 2000U,                                                                                        \
         .measure_steps = 50000U,                                                                                       \
     }
 
 /* Z drives a screw through a belt: about 335 um per motor turn, travel about 16.3 mm. The driver runs at 6400 pulses
- * per turn, about 0.052 um per step. Fast moves ramp from 8 kHz to 40 kHz (about 2.1 mm/s) within about 2400 steps
- * (0.13 mm). At 80 kHz Z faulted whenever X ran fast at the same time. All step counts and rates here assume that
- * driver setting: scale them together with its divider. */
-#define MOTION_TASK_Z_FAST_PROFILE {8000U, 40000U, 320000U}
+ * per turn, about 0.052 um per step. Fast moves ramp from 8 kHz to 80 kHz (about 4.2 mm/s) within about 10000 steps
+ * (0.5 mm). All step counts and rates here assume that driver setting: scale them together with its divider. */
+#define MOTION_TASK_Z_FAST_PROFILE {8000U, 80000U, 320000U}
 
 #define MOTION_TASK_Z_HOME_SETTINGS                                                                                    \
     {                                                                                                                  \
@@ -110,7 +109,7 @@ typedef struct {
 static const MotionTaskAxisConfig_t motion_task_axis_configs[MOTION_AXIS_HARDWARE_COUNT] = {
     [MOTION_AXIS_X] =
         {
-            /* Brakes a 25 kHz seek within about 520 steps, i.e. under 0.3 mm at 1/51200. */
+            /* Brakes a 50 kHz seek within about 2100 steps, i.e. under 1 mm at 1/51200. */
             .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_ox_get_coordinate, 600000U),
             .zero_scale = encoder_ox_reset_coordinate,
             .home = MOTION_TASK_BELT_HOME_SETTINGS,
@@ -127,13 +126,13 @@ static const MotionTaskAxisConfig_t motion_task_axis_configs[MOTION_AXIS_HARDWAR
         },
     [MOTION_AXIS_Z] =
         {
-            /* Brakes a 40 kHz seek within about 500 steps (0.03 mm) past the switch. */
+            /* Brakes an 80 kHz seek within about 2000 steps (0.1 mm) past the switch. */
             .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_oz_get_coordinate, 1600000U),
             .zero_scale = encoder_oz_reset_coordinate,
             .home = MOTION_TASK_Z_HOME_SETTINGS,
             .calibration = MOTION_TASK_Z_CALIBRATION_SETTINGS,
-            /* About 2.1 mm/s, the fast-move rate. */
-            .max_step_rate_hz = 40000U,
+            /* About 4.2 mm/s, the fast-move rate. */
+            .max_step_rate_hz = 80000U,
         },
 };
 
@@ -627,6 +626,8 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
         motion_axis_hardware_clear_fault(state->axis) == MOTION_AXIS_HARDWARE_STATUS_READY && context != NULL) {
         context->machine_state.homed_axes_mask &= (uint8_t)~motion_task_axis_mask(state->axis);
     }
+    /* Each test run after a STOP gets its own step-timing peaks in the diagnostics. */
+    motion_axis_hardware_reset_timing_peaks(state->axis);
 }
 
 static void motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {

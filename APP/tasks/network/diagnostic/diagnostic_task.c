@@ -197,6 +197,9 @@ static void diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePerc
     diagnostic_task_collect_buffers(payload);
     diagnostic_task_collect_ethernet(&payload->ethernet);
     lwip_diagnostics_collect(&payload->lwip);
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        motion_axis_hardware_get_timing((MotionAxis_t)axis, &payload->step_timing[axis]);
+    }
 }
 
 void DiagnosticTask(void *argument) {
