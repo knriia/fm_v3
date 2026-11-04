@@ -35,11 +35,16 @@ typedef struct {
     uint32_t output_port_clock_bit;
     uint8_t step_pin;
     uint8_t direction_pin;
+    GPIO_TypeDef *enable_port;
+    uint32_t enable_port_clock_bit;
     uint8_t enable_pin;
-    GPIO_TypeDef *limit_port;
-    uint32_t limit_port_clock_bit;
-    /* SYSCFG_EXTICR port code: A = 0, B = 1, ... */
-    uint8_t limit_port_index;
+    /* Each switch has its own port; SYSCFG_EXTICR port code: A = 0, B = 1, ... */
+    GPIO_TypeDef *start_limit_port;
+    uint32_t start_limit_port_clock_bit;
+    uint8_t start_limit_port_index;
+    GPIO_TypeDef *end_limit_port;
+    uint32_t end_limit_port_clock_bit;
+    uint8_t end_limit_port_index;
     /* A switch pin number is also its EXTI line. */
     uint8_t start_limit_pin;
     uint8_t end_limit_pin;
@@ -63,10 +68,15 @@ static const MotionAxisBoard_t motion_axis_boards[MOTION_AXIS_HARDWARE_COUNT] = 
             .output_port_clock_bit = RCC_AHB4ENR_GPIOBEN,
             .step_pin = 6U,
             .direction_pin = 7U,
+            .enable_port = GPIOB,
+            .enable_port_clock_bit = RCC_AHB4ENR_GPIOBEN,
             .enable_pin = 8U,
-            .limit_port = GPIOF,
-            .limit_port_clock_bit = RCC_AHB4ENR_GPIOFEN,
-            .limit_port_index = 5U,
+            .start_limit_port = GPIOF,
+            .start_limit_port_clock_bit = RCC_AHB4ENR_GPIOFEN,
+            .start_limit_port_index = 5U,
+            .end_limit_port = GPIOF,
+            .end_limit_port_clock_bit = RCC_AHB4ENR_GPIOFEN,
+            .end_limit_port_index = 5U,
             .start_limit_pin = 10U,
             .end_limit_pin = 9U,
             .start_limit_irq = EXTI15_10_IRQn,
@@ -87,14 +97,49 @@ static const MotionAxisBoard_t motion_axis_boards[MOTION_AXIS_HARDWARE_COUNT] = 
             .output_port_clock_bit = RCC_AHB4ENR_GPIOAEN,
             .step_pin = 9U,
             .direction_pin = 10U,
+            .enable_port = GPIOA,
+            .enable_port_clock_bit = RCC_AHB4ENR_GPIOAEN,
             .enable_pin = 11U,
-            .limit_port = GPIOE,
-            .limit_port_clock_bit = RCC_AHB4ENR_GPIOEEN,
-            .limit_port_index = 4U,
+            .start_limit_port = GPIOE,
+            .start_limit_port_clock_bit = RCC_AHB4ENR_GPIOEEN,
+            .start_limit_port_index = 4U,
+            .end_limit_port = GPIOE,
+            .end_limit_port_clock_bit = RCC_AHB4ENR_GPIOEEN,
+            .end_limit_port_index = 4U,
             .start_limit_pin = 5U,
             .end_limit_pin = 4U,
             .start_limit_irq = EXTI9_5_IRQn,
             .end_limit_irq = EXTI4_IRQn,
+        },
+    [MOTION_AXIS_Z] =
+        {
+            .timer = TIM3,
+            .timer_clock_enable = &RCC->APB1LENR,
+            .timer_clock_enable_bit = RCC_APB1LENR_TIM3EN,
+            .timer_on_apb2 = 0U,
+            .advanced_timer = 0U,
+            .timer_irq = {TIM3_IRQn},
+            .timer_irq_count = 1U,
+            .channel = 3U,
+            .step_alternate_function = 2U,
+            .output_port = GPIOC,
+            .output_port_clock_bit = RCC_AHB4ENR_GPIOCEN,
+            .step_pin = 8U,
+            .direction_pin = 9U,
+            /* ENA is the only Z output on GPIOA. */
+            .enable_port = GPIOA,
+            .enable_port_clock_bit = RCC_AHB4ENR_GPIOAEN,
+            .enable_pin = 8U,
+            .start_limit_port = GPIOE,
+            .start_limit_port_clock_bit = RCC_AHB4ENR_GPIOEEN,
+            .start_limit_port_index = 4U,
+            .end_limit_port = GPIOF,
+            .end_limit_port_clock_bit = RCC_AHB4ENR_GPIOFEN,
+            .end_limit_port_index = 5U,
+            .start_limit_pin = 6U,
+            .end_limit_pin = 7U,
+            .start_limit_irq = EXTI9_5_IRQn,
+            .end_limit_irq = EXTI9_5_IRQn,
         },
 };
 
@@ -163,6 +208,7 @@ typedef MotionAxisHardwareContext_t Ctx_t;
 static MotionAxisHardwareContext_t motion_axis_contexts[MOTION_AXIS_HARDWARE_COUNT] = {
     [MOTION_AXIS_X] = {.board = &motion_axis_boards[MOTION_AXIS_X]},
     [MOTION_AXIS_Y] = {.board = &motion_axis_boards[MOTION_AXIS_Y]},
+    [MOTION_AXIS_Z] = {.board = &motion_axis_boards[MOTION_AXIS_Z]},
 };
 extern uint32_t SystemCoreClock;
 
@@ -275,17 +321,25 @@ static void motion_axis_set_pin_mode(GPIO_TypeDef *port, uint8_t pin, uint32_t m
     port->MODER = (port->MODER & ~(3UL << shift)) | (mode << shift);
 }
 
-static uint8_t motion_axis_limit_pin_is_active(const Ctx_t *c, uint8_t pin, uint8_t active_high) {
-    const uint8_t high = (c->board->limit_port->IDR & motion_axis_pin_mask(pin)) != 0U;
+static uint8_t motion_axis_limit_pin_is_active(GPIO_TypeDef *port, uint8_t pin, uint8_t active_high) {
+    const uint8_t high = (port->IDR & motion_axis_pin_mask(pin)) != 0U;
     return high == (active_high != 0U);
 }
 
 static uint8_t motion_axis_start_limit_active(const Ctx_t *c) {
-    return motion_axis_limit_pin_is_active(c, c->board->start_limit_pin, c->config.start_limit_active_high);
+    return motion_axis_limit_pin_is_active(
+        c->board->start_limit_port,
+        c->board->start_limit_pin,
+        c->config.start_limit_active_high
+    );
 }
 
 static uint8_t motion_axis_end_limit_active(const Ctx_t *c) {
-    return motion_axis_limit_pin_is_active(c, c->board->end_limit_pin, c->config.end_limit_active_high);
+    return motion_axis_limit_pin_is_active(
+        c->board->end_limit_port,
+        c->board->end_limit_pin,
+        c->config.end_limit_active_high
+    );
 }
 
 static uint8_t motion_axis_step_mask(const Ctx_t *c) { return (uint8_t)(1U << (uint32_t)(c - motion_axis_contexts)); }
@@ -311,7 +365,7 @@ static void motion_axis_set_direction(Ctx_t *c, uint8_t positive_direction) {
 
 static void motion_axis_set_enabled(const Ctx_t *c, uint8_t enabled) {
     const uint8_t high = enabled != 0U ? c->config.enable_active_high : (uint8_t)!c->config.enable_active_high;
-    motion_axis_write_pin(c->board->output_port, c->board->enable_pin, high);
+    motion_axis_write_pin(c->board->enable_port, c->board->enable_pin, high);
 }
 
 static void motion_axis_set_step_idle_gpio(const Ctx_t *c) {
@@ -653,9 +707,9 @@ static void motion_axis_configure_gpio(const Ctx_t *c) {
     const MotionAxisBoard_t *board = c->board;
     motion_axis_configure_output_pin(board->output_port, board->step_pin, (uint8_t)!c->config.step_active_high);
     motion_axis_configure_output_pin(board->output_port, board->direction_pin, c->config.positive_direction_high);
-    motion_axis_configure_output_pin(board->output_port, board->enable_pin, (uint8_t)!c->config.enable_active_high);
-    motion_axis_configure_limit_pin(board->limit_port, board->start_limit_pin, c->config.limit_pull);
-    motion_axis_configure_limit_pin(board->limit_port, board->end_limit_pin, c->config.limit_pull);
+    motion_axis_configure_output_pin(board->enable_port, board->enable_pin, (uint8_t)!c->config.enable_active_high);
+    motion_axis_configure_limit_pin(board->start_limit_port, board->start_limit_pin, c->config.limit_pull);
+    motion_axis_configure_limit_pin(board->end_limit_port, board->end_limit_pin, c->config.limit_pull);
 }
 
 static void motion_axis_route_exti_line(uint8_t line, uint8_t port_index) {
@@ -674,8 +728,8 @@ static void motion_axis_configure_exti(const Ctx_t *c) {
     const uint32_t start_line = motion_axis_pin_mask(board->start_limit_pin);
     const uint32_t end_line = motion_axis_pin_mask(board->end_limit_pin);
     const uint32_t lines = start_line | end_line;
-    motion_axis_route_exti_line(board->start_limit_pin, board->limit_port_index);
-    motion_axis_route_exti_line(board->end_limit_pin, board->limit_port_index);
+    motion_axis_route_exti_line(board->start_limit_pin, board->start_limit_port_index);
+    motion_axis_route_exti_line(board->end_limit_pin, board->end_limit_port_index);
     /* The start switch is watched on both edges: homing also needs the moment the switch is released. */
     EXTI->RTSR1 = (EXTI->RTSR1 & ~lines) | start_line | (c->config.end_limit_active_high != 0U ? end_line : 0U);
     EXTI->FTSR1 = (EXTI->FTSR1 & ~lines) | start_line | (c->config.end_limit_active_high != 0U ? 0U : end_line);
@@ -764,7 +818,8 @@ MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const Mo
         return c->status;
     }
 
-    RCC->AHB4ENR |= board->output_port_clock_bit | board->limit_port_clock_bit;
+    RCC->AHB4ENR |= board->output_port_clock_bit | board->enable_port_clock_bit | board->start_limit_port_clock_bit |
+                    board->end_limit_port_clock_bit;
     RCC->APB4ENR |= RCC_APB4ENR_SYSCFGEN;
     *board->timer_clock_enable |= board->timer_clock_enable_bit;
     (void)RCC->AHB4ENR;

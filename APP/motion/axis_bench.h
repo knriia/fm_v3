@@ -15,6 +15,13 @@ typedef enum {
     AXIS_BENCH_STATUS_HARDWARE_ERROR
 } AxisBenchStatus_t;
 
+/* Start rate, top rate and acceleration of one move; equal rates with no acceleration give a constant rate. */
+typedef struct {
+    uint32_t initial_step_rate_hz;
+    uint32_t target_step_rate_hz;
+    uint32_t acceleration_steps_per_s2;
+} AxisBenchProfile_t;
+
 typedef enum { AXIS_BENCH_TOWARD_START = 0, AXIS_BENCH_TOWARD_END } AxisBenchDirection_t;
 
 /* Starts a finite move of one axis toward one of its switches with a symmetric acceleration/deceleration profile;

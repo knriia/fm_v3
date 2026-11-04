@@ -96,6 +96,7 @@ typedef struct {
     ExecutionBufferDiagnosticsDTO_t execution_buffer;
     MotionAxisDiagnostics x_axis;
     MotionAxisDiagnostics y_axis;
+    MotionAxisDiagnostics z_axis;
     EthernetDiagnosticsDTO_t ethernet;
     LwipDiagnostics lwip;
 } DiagnosticPayloadDTO_t;
@@ -116,7 +117,7 @@ _Static_assert(sizeof(ExecutionBufferDiagnosticsDTO_t) == 8U, "Invalid execution
 _Static_assert(sizeof(MotionAxisDiagnostics) == 48U, "Invalid axis diagnostics size");
 _Static_assert(sizeof(EthernetDiagnosticsDTO_t) == 60U, "Invalid Ethernet diagnostics size");
 _Static_assert(sizeof(LwipDiagnostics) == 100U, "Invalid LwIP diagnostics size");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 656U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 664U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 704U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 712U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

@@ -204,10 +204,15 @@ void EXTI0_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
-/* Step timers: X on TIM4; Y on TIM1, whose update and compare interrupts have separate vectors. */
+/* Step timers: X on TIM4, Z on TIM3; Y on TIM1, whose update and compare interrupts have separate vectors. */
 void TIM4_IRQHandler(void)
 {
   motion_axis_hardware_timer_irq(MOTION_AXIS_X);
+}
+
+void TIM3_IRQHandler(void)
+{
+  motion_axis_hardware_timer_irq(MOTION_AXIS_Z);
 }
 
 void TIM1_UP_IRQHandler(void)
@@ -220,7 +225,8 @@ void TIM1_CC_IRQHandler(void)
   motion_axis_hardware_timer_irq(MOTION_AXIS_Y);
 }
 
-/* Axis switches: Y end PE4 (line 4), Y start PE5 (line 5), X end PF9 (line 9), X start PF10 (line 10). */
+/* Axis switches: Y end PE4 (line 4), Y start PE5 (line 5), Z start PE6 (line 6), Z end PF7 (line 7),
+ * X end PF9 (line 9), X start PF10 (line 10). */
 static void motion_limit_lines_irq(uint32_t lines)
 {
   const uint32_t pending = EXTI->PR1 & lines;
@@ -238,7 +244,7 @@ void EXTI4_IRQHandler(void)
 
 void EXTI9_5_IRQHandler(void)
 {
-  motion_limit_lines_irq((1UL << 5U) | (1UL << 9U));
+  motion_limit_lines_irq((1UL << 5U) | (1UL << 6U) | (1UL << 7U) | (1UL << 9U));
 }
 
 void EXTI15_10_IRQHandler(void)
