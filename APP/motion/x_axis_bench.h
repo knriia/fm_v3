@@ -15,14 +15,6 @@ typedef enum {
     X_AXIS_BENCH_STATUS_HARDWARE_ERROR
 } XAxisBenchStatus_t;
 
-/* Starts one finite, constant-rate X move expressed as signed motor steps. */
-XAxisBenchStatus_t x_axis_bench_start(
-    const MotionHardwareXConfig_t *hardware_config,
-    int32_t signed_steps,
-    uint32_t step_rate_hz,
-    MotionHardwareXStatus_t *hardware_status
-);
-
 /* Starts a finite X move with a symmetric acceleration/deceleration profile. */
 XAxisBenchStatus_t x_axis_bench_start_profile(
     const MotionHardwareXConfig_t *hardware_config,

@@ -93,15 +93,6 @@ static XAxisBenchStatus_t x_axis_bench_start_idle_axis(
     return X_AXIS_BENCH_STATUS_STARTED;
 }
 
-XAxisBenchStatus_t x_axis_bench_start(
-    const MotionHardwareXConfig_t *hardware_config,
-    int32_t signed_steps,
-    uint32_t step_rate_hz,
-    MotionHardwareXStatus_t *hardware_status
-) {
-    return x_axis_bench_start_internal(hardware_config, signed_steps, step_rate_hz, step_rate_hz, 0U, hardware_status);
-}
-
 XAxisBenchStatus_t x_axis_bench_start_profile(
     const MotionHardwareXConfig_t *hardware_config,
     int32_t signed_steps,
