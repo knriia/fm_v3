@@ -14,6 +14,9 @@ typedef enum {
     MOTION_HARDWARE_X_LIMIT_PULL_DOWN
 } MotionHardwareXLimitPull_t;
 
+/* Reads the axis position in um; called from the switch interrupt, so it must be short and must not block. */
+typedef int32_t (*MotionHardwareXPositionReader_t)(void);
+
 typedef struct {
     uint8_t step_active_high;              /* Must be 1 for the active-high PB6 STEP output. */
     uint8_t enable_active_high;            /* ENA active level on PB8 EB output. */
@@ -28,6 +31,11 @@ typedef struct {
     uint32_t direction_hold_ns; /* This backend requires hold <= STEP high/active width. */
     uint32_t enable_setup_ns;   /* Minimum ENA-to-DIR lead time when PB8 is connected to ENA. */
     uint32_t enable_hold_ns;    /* This backend requires hold <= STEP high/active width. */
+    /* A switch that a profiled move (start_jog_profile) runs into brakes it at this rate instead of stopping it
+     * dead; 0 keeps the hard stop. Planned moves and STOP always stop at once. */
+    uint32_t limit_deceleration_steps_per_s2;
+    /* Read when a switch fires, so the switch point is known even though the axis brakes past it; may be NULL. */
+    MotionHardwareXPositionReader_t position_reader;
 } MotionHardwareXConfig_t;
 
 typedef enum {
@@ -75,6 +83,8 @@ MotionHardwareXStopReason_t motion_hardware_x_get_last_stop_reason(void);
 uint8_t motion_hardware_x_start_limit_is_active(void);
 uint8_t motion_hardware_x_end_limit_is_active(void);
 uint32_t motion_hardware_x_get_last_jog_steps_completed(void);
+/* Position reader value at the moment a switch fired during the last move; 0 when no reader is configured. */
+int32_t motion_hardware_x_get_limit_trigger_position(void);
 /* While armed, the PF10 release during a move toward PF9 stops that move. */
 void motion_hardware_x_arm_start_limit_release_stop(void);
 void motion_hardware_x_disarm_start_limit_release_stop(void);

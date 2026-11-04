@@ -63,6 +63,13 @@ typedef struct {
     volatile MotionHardwareXStopReason_t stop_reason;
     volatile uint8_t start_limit_release_stop_armed;
     volatile MotionHardwareXStartLimitHook_t start_limit_hook;
+    /* Switch point of the current move, recorded once by whichever interrupt sees the switch first. */
+    volatile uint8_t limit_latched;
+    volatile int32_t limit_trigger_position;
+    /* Set by the switch interrupt; the timer interrupt, which owns the step count, turns it into a deceleration. */
+    volatile MotionHardwareXStopReason_t limit_deceleration_requested;
+    /* Timer interrupt only: the switch this move is braking for, or NONE. */
+    MotionHardwareXStopReason_t limit_deceleration_reason;
 } MotionHardwareXContext_t;
 
 static MotionHardwareXContext_t motion_hardware_x_context;
@@ -206,6 +213,8 @@ static void motion_hardware_x_stop(MotionHardwareXStatus_t final_status) {
     motion_hardware_x_context.pending_stop_reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     motion_hardware_x_context.start_limit_release_stop_armed = 0U;
     motion_hardware_x_context.start_limit_hook = NULL;
+    motion_hardware_x_context.limit_deceleration_requested = MOTION_HARDWARE_X_STOP_REASON_NONE;
+    motion_hardware_x_context.limit_deceleration_reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     if (motion_hardware_x_status_is_fault(motion_hardware_x_context.status) != 0) {
         final_status = motion_hardware_x_context.status;
     }
@@ -447,8 +456,18 @@ static MotionHardwareXStopReason_t motion_hardware_x_limit_blocks_direction(cons
     return MOTION_HARDWARE_X_STOP_REASON_NONE;
 }
 
-/* Runs the armed PF10 hook once; called where PF10 stops a move, before anything else can clear the hook. */
-static void motion_hardware_x_run_start_limit_hook(MotionHardwareXStopReason_t reason) {
+static uint8_t motion_hardware_x_reason_is_limit(MotionHardwareXStopReason_t reason) {
+    return reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT || reason == MOTION_HARDWARE_X_STOP_REASON_END_LIMIT;
+}
+
+/* Records the switch point once per move: the position first, then the armed PF10 hook, which may reset it. */
+static void motion_hardware_x_latch_limit(MotionHardwareXStopReason_t reason) {
+    if (motion_hardware_x_context.limit_latched == 0U) {
+        motion_hardware_x_context.limit_latched = 1U;
+        motion_hardware_x_context.limit_trigger_position = motion_hardware_x_context.config.position_reader != NULL
+                                                               ? motion_hardware_x_context.config.position_reader()
+                                                               : 0;
+    }
     const MotionHardwareXStartLimitHook_t hook = motion_hardware_x_context.start_limit_hook;
     motion_hardware_x_context.start_limit_hook = NULL;
     if (reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT && hook != NULL) {
@@ -456,8 +475,43 @@ static void motion_hardware_x_run_start_limit_hook(MotionHardwareXStopReason_t r
     }
 }
 
+/* Steps needed to brake the current profiled move down to its start rate; 0 means it can stop at once. */
+static uint32_t motion_hardware_x_limit_deceleration_steps(void) {
+    const uint64_t deceleration = motion_hardware_x_context.config.limit_deceleration_steps_per_s2;
+    const uint64_t rate_hz = motion_hardware_x_context.jog_step_rate_hz;
+    const uint64_t initial_rate_hz = motion_hardware_x_context.jog_initial_step_rate_hz;
+    if (motion_hardware_x_context.jog_mode == 0U || deceleration == 0U || rate_hz <= initial_rate_hz) {
+        return 0U;
+    }
+    return (uint32_t)((rate_hz * rate_hz - initial_rate_hz * initial_rate_hz) / (2U * deceleration));
+}
+
+/* Timer interrupt only. Turns a switch hit into a deceleration; returns 0 when the move must stop at once. */
+static uint8_t motion_hardware_x_begin_limit_deceleration(MotionHardwareXStopReason_t reason) {
+    if (motion_hardware_x_context.limit_deceleration_reason != MOTION_HARDWARE_X_STOP_REASON_NONE) {
+        return 1U;
+    }
+    const uint32_t steps = motion_hardware_x_limit_deceleration_steps();
+    if (steps == 0U) {
+        return 0U;
+    }
+    motion_hardware_x_latch_limit(reason);
+    motion_hardware_x_context.limit_deceleration_reason = reason;
+    /* The profile brakes over the remaining steps, so shortening them to the braking distance is the whole ramp. */
+    motion_hardware_x_context.jog_acceleration_steps_per_s2 =
+        motion_hardware_x_context.config.limit_deceleration_steps_per_s2;
+    if (steps < motion_hardware_x_context.jog_steps_remaining) {
+        /* The move gets shorter, so the completed-step count stays right. */
+        motion_hardware_x_context.jog_total_steps -= motion_hardware_x_context.jog_steps_remaining - steps;
+        motion_hardware_x_context.jog_steps_remaining = steps;
+    }
+    return 1U;
+}
+
 static void motion_hardware_x_stop_with_reason(MotionHardwareXStopReason_t reason) {
-    motion_hardware_x_run_start_limit_hook(reason);
+    if (motion_hardware_x_reason_is_limit(reason) != 0U) {
+        motion_hardware_x_latch_limit(reason);
+    }
     motion_hardware_x_context.stop_reason = reason;
     motion_hardware_x_stop(MOTION_HARDWARE_X_STATUS_STOPPED);
     step_executor_reset();
@@ -572,8 +626,9 @@ static MotionHardwareXStatus_t motion_hardware_x_start_event(const MotionExecuti
     }
     const MotionHardwareXStopReason_t blocking_limit = motion_hardware_x_limit_blocks_direction(first_event);
     if (blocking_limit != MOTION_HARDWARE_X_STOP_REASON_NONE) {
-        /* Already on PF10 when an approach starts: this is the switch point. */
-        motion_hardware_x_run_start_limit_hook(blocking_limit);
+        /* Already on the switch when the move starts: this is the switch point. */
+        motion_hardware_x_context.limit_latched = 0U;
+        motion_hardware_x_latch_limit(blocking_limit);
         step_executor_reset();
         motion_hardware_x_context.stop_reason = blocking_limit;
         motion_hardware_x_context.status = MOTION_HARDWARE_X_STATUS_STOPPED;
@@ -592,6 +647,9 @@ static MotionHardwareXStatus_t motion_hardware_x_start_event(const MotionExecuti
         return motion_hardware_x_context.status;
     }
 
+    motion_hardware_x_context.limit_latched = 0U;
+    motion_hardware_x_context.limit_deceleration_requested = MOTION_HARDWARE_X_STOP_REASON_NONE;
+    motion_hardware_x_context.limit_deceleration_reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     motion_hardware_x_context.current_event = *first_event;
     motion_hardware_x_context.current_direction_positive = motion_hardware_x_direction_is_positive(first_event);
     motion_hardware_x_context.first_interval_ticks = first_interval_ticks;
@@ -766,6 +824,8 @@ uint32_t motion_hardware_x_get_last_jog_steps_completed(void) {
     return motion_hardware_x_context.last_jog_steps_completed;
 }
 
+int32_t motion_hardware_x_get_limit_trigger_position(void) { return motion_hardware_x_context.limit_trigger_position; }
+
 void motion_hardware_x_arm_start_limit_release_stop(void) {
     const uint32_t primask = motion_hardware_x_enter_critical();
     motion_hardware_x_context.start_limit_release_stop_armed = 1U;
@@ -901,8 +961,10 @@ void motion_hardware_x_timer_irq(void) {
                 motion_hardware_x_exit_critical(primask);
                 return;
             }
-            const MotionHardwareXStopReason_t blocking_limit =
-                motion_hardware_x_limit_blocks_direction(&motion_hardware_x_context.current_event);
+            MotionHardwareXStopReason_t blocking_limit = motion_hardware_x_context.limit_deceleration_reason;
+            if (blocking_limit == MOTION_HARDWARE_X_STOP_REASON_NONE) {
+                blocking_limit = motion_hardware_x_limit_blocks_direction(&motion_hardware_x_context.current_event);
+            }
             if (blocking_limit != MOTION_HARDWARE_X_STOP_REASON_NONE) {
                 motion_hardware_x_stop_with_reason(blocking_limit);
                 motion_hardware_x_exit_critical(primask);
@@ -936,8 +998,13 @@ void motion_hardware_x_timer_irq(void) {
             motion_hardware_x_exit_critical(primask);
             return;
         }
-        const MotionHardwareXStopReason_t blocking_limit = motion_hardware_x_limit_blocks_direction(&next_event);
-        if (blocking_limit != MOTION_HARDWARE_X_STOP_REASON_NONE) {
+        MotionHardwareXStopReason_t blocking_limit = motion_hardware_x_limit_blocks_direction(&next_event);
+        if (blocking_limit == MOTION_HARDWARE_X_STOP_REASON_NONE) {
+            /* The switch may already be off again; its interrupt still counts. */
+            blocking_limit = motion_hardware_x_context.limit_deceleration_requested;
+        }
+        if (blocking_limit != MOTION_HARDWARE_X_STOP_REASON_NONE &&
+            motion_hardware_x_begin_limit_deceleration(blocking_limit) == 0U) {
             motion_hardware_x_stop_with_reason(blocking_limit);
             motion_hardware_x_exit_critical(primask);
             return;
@@ -998,9 +1065,23 @@ void motion_hardware_x_limit_irq(uint32_t pending_lines) {
                                                               motion_hardware_x_context.config.end_limit_active_high
                                                           ) != 0U;
 
+    MotionHardwareXStopReason_t reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     if (start_active != 0U && toward_end == 0U) {
-        motion_hardware_x_stop_with_reason(MOTION_HARDWARE_X_STOP_REASON_START_LIMIT);
+        reason = MOTION_HARDWARE_X_STOP_REASON_START_LIMIT;
     } else if (end_active != 0U && toward_end != 0U) {
-        motion_hardware_x_stop_with_reason(MOTION_HARDWARE_X_STOP_REASON_END_LIMIT);
+        reason = MOTION_HARDWARE_X_STOP_REASON_END_LIMIT;
     }
+    if (reason == MOTION_HARDWARE_X_STOP_REASON_NONE) {
+        return;
+    }
+    /* A fast profiled move brakes: the switch point is recorded here and the timer interrupt starts the ramp on its
+     * next step, at most one step later. Everything else stops at once. */
+    if (motion_hardware_x_context.status == MOTION_HARDWARE_X_STATUS_RUNNING &&
+        motion_hardware_x_limit_deceleration_steps() != 0U) {
+        motion_hardware_x_latch_limit(reason);
+        motion_hardware_x_context.limit_deceleration_requested = reason;
+        __DMB();
+        return;
+    }
+    motion_hardware_x_stop_with_reason(reason);
 }
