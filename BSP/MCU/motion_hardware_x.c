@@ -61,8 +61,8 @@ typedef struct {
     volatile uint8_t stop_requested;
     volatile MotionHardwareXStopReason_t pending_stop_reason;
     volatile MotionHardwareXStopReason_t stop_reason;
-    volatile uint8_t start_limit_release_event_pending;
     volatile uint8_t start_limit_release_stop_armed;
+    volatile MotionHardwareXStartLimitHook_t start_limit_hook;
 } MotionHardwareXContext_t;
 
 static MotionHardwareXContext_t motion_hardware_x_context;
@@ -205,6 +205,7 @@ static void motion_hardware_x_stop(MotionHardwareXStatus_t final_status) {
     motion_hardware_x_context.stop_requested = 0U;
     motion_hardware_x_context.pending_stop_reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     motion_hardware_x_context.start_limit_release_stop_armed = 0U;
+    motion_hardware_x_context.start_limit_hook = NULL;
     if (motion_hardware_x_status_is_fault(motion_hardware_x_context.status) != 0) {
         final_status = motion_hardware_x_context.status;
     }
@@ -446,7 +447,17 @@ static MotionHardwareXStopReason_t motion_hardware_x_limit_blocks_direction(cons
     return MOTION_HARDWARE_X_STOP_REASON_NONE;
 }
 
+/* Runs the armed PF10 hook once; called where PF10 stops a move, before anything else can clear the hook. */
+static void motion_hardware_x_run_start_limit_hook(MotionHardwareXStopReason_t reason) {
+    const MotionHardwareXStartLimitHook_t hook = motion_hardware_x_context.start_limit_hook;
+    motion_hardware_x_context.start_limit_hook = NULL;
+    if (reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT && hook != NULL) {
+        hook();
+    }
+}
+
 static void motion_hardware_x_stop_with_reason(MotionHardwareXStopReason_t reason) {
+    motion_hardware_x_run_start_limit_hook(reason);
     motion_hardware_x_context.stop_reason = reason;
     motion_hardware_x_stop(MOTION_HARDWARE_X_STATUS_STOPPED);
     step_executor_reset();
@@ -561,6 +572,8 @@ static MotionHardwareXStatus_t motion_hardware_x_start_event(const MotionExecuti
     }
     const MotionHardwareXStopReason_t blocking_limit = motion_hardware_x_limit_blocks_direction(first_event);
     if (blocking_limit != MOTION_HARDWARE_X_STOP_REASON_NONE) {
+        /* Already on PF10 when an approach starts: this is the switch point. */
+        motion_hardware_x_run_start_limit_hook(blocking_limit);
         step_executor_reset();
         motion_hardware_x_context.stop_reason = blocking_limit;
         motion_hardware_x_context.status = MOTION_HARDWARE_X_STATUS_STOPPED;
@@ -645,7 +658,6 @@ MotionHardwareXStatus_t motion_hardware_x_start_jog_profile(
     motion_hardware_x_context.jog_steps_remaining = (uint32_t)step_count;
     motion_hardware_x_context.jog_total_steps = (uint32_t)step_count;
     motion_hardware_x_context.last_jog_steps_completed = 0U;
-    motion_hardware_x_context.start_limit_release_event_pending = 0U;
     motion_hardware_x_context.jog_initial_step_rate_hz = initial_step_rate_hz;
     motion_hardware_x_context.jog_target_step_rate_hz = target_step_rate_hz;
     motion_hardware_x_context.jog_acceleration_steps_per_s2 = acceleration_steps_per_s2;
@@ -740,12 +752,14 @@ uint8_t motion_hardware_x_start_limit_is_active(void) {
     );
 }
 
-uint8_t motion_hardware_x_take_start_limit_release_event(void) {
-    const uint32_t primask = motion_hardware_x_enter_critical();
-    const uint8_t pending = motion_hardware_x_context.start_limit_release_event_pending;
-    motion_hardware_x_context.start_limit_release_event_pending = 0U;
-    motion_hardware_x_exit_critical(primask);
-    return pending;
+uint8_t motion_hardware_x_end_limit_is_active(void) {
+    if (motion_hardware_x_context.status == MOTION_HARDWARE_X_STATUS_UNINITIALIZED) {
+        return 0U;
+    }
+    return motion_hardware_x_limit_is_active(
+        MOTION_X_END_LIMIT_PIN,
+        motion_hardware_x_context.config.end_limit_active_high
+    );
 }
 
 uint32_t motion_hardware_x_get_last_jog_steps_completed(void) {
@@ -754,7 +768,6 @@ uint32_t motion_hardware_x_get_last_jog_steps_completed(void) {
 
 void motion_hardware_x_arm_start_limit_release_stop(void) {
     const uint32_t primask = motion_hardware_x_enter_critical();
-    motion_hardware_x_context.start_limit_release_event_pending = 0U;
     motion_hardware_x_context.start_limit_release_stop_armed = 1U;
     __DMB();
     motion_hardware_x_exit_critical(primask);
@@ -763,6 +776,13 @@ void motion_hardware_x_arm_start_limit_release_stop(void) {
 void motion_hardware_x_disarm_start_limit_release_stop(void) {
     const uint32_t primask = motion_hardware_x_enter_critical();
     motion_hardware_x_context.start_limit_release_stop_armed = 0U;
+    __DMB();
+    motion_hardware_x_exit_critical(primask);
+}
+
+void motion_hardware_x_arm_start_limit_hook(MotionHardwareXStartLimitHook_t hook) {
+    const uint32_t primask = motion_hardware_x_enter_critical();
+    motion_hardware_x_context.start_limit_hook = hook;
     __DMB();
     motion_hardware_x_exit_critical(primask);
 }
@@ -966,13 +986,10 @@ void motion_hardware_x_limit_irq(uint32_t pending_lines) {
                                                             MOTION_X_START_LIMIT_PIN,
                                                             motion_hardware_x_context.config.start_limit_active_high
                                                         ) != 0U;
-    if (start_pending != 0U && start_active == 0U) {
-        motion_hardware_x_context.start_limit_release_event_pending = 1U;
-        if (motion_hardware_x_context.start_limit_release_stop_armed != 0U && toward_end != 0U &&
-            motion_hardware_x_context.stop_requested == 0U) {
-            motion_hardware_x_context.pending_stop_reason = MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE;
-            motion_hardware_x_context.stop_requested = 1U;
-        }
+    if (start_pending != 0U && start_active == 0U && motion_hardware_x_context.start_limit_release_stop_armed != 0U &&
+        toward_end != 0U && motion_hardware_x_context.stop_requested == 0U) {
+        motion_hardware_x_context.pending_stop_reason = MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE;
+        motion_hardware_x_context.stop_requested = 1U;
         __DMB();
     }
     const uint8_t end_active =

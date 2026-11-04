@@ -62,11 +62,8 @@ void encoder_init(void) {
     encoder_configure_timer(TIM24);
 }
 
-static void encoder_reset_timer(TIM_TypeDef *timer) {
-    timer->CR1 &= ~TIM_CR1_CEN;
-    timer->CNT = 0U;
-    timer->CR1 |= TIM_CR1_CEN;
-}
+/* One store to the running counter: no edge is lost, and it is safe from an interrupt. */
+static void encoder_reset_timer(TIM_TypeDef *timer) { timer->CNT = 0U; }
 
 int32_t encoder_ox_get_coordinate(void) { return (int32_t)TIM24->CNT; }
 

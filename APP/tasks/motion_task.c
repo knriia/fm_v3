@@ -15,16 +15,16 @@
 #define MOTION_TASK_X_HOME_AXIS_MASK MOTION_PLANNER_AXIS_X_MASK
 #define MOTION_TASK_X_HOME_POLL_INTERVAL_MS 1U
 #define MOTION_TASK_X_HOME_FAST_STEP_RATE_HZ 50000U
-#define MOTION_TASK_X_HOME_CALIBRATION_STEP_RATE_HZ 100U
-#define MOTION_TASK_X_HOME_CALIBRATION_INITIAL_STEP_RATE_HZ 10U
 #define MOTION_TASK_X_HOME_INITIAL_STEP_RATE_HZ 1000U
 #define MOTION_TASK_X_HOME_ACCELERATION_STEPS_PER_S2 100000U
-/* Safety bound only: the backoff ends on PF10 release, not after this fixed distance. */
-#define MOTION_TASK_X_HOME_CALIBRATION_MAX_STEPS 1000U
-#define MOTION_TASK_X_HOME_CALIBRATION_EXTRA_STEPS 100U
-#define MOTION_TASK_X_HOME_CALIBRATION_ACCELERATION_STEPS_PER_S2 500U
-#define MOTION_TASK_X_HOME_CALIBRATION_RETURN_MAX_STEPS                                                                \
-    (MOTION_TASK_X_HOME_CALIBRATION_MAX_STEPS + MOTION_TASK_X_HOME_CALIBRATION_EXTRA_STEPS)
+/* The backoff and the approach run slowly so PF10 stops the axis within a step of its edge. */
+#define MOTION_TASK_X_HOME_SLOW_STEP_RATE_HZ 100U
+#define MOTION_TASK_X_HOME_SLOW_INITIAL_STEP_RATE_HZ 10U
+#define MOTION_TASK_X_HOME_SLOW_ACCELERATION_STEPS_PER_S2 500U
+/* Lets the belt come to rest between the backoff and the approach. */
+#define MOTION_TASK_X_HOME_SETTLE_MS 10U
+/* PF10, not a step count, ends every homing move; a switch that never changes is a separate open task. */
+#define MOTION_TASK_X_HOME_MOVE_STEPS X_AXIS_BENCH_MAX_STEPS
 
 static volatile MotionTaskDiagnostics motion_task_diagnostics = {
     .last_planner_status = MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
@@ -49,17 +49,16 @@ static const MotionHardwareXConfig_t motion_task_x_hardware_config = {
 
 typedef enum {
     MOTION_TASK_X_HOME_IDLE = 0,
+    /* Toward PF10 at full speed; skipped in effect when PF10 is already active. */
     MOTION_TASK_X_HOME_FAST_SEEK,
+    /* Away from PF10 until it turns off. */
     MOTION_TASK_X_HOME_BACKOFF,
-    MOTION_TASK_X_HOME_BACKOFF_STOPPING,
-    MOTION_TASK_X_HOME_BACKOFF_EXTRA,
-    MOTION_TASK_X_HOME_FINE_SEEK
+    /* Back toward PF10 until it turns on; that interrupt stops the axis and zeroes the scale. */
+    MOTION_TASK_X_HOME_APPROACH
 } MotionTaskXHomePhase_t;
 
 typedef struct {
     MotionTaskXHomePhase_t phase;
-    uint32_t backoff_release_steps;
-    uint8_t backoff_release_detected;
 } MotionTaskXHomeContext_t;
 
 /* CALIBRATE homes X, runs the calibration procedure and homes X again, so every move starts from home. */
@@ -197,31 +196,37 @@ static uint8_t motion_task_x_home_status_is_fault(MotionHardwareXStatus_t status
     return status >= MOTION_HARDWARE_X_STATUS_FAULT_LIMIT && status <= MOTION_HARDWARE_X_STATUS_FAULT_CLOCK;
 }
 
+/* PF10 and PF9 can never be covered at once, so both active means a wiring or sensor fault. */
+static uint8_t motion_task_x_limits_conflict(void) {
+    return motion_hardware_x_start_limit_is_active() != 0U && motion_hardware_x_end_limit_is_active() != 0U ? 1U : 0U;
+}
+
 static void motion_task_x_home_abort(MotionTaskXHomeContext_t *homing, MotionTaskContext_t *context) {
     motion_hardware_x_request_stop();
     motion_hardware_x_disarm_start_limit_release_stop();
+    motion_hardware_x_arm_start_limit_hook(NULL);
     context->machine_state.homed_axes_mask &= (uint8_t)~MOTION_TASK_X_HOME_AXIS_MASK;
     *homing = (MotionTaskXHomeContext_t){0};
 }
 
 static void motion_task_x_home_complete(MotionTaskXHomeContext_t *homing, MotionTaskContext_t *context) {
-    motion_hardware_x_disarm_start_limit_release_stop();
-    encoder_ox_reset_coordinate();
+    /* The PF10 interrupt that stopped the approach has already zeroed the scale at the switch edge. */
     context->machine_state.position_um[0] = 0;
     context->machine_state.homed_axes_mask |= MOTION_TASK_X_HOME_AXIS_MASK;
     (void)motion_hardware_x_ready_after_home();
     *homing = (MotionTaskXHomeContext_t){0};
 }
 
-static uint8_t motion_task_x_home_start_jog(
+/* A move that a switch blocks at once leaves the hardware STOPPED with that switch as the reason; the next poll
+ * judges it like any other stop, e.g. a seek that starts on PF10 goes straight on to the backoff. */
+static void motion_task_x_home_start_move(
     MotionTaskXHomeContext_t *homing,
     MotionTaskContext_t *context,
     int32_t signed_steps,
     uint32_t initial_step_rate_hz,
     uint32_t target_step_rate_hz,
     uint32_t acceleration_steps_per_s2,
-    MotionTaskXHomePhase_t phase,
-    uint8_t allow_switch_already_active
+    MotionTaskXHomePhase_t phase
 ) {
     MotionHardwareXStatus_t hardware_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
     const XAxisBenchStatus_t start_status = x_axis_bench_start_profile(
@@ -233,78 +238,38 @@ static uint8_t motion_task_x_home_start_jog(
         &hardware_status
     );
 
-    if (start_status == X_AXIS_BENCH_STATUS_STARTED ||
-        (allow_switch_already_active != 0U && hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED)) {
+    if (start_status == X_AXIS_BENCH_STATUS_STARTED || hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED) {
         homing->phase = phase;
-        return 1U;
+        return;
     }
-
     motion_task_x_home_abort(homing, context);
-    return 0U;
 }
 
 static void motion_task_x_home_start_backoff(MotionTaskXHomeContext_t *homing, MotionTaskContext_t *context) {
+    /* The PF10 release interrupt stops the backoff. */
     motion_hardware_x_arm_start_limit_release_stop();
-    (void)motion_task_x_home_start_jog(
+    motion_task_x_home_start_move(
         homing,
         context,
-        motion_task_x_home_away_from_start(MOTION_TASK_X_HOME_CALIBRATION_MAX_STEPS),
-        MOTION_TASK_X_HOME_CALIBRATION_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_CALIBRATION_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_CALIBRATION_ACCELERATION_STEPS_PER_S2,
-        MOTION_TASK_X_HOME_BACKOFF,
-        0U
+        motion_task_x_home_away_from_start(MOTION_TASK_X_HOME_MOVE_STEPS),
+        MOTION_TASK_X_HOME_SLOW_INITIAL_STEP_RATE_HZ,
+        MOTION_TASK_X_HOME_SLOW_STEP_RATE_HZ,
+        MOTION_TASK_X_HOME_SLOW_ACCELERATION_STEPS_PER_S2,
+        MOTION_TASK_X_HOME_BACKOFF
     );
 }
 
-/* The caller has bounded backoff_steps to 1..MOTION_TASK_X_HOME_CALIBRATION_RETURN_MAX_STEPS. */
-static void motion_task_x_home_start_fine_seek(
-    MotionTaskXHomeContext_t *homing,
-    MotionTaskContext_t *context,
-    uint32_t backoff_steps
-) {
-    (void)motion_task_x_home_start_jog(
+static void motion_task_x_home_start_approach(MotionTaskXHomeContext_t *homing, MotionTaskContext_t *context) {
+    /* The PF10 interrupt that stops the approach zeroes the scale in the same interrupt. */
+    motion_hardware_x_arm_start_limit_hook(encoder_ox_reset_coordinate);
+    motion_task_x_home_start_move(
         homing,
         context,
-        motion_task_x_home_toward_start(backoff_steps),
-        MOTION_TASK_X_HOME_CALIBRATION_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_CALIBRATION_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_CALIBRATION_ACCELERATION_STEPS_PER_S2,
-        MOTION_TASK_X_HOME_FINE_SEEK,
-        1U
-    );
-}
-
-/* Called once PF10 release was seen and the axis is STOPPED or COMPLETE. */
-static void motion_task_x_home_finish_backoff(
-    MotionTaskXHomeContext_t *homing,
-    MotionTaskContext_t *context,
-    MotionHardwareXStatus_t hardware_status
-) {
-    /* Backoff may end by the armed PF10-release stop or by this task's own stop request, never by a limit. */
-    const MotionHardwareXStopReason_t stop_reason = motion_hardware_x_get_last_stop_reason();
-    const uint8_t stop_is_expected = hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE ||
-                                     stop_reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE ||
-                                     stop_reason == MOTION_HARDWARE_X_STOP_REASON_REQUEST;
-    if (stop_is_expected == 0U || motion_hardware_x_start_limit_is_active() != 0U) {
-        motion_task_x_home_abort(homing, context);
-        return;
-    }
-    homing->backoff_release_steps = motion_hardware_x_get_last_jog_steps_completed();
-    if (homing->backoff_release_steps == 0U ||
-        homing->backoff_release_steps > MOTION_TASK_X_HOME_CALIBRATION_MAX_STEPS) {
-        motion_task_x_home_abort(homing, context);
-        return;
-    }
-    (void)motion_task_x_home_start_jog(
-        homing,
-        context,
-        motion_task_x_home_away_from_start(MOTION_TASK_X_HOME_CALIBRATION_EXTRA_STEPS),
-        MOTION_TASK_X_HOME_CALIBRATION_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_CALIBRATION_STEP_RATE_HZ,
-        MOTION_TASK_X_HOME_CALIBRATION_ACCELERATION_STEPS_PER_S2,
-        MOTION_TASK_X_HOME_BACKOFF_EXTRA,
-        0U
+        motion_task_x_home_toward_start(MOTION_TASK_X_HOME_MOVE_STEPS),
+        MOTION_TASK_X_HOME_SLOW_INITIAL_STEP_RATE_HZ,
+        MOTION_TASK_X_HOME_SLOW_STEP_RATE_HZ,
+        MOTION_TASK_X_HOME_SLOW_ACCELERATION_STEPS_PER_S2,
+        MOTION_TASK_X_HOME_APPROACH
     );
 }
 
@@ -320,134 +285,62 @@ static void motion_task_x_home_begin(MotionTaskXHomeContext_t *homing, MotionTas
     *homing = (MotionTaskXHomeContext_t){0};
     context->machine_state.homed_axes_mask &= (uint8_t)~MOTION_TASK_X_HOME_AXIS_MASK;
     (void)plan_buffer_clear();
-    (void)motion_task_x_home_start_jog(
+    if (motion_task_x_limits_conflict() != 0U) {
+        return;
+    }
+    motion_task_x_home_start_move(
         homing,
         context,
-        motion_task_x_home_toward_start(X_AXIS_BENCH_MAX_STEPS),
+        motion_task_x_home_toward_start(MOTION_TASK_X_HOME_MOVE_STEPS),
         MOTION_TASK_X_HOME_INITIAL_STEP_RATE_HZ,
         MOTION_TASK_X_HOME_FAST_STEP_RATE_HZ,
         MOTION_TASK_X_HOME_ACCELERATION_STEPS_PER_S2,
-        MOTION_TASK_X_HOME_FAST_SEEK,
-        1U
+        MOTION_TASK_X_HOME_FAST_SEEK
     );
 }
 
 static void motion_task_x_home_poll(MotionTaskXHomeContext_t *homing, MotionTaskContext_t *context) {
+    if (motion_task_x_home_is_active(homing) == 0U) {
+        return;
+    }
     const MotionHardwareXStatus_t hardware_status = motion_hardware_x_get_status();
+    if (motion_task_x_home_hardware_is_active(hardware_status) != 0U) {
+        return;
+    }
+    /* Every homing move is meant to end on PF10; running out of steps or any other stop is a failure. */
+    const MotionHardwareXStopReason_t stop_reason = hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED
+                                                        ? motion_hardware_x_get_last_stop_reason()
+                                                        : MOTION_HARDWARE_X_STOP_REASON_NONE;
+
     switch (homing->phase) {
     case MOTION_TASK_X_HOME_FAST_SEEK:
-        if (hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED) {
-            /* Only PF10 may end the seek; PF9 or any other stop means wrong wiring or direction. */
-            if (motion_hardware_x_get_last_stop_reason() == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT) {
-                motion_task_x_home_start_backoff(homing, context);
-            } else {
-                motion_task_x_home_abort(homing, context);
-            }
-            break;
-        }
-        if (motion_task_x_home_status_is_fault(hardware_status) != 0U ||
-            hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE ||
-            motion_task_x_home_hardware_is_active(hardware_status) == 0U) {
-            motion_task_x_home_abort(homing, context);
+        if (stop_reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT) {
+            motion_task_x_home_start_backoff(homing, context);
+            return;
         }
         break;
-
     case MOTION_TASK_X_HOME_BACKOFF:
-        if (motion_task_x_home_status_is_fault(hardware_status) != 0U) {
-            motion_task_x_home_abort(homing, context);
-            return;
-        }
-        if (motion_hardware_x_take_start_limit_release_event() != 0U) {
-            homing->backoff_release_detected = 1U;
-        }
-        if (motion_hardware_x_start_limit_is_active() == 0U &&
-            motion_task_x_home_hardware_is_active(hardware_status) != 0U) {
-            homing->backoff_release_detected = 1U;
-        }
-        if (homing->backoff_release_detected != 0U) {
-            if (motion_task_x_home_hardware_is_active(hardware_status) != 0U) {
-                motion_hardware_x_request_stop();
-                homing->phase = MOTION_TASK_X_HOME_BACKOFF_STOPPING;
-                break;
-            }
-            if (hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED ||
-                hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE) {
-                motion_task_x_home_finish_backoff(homing, context, hardware_status);
-                break;
-            }
-            motion_task_x_home_abort(homing, context);
-            return;
-        }
-        if (hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE) {
-            motion_task_x_home_abort(homing, context);
-            break;
-        }
-        if (hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED) {
-            motion_task_x_home_abort(homing, context);
-            return;
-        }
-        if (motion_task_x_home_hardware_is_active(hardware_status) == 0U) {
-            motion_task_x_home_abort(homing, context);
-        }
-        break;
-
-    case MOTION_TASK_X_HOME_BACKOFF_STOPPING:
-        if (motion_task_x_home_status_is_fault(hardware_status) != 0U) {
-            motion_task_x_home_abort(homing, context);
-            return;
-        }
-        if (hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED ||
-            hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE) {
-            motion_task_x_home_finish_backoff(homing, context, hardware_status);
-            break;
-        }
-        if (motion_task_x_home_hardware_is_active(hardware_status) == 0U) {
-            motion_task_x_home_abort(homing, context);
-        }
-        break;
-
-    case MOTION_TASK_X_HOME_BACKOFF_EXTRA:
-        if (motion_task_x_home_status_is_fault(hardware_status) != 0U ||
-            motion_hardware_x_start_limit_is_active() != 0U || hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED) {
-            motion_task_x_home_abort(homing, context);
-            return;
-        }
-        if (hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE) {
-            /* backoff_release_steps is already bounded by CALIBRATION_MAX_STEPS, so the sum fits RETURN_MAX. */
-            const uint32_t extra_steps = motion_hardware_x_get_last_jog_steps_completed();
-            if (extra_steps != MOTION_TASK_X_HOME_CALIBRATION_EXTRA_STEPS) {
-                motion_task_x_home_abort(homing, context);
+        if (stop_reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE) {
+            if (motion_hardware_x_start_limit_is_active() != 0U) {
+                /* PF10 flickered on its edge; keep backing off until it stays off. */
+                motion_task_x_home_start_backoff(homing, context);
                 return;
             }
-            motion_task_x_home_start_fine_seek(homing, context, homing->backoff_release_steps + extra_steps);
-            break;
-        }
-        if (motion_task_x_home_hardware_is_active(hardware_status) == 0U) {
-            motion_task_x_home_abort(homing, context);
+            (void)osDelay(MOTION_TASK_X_HOME_SETTLE_MS);
+            motion_task_x_home_start_approach(homing, context);
+            return;
         }
         break;
-
-    case MOTION_TASK_X_HOME_FINE_SEEK:
-        if (hardware_status == MOTION_HARDWARE_X_STATUS_STOPPED) {
-            if (motion_hardware_x_get_last_stop_reason() != MOTION_HARDWARE_X_STOP_REASON_START_LIMIT ||
-                motion_hardware_x_start_limit_is_active() == 0U) {
-                motion_task_x_home_abort(homing, context);
-                return;
-            }
+    default:
+        /* MOTION_TASK_X_HOME_APPROACH */
+        if (stop_reason == MOTION_HARDWARE_X_STOP_REASON_START_LIMIT &&
+            motion_hardware_x_start_limit_is_active() != 0U) {
             motion_task_x_home_complete(homing, context);
             return;
         }
-        if (motion_task_x_home_status_is_fault(hardware_status) != 0U ||
-            hardware_status == MOTION_HARDWARE_X_STATUS_COMPLETE ||
-            motion_task_x_home_hardware_is_active(hardware_status) == 0U) {
-            motion_task_x_home_abort(homing, context);
-        }
-        break;
-
-    default:
-        /* MOTION_TASK_X_HOME_IDLE: nothing to supervise. */
         break;
     }
+    motion_task_x_home_abort(homing, context);
 }
 
 static uint8_t motion_task_x_calibration_is_busy(const MotionTaskXCalibrationContext_t *calibration) {
@@ -462,6 +355,10 @@ static void motion_task_x_calibration_begin(
     MotionTaskXHomeContext_t *homing,
     MotionTaskContext_t *context
 ) {
+    if (motion_task_x_limits_conflict() != 0U) {
+        calibration->result = X_AXIS_CALIBRATION_RESULT_LIMITS_CONFLICT;
+        return;
+    }
     calibration->result = X_AXIS_CALIBRATION_RESULT_RUNNING;
     calibration->waiting_for_home = 1U;
     /* A homing that cannot start leaves X unhomed, and the next poll reports it. */

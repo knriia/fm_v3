@@ -28,7 +28,9 @@ typedef enum {
     X_AXIS_CALIBRATION_RESULT_END_NOT_REACHED,
     X_AXIS_CALIBRATION_RESULT_MOVE_FAILED,
     X_AXIS_CALIBRATION_RESULT_NO_DISTANCE,
-    X_AXIS_CALIBRATION_RESULT_ABORTED
+    X_AXIS_CALIBRATION_RESULT_ABORTED,
+    /* PF10 and PF9 are both active: wiring or sensor fault, so the axis is not moved. */
+    X_AXIS_CALIBRATION_RESULT_LIMITS_CONFLICT
 } XAxisCalibrationResult_t;
 
 typedef struct {

@@ -60,15 +60,12 @@ typedef struct {
     MotionHardwareXStatus_t status;
     MotionHardwareXStopReason_t stop_reason;
     uint8_t start_limit_active;
-    uint32_t jog_steps_completed;
-    uint8_t start_limit_release_event;
 } TestXHardwareState_t;
 
 static MotionHardwareXStatus_t fake_x_status;
 static MotionHardwareXStopReason_t fake_x_stop_reason;
 static uint8_t fake_x_start_limit_active;
-static uint32_t fake_x_jog_steps_completed;
-static uint8_t fake_x_start_limit_release_event;
+static uint8_t fake_x_end_limit_active;
 /* Hardware state applied just before the matching scripted queue read, i.e. while MotionTask is blocked. */
 static TestXHardwareState_t test_x_state_script[16];
 
@@ -76,15 +73,13 @@ static void script_x_state(
     uint32_t index,
     MotionHardwareXStatus_t status,
     MotionHardwareXStopReason_t stop_reason,
-    uint8_t start_limit_active,
-    uint32_t jog_steps_completed
+    uint8_t start_limit_active
 ) {
     test_x_state_script[index] = (TestXHardwareState_t){
         .apply = 1U,
         .status = status,
         .stop_reason = stop_reason,
         .start_limit_active = start_limit_active,
-        .jog_steps_completed = jog_steps_completed,
     };
 }
 
@@ -94,8 +89,6 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
         fake_x_status = state->status;
         fake_x_stop_reason = state->stop_reason;
         fake_x_start_limit_active = state->start_limit_active;
-        fake_x_jog_steps_completed = state->jog_steps_completed;
-        fake_x_start_limit_release_event = state->start_limit_release_event;
     }
     ++test_receive_calls;
     test_last_receive_timeout = timeout_ms;
@@ -214,17 +207,15 @@ MotionHardwareXStatus_t motion_hardware_x_ready_after_home(void) {
 
 uint8_t motion_hardware_x_start_limit_is_active(void) { return fake_x_start_limit_active; }
 
-uint8_t motion_hardware_x_take_start_limit_release_event(void) {
-    const uint8_t event = fake_x_start_limit_release_event;
-    fake_x_start_limit_release_event = 0U;
-    return event;
-}
-
-uint32_t motion_hardware_x_get_last_jog_steps_completed(void) { return fake_x_jog_steps_completed; }
+uint8_t motion_hardware_x_end_limit_is_active(void) { return fake_x_end_limit_active; }
 
 void motion_hardware_x_arm_start_limit_release_stop(void) { ++fake_x_release_stop_arms; }
 
 void motion_hardware_x_disarm_start_limit_release_stop(void) {}
+
+static MotionHardwareXStartLimitHook_t fake_x_start_limit_hook;
+
+void motion_hardware_x_arm_start_limit_hook(MotionHardwareXStartLimitHook_t hook) { fake_x_start_limit_hook = hook; }
 
 void encoder_ox_reset_coordinate(void) {}
 
@@ -308,8 +299,8 @@ static void reset_receive_script(void) {
     fake_x_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
     fake_x_stop_reason = MOTION_HARDWARE_X_STOP_REASON_NONE;
     fake_x_start_limit_active = 0U;
-    fake_x_jog_steps_completed = 0U;
-    fake_x_start_limit_release_event = 0U;
+    fake_x_end_limit_active = 0U;
+    fake_x_start_limit_hook = NULL;
     (void)memset(test_x_state_script, 0, sizeof(test_x_state_script));
     fake_x_bench_last_signed_steps = 0;
     fake_x_failing_start = 0U;
@@ -749,7 +740,7 @@ static void run_single_stop(MotionTaskContext_t *context, MotionHardwareXStatus_
     script_read(0U, osOK, &stop);
     test_block_when_empty = 1U;
     /* MotionTask initializes the hardware itself, so the state is injected on the first queue read. */
-    script_x_state(0U, status_after_init, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(0U, status_after_init, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U);
     (void)run_motion_task_until_scripted_stop(context);
 }
 
@@ -771,13 +762,13 @@ static void script_home_polls(uint32_t poll_count) {
 static void test_home_fast_seek_moves_toward_start_and_backs_off_on_pf10(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
     script_home_polls(1U);
 
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 2U, "HOME starts fast seek and then backoff");
     expect_u32(fake_x_release_stop_arms, 1U, "backoff arms the PF10 release stop");
-    expect_i64(fake_x_bench_last_signed_steps, 1000, "backoff moves away from PF10 (positive with this config)");
+    expect_i64(fake_x_bench_last_signed_steps, 1000000, "backoff moves away from PF10 (positive with this config)");
     expect_u32(fake_x_stop_requests, 0U, "a PF10 stop is not treated as an abort");
     expect_u32(test_last_receive_timeout, 1U, "active homing polls the queue every millisecond");
 }
@@ -785,7 +776,7 @@ static void test_home_fast_seek_moves_toward_start_and_backs_off_on_pf10(void) {
 static void test_home_fast_seek_aborts_on_end_limit(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U, 0U);
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U);
     script_home_polls(1U);
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -800,25 +791,26 @@ static void test_home_fast_seek_aborts_on_end_limit(void) {
     );
 }
 
-/* Drives HOME through every phase up to the fine seek, then applies the given fine-seek result. */
-static void run_home_to_fine_seek_result(
+/* The three hardware states of a successful homing, applied on reads first..first+2:
+ * fast seek stopped by PF10, backoff stopped by the PF10 release, approach stopped by PF10. */
+static void script_successful_home_states(uint32_t first) {
+    script_x_state(first, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    script_x_state(first + 1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE, 0U);
+    script_x_state(first + 2U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+}
+
+/* Drives HOME through the fast seek and the backoff, then applies the given approach result. */
+static void run_home_to_approach_result(
     MotionTaskContext_t *context,
-    MotionHardwareXStopReason_t fine_seek_reason,
+    MotionHardwareXStopReason_t approach_reason,
     uint8_t start_limit_active
 ) {
     reset_receive_script();
     *context = valid_motion_context();
     context->machine_state.position_um[0] = 12345;
-    /* Fast seek hits PF10. */
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-    /* Backoff is running and PF10 is released: the task requests the stop itself. */
-    script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
-    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
-    /* Extra backoff completes exactly. */
-    script_x_state(4U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
-    /* Fine seek result. */
-    script_x_state(5U, MOTION_HARDWARE_X_STATUS_STOPPED, fine_seek_reason, start_limit_active, 0U);
-    script_home_polls(5U);
+    script_successful_home_states(1U);
+    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, approach_reason, start_limit_active);
+    script_home_polls(3U);
     (void)run_motion_task_until_scripted_stop(context);
 }
 
@@ -828,20 +820,11 @@ static const CommandDTO_t test_calibrate_x_command = {
     .parameters.calibrate.axes = MOTION_PLANNER_AXIS_X_MASK,
 };
 
-/* The five hardware states of a successful homing, applied on reads first..first+4. */
-static void script_successful_home_states(uint32_t first) {
-    script_x_state(first, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-    script_x_state(first + 1U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
-    script_x_state(first + 2U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
-    script_x_state(first + 3U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
-    script_x_state(first + 4U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-}
-
-/* CALIBRATE, homing on reads 1..5, the measurement finishes on read 6, then `polls` more reads. */
+/* CALIBRATE, homing on reads 1..3, the measurement finishes on read 4, then `polls` more reads. */
 static void run_calibration_with_final_home_polls(MotionTaskContext_t *context, uint32_t polls) {
     script_successful_home_states(1U);
     script_read(0U, osOK, &test_calibrate_x_command);
-    for (uint32_t index = 1U; index <= 6U + polls; ++index) {
+    for (uint32_t index = 1U; index <= 4U + polls; ++index) {
         script_read(index, osErrorTimeout, NULL);
     }
     test_block_when_empty = 1U;
@@ -856,13 +839,13 @@ static void test_calibration_runs_after_homing_and_applies_result(void) {
     fake_encoder_x_um = -300000;
     context = valid_motion_context();
     context.machine_state.position_um[0] = 777;
-    script_successful_home_states(7U);
-    run_calibration_with_final_home_polls(&context, 5U);
+    script_successful_home_states(5U);
+    run_calibration_with_final_home_polls(&context, 3U);
 
     expect_u32(fake_calibration_begin_calls, 1U, "calibration starts once homing has finished");
     expect_u32(fake_calibration_poll_calls, 1U, "calibration is polled while it runs");
-    expect_u32(fake_x_bench_starts, 8U, "calibration homes X before and after the measurement");
-    expect_i64(fake_x_bench_last_signed_steps, -400, "the last move is the fine seek of the final homing");
+    expect_u32(fake_x_bench_starts, 6U, "calibration homes X before and after the measurement");
+    expect_i64(fake_x_bench_last_signed_steps, -1000000, "the last move is the approach of the final homing");
     expect_u32(context.calibration.calibrated_axes_mask, MOTION_PLANNER_AXIS_X_MASK, "X is marked calibrated");
     expect_u32(context.calibration.axis[0].distance_um, 12U, "measured distance is kept in RAM");
     expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 10U, "planner uses the measured steps");
@@ -890,7 +873,7 @@ static void test_calibration_runs_after_homing_and_applies_result(void) {
     fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
     fake_calibration_measured = (AxisCalibration_t){.steps = 10U, .distance_um = 12U, .travel_um = 301000U};
     context = valid_motion_context();
-    script_x_state(7U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(5U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U);
     run_calibration_with_final_home_polls(&context, 1U);
     expect_u32(test_last_receive_timeout, 1U, "calibration keeps polling during the final homing");
     motion_task_get_x_axis_diagnostics(&axis);
@@ -901,7 +884,7 @@ static void test_calibration_runs_after_homing_and_applies_result(void) {
     fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
     fake_calibration_measured = (AxisCalibration_t){.steps = 10U, .distance_um = 12U, .travel_um = 301000U};
     context = valid_motion_context();
-    script_x_state(7U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U, 0U);
+    script_x_state(5U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U);
     run_calibration_with_final_home_polls(&context, 1U);
     motion_task_get_x_axis_diagnostics(&axis);
     expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_HOME_FAILED, "failed final homing is reported");
@@ -914,14 +897,15 @@ static void test_calibration_runs_after_homing_and_applies_result(void) {
     fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_OK;
     context = valid_motion_context();
     script_successful_home_states(1U);
-    script_x_state(7U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(5U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U);
     script_read(0U, osOK, &test_calibrate_x_command);
-    for (uint32_t index = 1U; index <= 6U; ++index) {
+    for (uint32_t index = 1U; index <= 4U; ++index) {
         script_read(index, osErrorTimeout, NULL);
     }
     const CommandDTO_t stop = {.sequence = 143U, .code = COMMAND_CODE_STOP};
-    script_read(7U, osOK, &stop);
-    test_axis_settles_after_delays = 1U;
+    script_read(5U, osOK, &stop);
+    /* Delay 1 is the settle pause of the first homing; the axis is at rest on the STOP wait that follows. */
+    test_axis_settles_after_delays = 2U;
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
     motion_task_get_x_axis_diagnostics(&axis);
@@ -934,7 +918,7 @@ static void test_calibration_failures(void) {
 
     reset_receive_script();
     context = valid_motion_context();
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U, 0U);
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U);
     script_read(0U, osOK, &test_calibrate_x_command);
     script_read(1U, osErrorTimeout, NULL);
     test_block_when_empty = 1U;
@@ -944,19 +928,15 @@ static void test_calibration_failures(void) {
     motion_task_get_x_axis_diagnostics(&axis);
     expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_HOME_FAILED, "failed homing is reported");
 
-    run_home_to_fine_seek_result(&context, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    run_home_to_approach_result(&context, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
     expect_u32(fake_calibration_begin_calls, 0U, "HOME alone does not calibrate");
 
     reset_receive_script();
     fake_calibration_begin_result = X_AXIS_CALIBRATION_RESULT_MOVE_FAILED;
     context = valid_motion_context();
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-    script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
-    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
-    script_x_state(4U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
-    script_x_state(5U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_successful_home_states(1U);
     script_read(0U, osOK, &test_calibrate_x_command);
-    for (uint32_t index = 1U; index <= 5U; ++index) {
+    for (uint32_t index = 1U; index <= 3U; ++index) {
         script_read(index, osErrorTimeout, NULL);
     }
     test_block_when_empty = 1U;
@@ -968,13 +948,9 @@ static void test_calibration_failures(void) {
     reset_receive_script();
     fake_calibration_poll_result = X_AXIS_CALIBRATION_RESULT_NO_DISTANCE;
     context = valid_motion_context();
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-    script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
-    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
-    script_x_state(4U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
-    script_x_state(5U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_successful_home_states(1U);
     script_read(0U, osOK, &test_calibrate_x_command);
-    for (uint32_t index = 1U; index <= 6U; ++index) {
+    for (uint32_t index = 1U; index <= 4U; ++index) {
         script_read(index, osErrorTimeout, NULL);
     }
     test_block_when_empty = 1U;
@@ -982,6 +958,47 @@ static void test_calibration_failures(void) {
     motion_task_get_x_axis_diagnostics(&axis);
     expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_NO_DISTANCE, "measurement failure is reported");
     expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 80U, "failed calibration keeps the limits");
+}
+
+/* Both switches active at once can only be a wiring or sensor fault, so nothing may move. */
+static void test_both_limits_active_refuse_homing_and_calibration(void) {
+    MotionTaskContext_t context;
+    MotionAxisDiagnostics axis = {0};
+
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_start_limit_active = 1U;
+    fake_x_end_limit_active = 1U;
+    script_read(0U, osOK, &test_calibrate_x_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    motion_task_get_x_axis_diagnostics(&axis);
+    expect_u32(axis.calibration_result, X_AXIS_CALIBRATION_RESULT_LIMITS_CONFLICT, "CALIBRATE reports the conflict");
+    expect_u32(fake_x_bench_starts, 0U, "CALIBRATE with both switches active does not move");
+    expect_u32(test_last_receive_timeout, osWaitForever, "refused calibration does not poll");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_start_limit_active = 1U;
+    fake_x_end_limit_active = 1U;
+    script_read(0U, osOK, &test_home_x_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 0U, "HOME with both switches active does not move");
+    expect_u32(
+        context.machine_state.homed_axes_mask,
+        MOTION_PLANNER_ALL_AXES_MASK & (uint8_t)~MOTION_PLANNER_AXIS_X_MASK,
+        "refused HOME leaves X unhomed"
+    );
+
+    /* Starting on PF10 alone is a normal start: the fast seek is blocked at once and the backoff follows. */
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_start_limit_active = 1U;
+    script_read(0U, osOK, &test_home_x_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 1U, "HOME on PF10 alone starts the seek");
 }
 
 static void test_calibration_is_cancelled_and_guarded(void) {
@@ -1023,22 +1040,30 @@ static void test_calibration_is_cancelled_and_guarded(void) {
     expect_u32(fake_x_bench_starts, 0U, "only X can be calibrated for now");
 }
 
-static void test_home_completes_only_on_pf10_during_fine_seek(void) {
+static void test_home_completes_only_on_pf10_during_approach(void) {
     MotionTaskContext_t context;
-    run_home_to_fine_seek_result(&context, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
-    expect_u32(fake_x_bench_starts, 4U, "fast seek, backoff, extra backoff and fine seek are started");
-    expect_i64(fake_x_bench_last_signed_steps, -400, "fine seek returns toward PF10 by backoff plus extra steps");
-    expect_u32(fake_x_stop_requests, 1U, "only the backoff stop is requested");
+    run_home_to_approach_result(&context, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    expect_u32(fake_x_bench_starts, 3U, "fast seek, backoff and approach are started");
+    expect_i64(fake_x_bench_last_signed_steps, -1000000, "the approach heads back toward PF10");
+    expect_u32(test_delay_calls, 1U, "the approach waits once after the backoff");
+    expect_u32(test_last_delay_ms, 10U, "the belt gets 10 ms to come to rest");
+    expect_u32(
+        fake_x_start_limit_hook == encoder_ox_reset_coordinate ? 1U : 0U,
+        1U,
+        "the approach lets the PF10 interrupt zero the scale"
+    );
+    expect_u32(fake_x_stop_requests, 0U, "a successful homing requests no stop");
     expect_u32(fake_x_ready_after_home_calls, 1U, "successful home readies the X hardware");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "successful homing marks X homed");
     expect_i64(context.machine_state.position_um[0], 0, "successful homing zeroes X");
 
-    run_home_to_fine_seek_result(&context, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 1U);
-    expect_u32(fake_x_stop_requests, 2U, "fine seek ended by PF9 aborts homing");
+    run_home_to_approach_result(&context, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 1U);
+    expect_u32(fake_x_stop_requests, 1U, "approach ended by PF9 aborts homing");
+    expect_u32(fake_x_start_limit_hook == NULL ? 1U : 0U, 1U, "aborted homing disarms the scale reset");
     expect_u32(
         context.machine_state.homed_axes_mask,
         MOTION_PLANNER_ALL_AXES_MASK & (uint8_t)~MOTION_PLANNER_AXIS_X_MASK,
-        "fine seek ended by PF9 leaves X unhomed"
+        "approach ended by PF9 leaves X unhomed"
     );
     expect_i64(context.machine_state.position_um[0], 12345, "aborted homing keeps the old X position");
 }
@@ -1046,15 +1071,30 @@ static void test_home_completes_only_on_pf10_during_fine_seek(void) {
 static void test_home_backoff_aborts_when_stopped_by_end_limit(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-    script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
-    script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U, 300U);
-    script_home_polls(3U);
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    script_x_state(2U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_END_LIMIT, 0U);
+    script_home_polls(2U);
 
     (void)run_motion_task_until_scripted_stop(&context);
-    expect_u32(fake_x_bench_starts, 2U, "backoff stopped by PF9 does not start the extra backoff");
-    expect_u32(fake_x_stop_requests, 2U, "backoff stop request and abort are both issued");
+    expect_u32(fake_x_bench_starts, 2U, "backoff stopped by PF9 does not start the approach");
+    expect_u32(fake_x_stop_requests, 1U, "backoff stopped by PF9 aborts homing");
     expect_u32(test_last_receive_timeout, osWaitForever, "aborted homing stops polling");
+}
+
+static void test_home_backoff_continues_while_pf10_flickers(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    /* The release interrupt fired, but PF10 is active again once the axis has stopped. */
+    script_x_state(2U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE, 1U);
+    script_home_polls(2U);
+
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 3U, "a flickering PF10 restarts the backoff");
+    expect_u32(fake_x_release_stop_arms, 2U, "the restarted backoff arms the release stop again");
+    expect_i64(fake_x_bench_last_signed_steps, 1000000, "the restarted backoff keeps moving away from PF10");
+    expect_u32(test_delay_calls, 0U, "no approach is started while PF10 is active");
+    expect_u32(test_last_receive_timeout, 1U, "homing stays active");
 }
 
 static void test_stop_clears_runtime_fault_and_x_homing(void) {
@@ -1118,14 +1158,18 @@ static void test_stop_without_fault_keeps_homing(void) {
     expect_u32(fake_x_stop_requests, 1U, "STOP requests an X hardware stop");
     expect_u32(fake_x_clear_fault_calls, 0U, "STOP without a fault does not clear anything");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "homing survives a plain STOP");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    run_single_stop(&context, MOTION_HARDWARE_X_STATUS_STOPPED);
+    expect_u32(fake_x_clear_fault_calls, 0U, "an axis stopped by a switch is not a fault");
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "homing survives a switch stop");
 }
 
 typedef enum {
     TEST_HOME_PHASE_FAST_SEEK = 0,
     TEST_HOME_PHASE_BACKOFF,
-    TEST_HOME_PHASE_BACKOFF_STOPPING,
-    TEST_HOME_PHASE_BACKOFF_EXTRA,
-    TEST_HOME_PHASE_FINE_SEEK
+    TEST_HOME_PHASE_APPROACH
 } TestHomePhase_t;
 
 typedef struct {
@@ -1139,67 +1183,39 @@ typedef struct {
 /* Scripts the hardware states that walk HOME into `phase` (poll N moves it into phase N). */
 static void script_home_prefix(TestHomePhase_t phase) {
     if (phase >= TEST_HOME_PHASE_BACKOFF) {
-        script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+        script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
     }
-    if (phase >= TEST_HOME_PHASE_BACKOFF_STOPPING) {
-        script_x_state(2U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
-    }
-    if (phase >= TEST_HOME_PHASE_BACKOFF_EXTRA) {
-        script_x_state(3U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_REQUEST, 0U, 300U);
-    }
-    if (phase >= TEST_HOME_PHASE_FINE_SEEK) {
-        script_x_state(4U, MOTION_HARDWARE_X_STATUS_COMPLETE, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 100U);
+    if (phase >= TEST_HOME_PHASE_APPROACH) {
+        script_x_state(2U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT_RELEASE, 0U);
     }
 }
 
-#define TEST_X_STATE(status_, reason_, limit_, steps_, release_)                                                       \
+#define TEST_X_STATE(status_, reason_, limit_)                                                                         \
     {.apply = 1U,                                                                                                      \
      .status = MOTION_HARDWARE_X_STATUS_##status_,                                                                     \
      .stop_reason = MOTION_HARDWARE_X_STOP_REASON_##reason_,                                                           \
-     .start_limit_active = (limit_),                                                                                   \
-     .jog_steps_completed = (steps_),                                                                                  \
-     .start_limit_release_event = (release_)}
+     .start_limit_active = (limit_)}
 
 static const TestHomePhaseCase_t test_home_phase_cases[] = {
-    {"fast seek fault aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(FAULT_TIMING, NONE, 0U, 0U, 0U), 0U, 1U},
-    {"fast seek completing without PF10 aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(COMPLETE, NONE, 0U, 0U, 0U), 0U, 1U},
-    {"fast seek with idle hardware aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(READY, NONE, 0U, 0U, 0U), 0U, 1U},
-    {"fast seek keeps waiting while STEP is pending", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(WAITING, NONE, 0U, 0U, 0U), 1U, 1U},
+    {"fast seek fault aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(FAULT_TIMING, NONE, 0U), 0U, 1U},
+    {"fast seek completing without PF10 aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(COMPLETE, NONE, 0U), 0U, 1U},
+    {"fast seek with idle hardware aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(READY, NONE, 0U), 0U, 1U},
+    {"fast seek stopped on request aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(STOPPED, REQUEST, 0U), 0U, 1U},
+    {"fast seek keeps waiting while STEP is pending", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(WAITING, NONE, 0U), 1U, 1U},
 
-    {"backoff fault aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(FAULT_TIMING, NONE, 1U, 0U, 0U), 0U, 2U},
-    {"backoff stopped by PF10 release starts extra backoff", TEST_HOME_PHASE_BACKOFF,
-     TEST_X_STATE(STOPPED, START_LIMIT_RELEASE, 0U, 300U, 1U), 1U, 3U},
-    {"backoff completing after PF10 release starts extra backoff", TEST_HOME_PHASE_BACKOFF,
-     TEST_X_STATE(COMPLETE, NONE, 0U, 1000U, 1U), 1U, 3U},
-    {"backoff release with idle hardware aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(READY, NONE, 0U, 0U, 1U), 0U, 2U},
-    {"backoff completing on PF10 aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(COMPLETE, NONE, 1U, 1000U, 0U), 0U, 2U},
-    {"backoff stopped on PF10 aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(STOPPED, REQUEST, 1U, 10U, 0U), 0U, 2U},
-    {"backoff with idle hardware aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(READY, NONE, 0U, 0U, 0U), 0U, 2U},
-    {"backoff keeps running while PF10 is pressed", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(RUNNING, NONE, 1U, 0U, 0U), 1U, 2U},
+    {"backoff fault aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(FAULT_TIMING, NONE, 1U), 0U, 2U},
+    {"backoff completing without the PF10 release aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(COMPLETE, NONE, 1U), 0U, 2U},
+    {"backoff with idle hardware aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(READY, NONE, 0U), 0U, 2U},
+    {"backoff stopped on request aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(STOPPED, REQUEST, 0U), 0U, 2U},
+    {"backoff keeps running while PF10 is active", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(RUNNING, NONE, 1U), 1U, 2U},
+    {"backoff stopped by the PF10 release starts the approach", TEST_HOME_PHASE_BACKOFF,
+     TEST_X_STATE(STOPPED, START_LIMIT_RELEASE, 0U), 1U, 3U},
 
-    {"backoff stopping fault aborts", TEST_HOME_PHASE_BACKOFF_STOPPING, TEST_X_STATE(FAULT_TIMING, NONE, 0U, 0U, 0U), 0U, 2U},
-    {"backoff completing before the stop starts extra backoff", TEST_HOME_PHASE_BACKOFF_STOPPING,
-     TEST_X_STATE(COMPLETE, NONE, 0U, 1000U, 0U), 1U, 3U},
-    {"backoff stopped by PF10 release starts extra backoff", TEST_HOME_PHASE_BACKOFF_STOPPING,
-     TEST_X_STATE(STOPPED, START_LIMIT_RELEASE, 0U, 300U, 0U), 1U, 3U},
-    {"backoff stop still in progress keeps waiting", TEST_HOME_PHASE_BACKOFF_STOPPING, TEST_X_STATE(RUNNING, NONE, 0U, 0U, 0U), 1U, 2U},
-    {"backoff stopping with idle hardware aborts", TEST_HOME_PHASE_BACKOFF_STOPPING, TEST_X_STATE(READY, NONE, 0U, 0U, 0U), 0U, 2U},
-    {"backoff stopped on a pressed PF10 aborts", TEST_HOME_PHASE_BACKOFF_STOPPING, TEST_X_STATE(STOPPED, REQUEST, 1U, 300U, 0U), 0U, 2U},
-    {"backoff without measured steps aborts", TEST_HOME_PHASE_BACKOFF_STOPPING, TEST_X_STATE(STOPPED, REQUEST, 0U, 0U, 0U), 0U, 2U},
-    {"backoff longer than its bound aborts", TEST_HOME_PHASE_BACKOFF_STOPPING, TEST_X_STATE(STOPPED, REQUEST, 0U, 1001U, 0U), 0U, 2U},
-
-    {"extra backoff fault aborts", TEST_HOME_PHASE_BACKOFF_EXTRA, TEST_X_STATE(FAULT_TIMING, NONE, 0U, 0U, 0U), 0U, 3U},
-    {"extra backoff reaching PF10 aborts", TEST_HOME_PHASE_BACKOFF_EXTRA, TEST_X_STATE(RUNNING, NONE, 1U, 0U, 0U), 0U, 3U},
-    {"extra backoff stopped aborts", TEST_HOME_PHASE_BACKOFF_EXTRA, TEST_X_STATE(STOPPED, END_LIMIT, 0U, 50U, 0U), 0U, 3U},
-    {"extra backoff with a short move aborts", TEST_HOME_PHASE_BACKOFF_EXTRA, TEST_X_STATE(COMPLETE, NONE, 0U, 50U, 0U), 0U, 3U},
-    {"extra backoff keeps running", TEST_HOME_PHASE_BACKOFF_EXTRA, TEST_X_STATE(RUNNING, NONE, 0U, 0U, 0U), 1U, 3U},
-    {"extra backoff with idle hardware aborts", TEST_HOME_PHASE_BACKOFF_EXTRA, TEST_X_STATE(READY, NONE, 0U, 0U, 0U), 0U, 3U},
-
-    {"fine seek PF10 stop with released switch aborts", TEST_HOME_PHASE_FINE_SEEK, TEST_X_STATE(STOPPED, START_LIMIT, 0U, 0U, 0U), 0U, 4U},
-    {"fine seek keeps running", TEST_HOME_PHASE_FINE_SEEK, TEST_X_STATE(RUNNING, NONE, 0U, 0U, 0U), 1U, 4U},
-    {"fine seek fault aborts", TEST_HOME_PHASE_FINE_SEEK, TEST_X_STATE(FAULT_TIMING, NONE, 0U, 0U, 0U), 0U, 4U},
-    {"fine seek completing without PF10 aborts", TEST_HOME_PHASE_FINE_SEEK, TEST_X_STATE(COMPLETE, NONE, 0U, 400U, 0U), 0U, 4U},
-    {"fine seek with idle hardware aborts", TEST_HOME_PHASE_FINE_SEEK, TEST_X_STATE(READY, NONE, 0U, 0U, 0U), 0U, 4U},
+    {"approach PF10 stop with released switch aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(STOPPED, START_LIMIT, 0U), 0U, 3U},
+    {"approach keeps running", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(RUNNING, NONE, 0U), 1U, 3U},
+    {"approach fault aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(FAULT_TIMING, NONE, 0U), 0U, 3U},
+    {"approach completing without PF10 aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(COMPLETE, NONE, 0U), 0U, 3U},
+    {"approach with idle hardware aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(READY, NONE, 0U), 0U, 3U},
 };
 
 static void test_home_phase_outcomes(void) {
@@ -1236,7 +1252,7 @@ static void test_home_start_failures(void) {
     fake_x_failing_start = 1U;
     fake_x_failed_start_status = MOTION_HARDWARE_X_STATUS_STOPPED;
     /* The hardware refuses to move into a pressed PF10 and records it as the stop reason. */
-    script_x_state(0U, MOTION_HARDWARE_X_STATUS_READY, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
+    script_x_state(0U, MOTION_HARDWARE_X_STATUS_READY, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
     script_home_polls(0U);
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 2U, "seek blocked by a pressed PF10 continues with the backoff");
@@ -1255,11 +1271,11 @@ static void test_home_start_failures(void) {
     context = valid_motion_context();
     fake_x_failing_start = 2U;
     fake_x_failed_start_status = MOTION_HARDWARE_X_STATUS_STOPPED;
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U, 0U);
-    script_home_polls(1U);
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_STOPPED, MOTION_HARDWARE_X_STOP_REASON_START_LIMIT, 1U);
+    script_home_polls(2U);
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 2U, "backoff start is attempted");
-    expect_u32(fake_x_stop_requests, 1U, "failed backoff start aborts homing even when the axis reports STOPPED");
+    expect_u32(fake_x_stop_requests, 1U, "a backoff blocked at its start aborts homing on the next poll");
     expect_u32(test_last_receive_timeout, osWaitForever, "failed backoff start ends homing");
 }
 
@@ -1290,7 +1306,7 @@ static void run_command_during_home(MotionTaskContext_t *context, const CommandD
     *context = valid_motion_context();
     script_read(0U, osOK, &test_home_x_command);
     script_read(1U, osOK, command);
-    script_x_state(1U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(1U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(context);
 }
@@ -1328,7 +1344,7 @@ static void test_home_is_refused_when_it_cannot_start(void) {
     reset_receive_script();
     context = valid_motion_context();
     script_read(0U, osOK, &test_home_x_command);
-    script_x_state(0U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U, 0U);
+    script_x_state(0U, MOTION_HARDWARE_X_STATUS_RUNNING, MOTION_HARDWARE_X_STOP_REASON_NONE, 0U);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 0U, "HOME is ignored while the axis is moving");
@@ -1476,8 +1492,10 @@ int main(void) {
     test_stop_request_and_pipeline_reset();
     test_home_fast_seek_moves_toward_start_and_backs_off_on_pf10();
     test_home_fast_seek_aborts_on_end_limit();
-    test_home_completes_only_on_pf10_during_fine_seek();
+    test_home_completes_only_on_pf10_during_approach();
     test_home_backoff_aborts_when_stopped_by_end_limit();
+    test_home_backoff_continues_while_pf10_flickers();
+    test_both_limits_active_refuse_homing_and_calibration();
     test_successful_receive_marks_dequeue();
     test_fifo_commands_are_dequeued_once();
     test_receive_error_does_not_count_as_dequeue();

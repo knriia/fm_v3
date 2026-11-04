@@ -73,10 +73,17 @@ MotionHardwareXStatus_t motion_hardware_x_ready_after_home(void);
 MotionHardwareXStatus_t motion_hardware_x_get_status(void);
 MotionHardwareXStopReason_t motion_hardware_x_get_last_stop_reason(void);
 uint8_t motion_hardware_x_start_limit_is_active(void);
-uint8_t motion_hardware_x_take_start_limit_release_event(void);
+uint8_t motion_hardware_x_end_limit_is_active(void);
 uint32_t motion_hardware_x_get_last_jog_steps_completed(void);
+/* While armed, the PF10 release during a move toward PF9 stops that move. */
 void motion_hardware_x_arm_start_limit_release_stop(void);
 void motion_hardware_x_disarm_start_limit_release_stop(void);
+
+/* Runs in interrupt context: must be short and must not block. */
+typedef void (*MotionHardwareXStartLimitHook_t)(void);
+/* One shot: `hook` runs in the same interrupt that stops the next move on PF10, so it sees the exact switch point.
+ * Any stop clears it; NULL disarms it. */
+void motion_hardware_x_arm_start_limit_hook(MotionHardwareXStartLimitHook_t hook);
 
 /* Called only by the matching CMSIS interrupt handlers. */
 void motion_hardware_x_timer_irq(void);
