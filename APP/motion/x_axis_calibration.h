@@ -6,9 +6,16 @@
 
 #include <stdint.h>
 
-/* Bring-up values: tiny and slow on purpose, to be raised once the mechanics are known. */
-#define X_AXIS_CALIBRATION_MEASURE_STEPS 10U
-#define X_AXIS_CALIBRATION_MEASURE_STEP_RATE_HZ 10U
+/* After the reversal at the end switch this move takes up the belt slack, so the measurement does not include it.
+ * About 1 mm at 1/40000 and 2 mm at 1/20000 microstepping. */
+#define X_AXIS_CALIBRATION_TAKE_UP_STEPS 2000U
+/* The measured stretch: about 25 mm at 1/40000 and 50 mm at 1/20000, well inside the travel, so the 1 um scale
+ * resolution stays far below 0.01 %. */
+#define X_AXIS_CALIBRATION_MEASURE_STEPS 50000U
+/* Both moves ramp up and down; the scale is read only at rest, so the ramp itself adds no error. */
+#define X_AXIS_CALIBRATION_MEASURE_INITIAL_STEP_RATE_HZ 100U
+#define X_AXIS_CALIBRATION_MEASURE_STEP_RATE_HZ 2000U
+#define X_AXIS_CALIBRATION_MEASURE_ACCELERATION_STEPS_PER_S2 2000U
 /* Seek toward the end switch; the switch, not the step count, ends it. */
 #define X_AXIS_CALIBRATION_SEEK_INITIAL_STEP_RATE_HZ 1000U
 #define X_AXIS_CALIBRATION_SEEK_STEP_RATE_HZ 50000U
@@ -17,7 +24,9 @@
 typedef enum {
     X_AXIS_CALIBRATION_PHASE_IDLE = 0,
     X_AXIS_CALIBRATION_PHASE_SEEK_END,
-    X_AXIS_CALIBRATION_PHASE_MEASURE
+    X_AXIS_CALIBRATION_PHASE_MEASURE,
+    /* Runs between SEEK_END and MEASURE; appended so the values in the diagnostics frame stay the same. */
+    X_AXIS_CALIBRATION_PHASE_TAKE_UP
 } XAxisCalibrationPhase_t;
 
 typedef enum {
@@ -40,7 +49,7 @@ typedef struct {
 } XAxisCalibration_t;
 
 /* Starts at the homed start switch with the scale zeroed there: drives to the end switch to measure the travel,
- * then makes one slow measuring move back toward the start. */
+ * takes up the slack back toward the start, then measures one long move further toward the start. */
 XAxisCalibrationResult_t
 x_axis_calibration_begin(XAxisCalibration_t *calibration, const MotionHardwareXConfig_t *config);
 /* Supervises the active phase; on OK `result` holds the measured axis values. */

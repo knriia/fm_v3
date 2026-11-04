@@ -91,7 +91,7 @@ static void test_constant_rate_move_initializes_once_and_starts_jog(void) {
     const MotionHardwareXConfig_t config = make_config();
     MotionHardwareXStatus_t hardware_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
 
-    assert(x_axis_bench_start(&config, -3, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_STARTED);
+    assert(x_axis_bench_start_profile(&config, -3, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_STARTED);
     assert(hardware_status == MOTION_HARDWARE_X_STATUS_STARTING);
     assert(fake_init_calls == 1U);
     assert(fake_start_calls == 1U);
@@ -101,7 +101,7 @@ static void test_constant_rate_move_initializes_once_and_starts_jog(void) {
     assert(fake_last_acceleration == 0U);
 
     fake_status = MOTION_HARDWARE_X_STATUS_COMPLETE;
-    assert(x_axis_bench_start(&config, 2, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_STARTED);
+    assert(x_axis_bench_start_profile(&config, 2, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_STARTED);
     assert(fake_init_calls == 1U);
 }
 
@@ -124,15 +124,15 @@ static void test_invalid_arguments_do_not_touch_hardware(void) {
     const MotionHardwareXConfig_t config = make_config();
     MotionHardwareXStatus_t hardware_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
 
-    assert(x_axis_bench_start(NULL, 1, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
-    assert(x_axis_bench_start(&config, 1, 100U, NULL) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
-    assert(x_axis_bench_start(&config, 0, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
-    assert(x_axis_bench_start(&config, 1, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(NULL, 1, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(&config, 1, 100U, 100U, 0U, NULL) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(&config, 0, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(&config, 1, 0U, 0U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
     assert(
-        x_axis_bench_start(&config, (int32_t)X_AXIS_BENCH_MAX_STEPS + 1, 100U, &hardware_status) ==
+        x_axis_bench_start_profile(&config, (int32_t)X_AXIS_BENCH_MAX_STEPS + 1, 100U, 100U, 0U, &hardware_status) ==
         X_AXIS_BENCH_STATUS_INVALID_ARGUMENT
     );
-    assert(x_axis_bench_start(&config, INT32_MIN, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(&config, INT32_MIN, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
     assert(
         x_axis_bench_start_profile(&config, 1, 100U, 10U, 1000U, &hardware_status) ==
         X_AXIS_BENCH_STATUS_INVALID_ARGUMENT
@@ -151,8 +151,8 @@ static void test_rate_is_limited_by_driver_timing(void) {
     MotionHardwareXStatus_t hardware_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
 
     /* 5000 ns pulse + 2500 ns low time => at most 133333 Hz. */
-    assert(x_axis_bench_start(&config, 1, 133333U, &hardware_status) == X_AXIS_BENCH_STATUS_STARTED);
-    assert(x_axis_bench_start(&config, 1, 133334U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(&config, 1, 133333U, 133333U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_STARTED);
+    assert(x_axis_bench_start_profile(&config, 1, 133334U, 133334U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
     assert(
         x_axis_bench_start_profile(&config, 1, 10U, 133334U, 1000U, &hardware_status) ==
         X_AXIS_BENCH_STATUS_INVALID_ARGUMENT
@@ -167,7 +167,7 @@ static void test_zero_driver_timing_rejects_any_rate(void) {
     config.step_low_time_ns = 0U;
     MotionHardwareXStatus_t hardware_status = MOTION_HARDWARE_X_STATUS_UNINITIALIZED;
 
-    assert(x_axis_bench_start(&config, 1, 1U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
+    assert(x_axis_bench_start_profile(&config, 1, 1U, 1U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_INVALID_ARGUMENT);
     assert(fake_start_calls == 0U);
 }
 
@@ -182,18 +182,18 @@ static void test_busy_fault_and_start_error(void) {
     };
     for (size_t index = 0U; index < sizeof(busy_statuses) / sizeof(busy_statuses[0]); ++index) {
         reset_fakes(busy_statuses[index]);
-        assert(x_axis_bench_start(&config, 1, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_BUSY);
+        assert(x_axis_bench_start_profile(&config, 1, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_BUSY);
         assert(hardware_status == busy_statuses[index]);
         assert(fake_start_calls == 0U);
     }
 
     reset_fakes(MOTION_HARDWARE_X_STATUS_FAULT_TIMING);
-    assert(x_axis_bench_start(&config, 1, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_HARDWARE_ERROR);
+    assert(x_axis_bench_start_profile(&config, 1, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_HARDWARE_ERROR);
     assert(hardware_status == MOTION_HARDWARE_X_STATUS_FAULT_TIMING);
 
     reset_fakes(MOTION_HARDWARE_X_STATUS_STOPPED);
     fake_start_status = MOTION_HARDWARE_X_STATUS_FAULT_TIMING;
-    assert(x_axis_bench_start(&config, 1, 100U, &hardware_status) == X_AXIS_BENCH_STATUS_HARDWARE_ERROR);
+    assert(x_axis_bench_start_profile(&config, 1, 100U, 100U, 0U, &hardware_status) == X_AXIS_BENCH_STATUS_HARDWARE_ERROR);
     assert(hardware_status == MOTION_HARDWARE_X_STATUS_FAULT_TIMING);
     assert(fake_start_calls == 1U);
 }
