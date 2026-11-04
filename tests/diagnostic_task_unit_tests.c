@@ -113,8 +113,9 @@ void command_decoder_get_diagnostics(CommandDecoderDiagnostics *diagnostics) {
 
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) { *diagnostics = test_motion_task_diagnostics; }
 
-void motion_task_get_x_axis_diagnostics(MotionAxisDiagnostics *diagnostics) {
-    *diagnostics = (MotionAxisDiagnostics){.travel_um = 301000U, .scale_position_um = -5};
+void motion_task_get_axis_diagnostics(MotionAxis_t axis, MotionAxisDiagnostics *diagnostics) {
+    *diagnostics = axis == MOTION_AXIS_X ? (MotionAxisDiagnostics){.travel_um = 301000U, .scale_position_um = -5}
+                                         : (MotionAxisDiagnostics){.travel_um = 402000U, .scale_position_um = 7};
 }
 
 void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnostics) {
@@ -519,6 +520,8 @@ static void test_diagnostic_frame_contents(void) {
     expect_u32(payload->execution_buffer.underruns, 2U, "execution buffer underruns");
     expect_u32(payload->x_axis.travel_um, 301000U, "X axis");
     expect_u32((uint32_t)payload->x_axis.scale_position_um, (uint32_t)-5, "X axis scale");
+    expect_u32(payload->y_axis.travel_um, 402000U, "Y axis");
+    expect_u32((uint32_t)payload->y_axis.scale_position_um, 7U, "Y axis scale");
     expect_u32(payload->ethernet.link_up, 1U, "Ethernet");
     expect_u32(payload->lwip.mailbox_errors, 3U, "LwIP");
 }

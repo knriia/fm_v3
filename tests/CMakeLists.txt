@@ -99,19 +99,20 @@ add_executable(calibration_storage_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
 )
 
-add_executable(x_axis_calibration_unit_tests
-    x_axis_calibration_unit_tests.c
-    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/x_axis_calibration.c
+add_executable(axis_calibration_run_unit_tests
+    axis_calibration_run_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/axis_calibration_run.c
 )
 
-add_executable(x_axis_bench_unit_tests
-    x_axis_bench_unit_tests.c
-    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/x_axis_bench.c
+add_executable(axis_bench_unit_tests
+    axis_bench_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/axis_bench.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/execution_buffer.c
 )
 
 target_include_directories(diagnostic_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
@@ -124,6 +125,7 @@ target_include_directories(diagnostic_protocol_tests PRIVATE
 
 target_include_directories(diagnostic_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/network
@@ -216,13 +218,13 @@ target_include_directories(calibration_storage_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
 )
 
-target_include_directories(x_axis_calibration_unit_tests PRIVATE
+target_include_directories(axis_calibration_run_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/ENC
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
 )
 
-target_include_directories(x_axis_bench_unit_tests PRIVATE
+target_include_directories(axis_bench_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
@@ -302,7 +304,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
-    target_compile_options(x_axis_calibration_unit_tests PRIVATE
+    target_compile_options(axis_calibration_run_unit_tests PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -312,7 +314,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
-    target_compile_options(x_axis_bench_unit_tests PRIVATE
+    target_compile_options(axis_bench_unit_tests PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -373,5 +375,5 @@ add_test(NAME motion_planner_unit_tests COMMAND motion_planner_unit_tests)
 add_test(NAME motion_execution_unit_tests COMMAND motion_execution_unit_tests)
 add_test(NAME step_generator_task_unit_tests COMMAND step_generator_task_unit_tests)
 add_test(NAME calibration_storage_unit_tests COMMAND calibration_storage_unit_tests)
-add_test(NAME x_axis_calibration_unit_tests COMMAND x_axis_calibration_unit_tests)
-add_test(NAME x_axis_bench_unit_tests COMMAND x_axis_bench_unit_tests)
+add_test(NAME axis_calibration_run_unit_tests COMMAND axis_calibration_run_unit_tests)
+add_test(NAME axis_bench_unit_tests COMMAND axis_bench_unit_tests)
