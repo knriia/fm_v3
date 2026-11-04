@@ -72,6 +72,20 @@ typedef enum {
 /* Runs in interrupt context: must be short and must not block. */
 typedef void (*MotionAxisHardwareStartLimitHook_t)(void);
 
+#define MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE UINT32_MAX
+
+/* Step-timer health of one axis, sent in the diagnostic frame. */
+typedef struct {
+    uint32_t status; /* MotionAxisHardwareStatus_t */
+    /* Moves stopped with MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING since power-up, mostly missed step deadlines. */
+    uint32_t timing_faults;
+    /* Longest step-timer interrupt since the last peak reset. */
+    uint32_t isr_max_ns;
+    /* Least time left before a step deadline when the interrupt loaded it, since the last peak reset;
+     * MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE until a step was loaded. Near 0 means the axis is close to a fault. */
+    uint32_t min_slack_ns;
+} MotionAxisHardwareTiming_t;
+
 /* Every call takes the axis; an axis outside MotionAxis_t is ignored (status UNINITIALIZED, values 0).
  * Electrical levels and driver timing are mandatory; no board defaults are assumed. */
 MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const MotionAxisHardwareConfig_t *config);
@@ -103,6 +117,10 @@ void motion_axis_hardware_disarm_start_limit_release_stop(MotionAxis_t axis);
 /* One shot: `hook` runs in the same interrupt that stops the next move on the start switch, so it sees the exact
  * switch point. Any stop clears it; NULL disarms it. */
 void motion_axis_hardware_arm_start_limit_hook(MotionAxis_t axis, MotionAxisHardwareStartLimitHook_t hook);
+/* An unknown axis leaves `timing` untouched. */
+void motion_axis_hardware_get_timing(MotionAxis_t axis, MotionAxisHardwareTiming_t *timing);
+/* Starts a new measurement of isr_max_ns and min_slack_ns; timing_faults keeps counting. */
+void motion_axis_hardware_reset_timing_peaks(MotionAxis_t axis);
 
 /* Called only by the CMSIS interrupt handlers: the axis timer vectors, and the EXTI vectors with the pending lines
  * they own (already cleared); lines of every axis may be passed together. */

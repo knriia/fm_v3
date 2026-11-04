@@ -122,6 +122,14 @@ add_link_options(-T ${LINKER_SCRIPT})
 
 add_executable(${PROJECT_NAME}.elf ${SOURCES} ${LINKER_SCRIPT})
 
+# The step timer interrupts must meet their step deadlines in every build type, so their code is always optimized.
+# -fno-math-errno lets sqrt() become a single VSQRT instruction.
+set_source_files_properties(
+        BSP/MCU/motion_axis_hardware.c
+        APP/motion/step_executor.c
+        APP/motion/execution_buffer.c
+        PROPERTIES COMPILE_OPTIONS "-O2;-fno-math-errno")
+
 set(HEX_FILE ${PROJECT_BINARY_DIR}/${PROJECT_NAME}.hex)
 set(BIN_FILE ${PROJECT_BINARY_DIR}/${PROJECT_NAME}.bin)
 

@@ -66,6 +66,7 @@ typedef struct {
     uint32_t init_receive_calls;
     uint32_t stop_requests;
     uint32_t clear_fault_calls;
+    uint32_t timing_peak_resets;
     uint32_t ready_after_home_calls;
     uint32_t bench_starts;
     int32_t bench_last_signed_steps;
@@ -258,6 +259,8 @@ void motion_axis_hardware_disarm_start_limit_release_stop(MotionAxis_t axis) { (
 void motion_axis_hardware_arm_start_limit_hook(MotionAxis_t axis, MotionAxisHardwareStartLimitHook_t hook) {
     fake_axes[axis].start_limit_hook = hook;
 }
+
+void motion_axis_hardware_reset_timing_peaks(MotionAxis_t axis) { ++fake_axes[axis].timing_peak_resets; }
 
 void encoder_ox_reset_coordinate(void) {}
 
@@ -1263,6 +1266,9 @@ static void test_stop_without_fault_keeps_homing(void) {
     expect_u32(fake_x_stop_requests, 1U, "STOP requests an X hardware stop");
     expect_u32(fake_x_clear_fault_calls, 0U, "STOP without a fault does not clear anything");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "homing survives a plain STOP");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(fake_axes[axis].timing_peak_resets, 1U, "STOP starts a new step-timing measurement on every axis");
+    }
 
     reset_receive_script();
     context = valid_motion_context();
@@ -1828,7 +1834,7 @@ static void test_z_home_and_calibration(void) {
     run_command_with_polls(&context, &calibrate_z, 7U);
     expect_u32(fake_calibration_last_axis, MOTION_AXIS_Z, "the procedure runs on Z");
     expect_u32(fake_calibration_last_settings->measure_steps, 233600U, "Z measures 12 mm of its screw");
-    expect_u32(fake_calibration_last_settings->seek.target_step_rate_hz, 40000U, "Z seeks its end at 40 kHz");
+    expect_u32(fake_calibration_last_settings->seek.target_step_rate_hz, 80000U, "Z seeks its end at 80 kHz");
     expect_u32(fake_calibration_last_settings->seek.acceleration_steps_per_s2, 320000U, "Z ramps up its seek");
     expect_u32(fake_z.bench_last_target_rate_hz, 4800U, "Z approaches its home switch slowly");
     expect_u32(fake_z.bench_last_initial_rate_hz, 800U, "Z starts its approach below the target rate");
@@ -1837,7 +1843,7 @@ static void test_z_home_and_calibration(void) {
     MotionAxisDiagnostics axis = {0};
     motion_task_get_axis_diagnostics(MOTION_AXIS_Z, &axis);
     expect_u32(axis.travel_um, 50300U, "Z diagnostics report the Z travel");
-    expect_u32(axis.max_speed_um_per_s, 20000U, "Z speed follows from its own 40 kHz motor limit");
+    expect_u32(axis.max_speed_um_per_s, 40000U, "Z speed follows from its own 80 kHz motor limit");
     expect_u32((uint32_t)axis.scale_position_um, (uint32_t)-42, "Z diagnostics read the Z scale");
 }
 

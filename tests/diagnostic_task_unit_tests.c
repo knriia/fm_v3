@@ -4,10 +4,10 @@
 #include "diagnostic_dto.h"
 #include "ethernet_port.h"
 #include "ethernetif.h"
-#include "motion/plan_buffer.h"
 #include "FreeRTOS.h"
 #include "lwip/api.h"
 #include "lwip/err.h"
+#include "motion/plan_buffer.h"
 #include "task_context.h"
 
 #include <setjmp.h>
@@ -120,6 +120,15 @@ void motion_task_get_axis_diagnostics(MotionAxis_t axis, MotionAxisDiagnostics *
         [MOTION_AXIS_Z] = {.travel_um = 50300U, .scale_position_um = -9},
     };
     *diagnostics = axes[axis];
+}
+
+void motion_axis_hardware_get_timing(MotionAxis_t axis, MotionAxisHardwareTiming_t *timing) {
+    *timing = (MotionAxisHardwareTiming_t){
+        .status = MOTION_AXIS_HARDWARE_STATUS_RUNNING,
+        .timing_faults = 10U + (uint32_t)axis,
+        .isr_max_ns = 1000U + (uint32_t)axis,
+        .min_slack_ns = 5000U + (uint32_t)axis,
+    };
 }
 
 void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnostics) {
@@ -357,7 +366,6 @@ static void test_command_channel_mapping(void) {
     expect_u32(channel.commands_received, 69U, "commands received");
     expect_u32(channel.commands_rejected, 70U, "commands rejected");
     expect_u32((uint32_t)channel.decoder_last_error, (uint32_t)-83, "decoder last error");
-
 }
 
 static void test_ethernet_mapping(void) {
@@ -530,6 +538,12 @@ static void test_diagnostic_frame_contents(void) {
     expect_u32((uint32_t)payload->z_axis.scale_position_um, (uint32_t)-9, "Z axis scale");
     expect_u32(payload->ethernet.link_up, 1U, "Ethernet");
     expect_u32(payload->lwip.mailbox_errors, 3U, "LwIP");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(payload->step_timing[axis].status, MOTION_AXIS_HARDWARE_STATUS_RUNNING, "step timing status");
+        expect_u32(payload->step_timing[axis].timing_faults, 10U + axis, "step timing faults follow the axis order");
+        expect_u32(payload->step_timing[axis].isr_max_ns, 1000U + axis, "step timing ISR maximum");
+        expect_u32(payload->step_timing[axis].min_slack_ns, 5000U + axis, "step timing slack");
+    }
 }
 
 static void test_diagnostic_task_network_paths(void) {

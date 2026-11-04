@@ -5,11 +5,15 @@
 #include "stm32h723xx.h"
 #include "system_stm32h7xx.h"
 
+#include <math.h>
 #include <stddef.h>
 
 #define MOTION_AXIS_TIMER_IRQ_PRIORITY 5U
 #define MOTION_AXIS_LIMIT_IRQ_PRIORITY 4U
 #define MOTION_AXIS_NANOSECONDS_PER_SECOND 1000000000ULL
+/* Fits 32 bits, so the step interrupt divides by a step rate with the hardware divider, not a library call. */
+#define MOTION_AXIS_NANOSECONDS_PER_SECOND_U32 1000000000U
+#define MOTION_AXIS_DWT_UNLOCK_KEY 0xC5ACCE55U
 #define MOTION_AXIS_MAX_PERIOD_TICKS 65536ULL
 #define MOTION_AXIS_ISR_GUARD_TICKS 256U
 #define MOTION_AXIS_JOG_MAX_STEPS 1000000U
@@ -201,14 +205,22 @@ typedef struct {
     volatile MotionAxisHardwareStopReason_t limit_deceleration_requested;
     /* Timer interrupt only: the switch this move is braking for, or NONE. */
     MotionAxisHardwareStopReason_t limit_deceleration_reason;
+    /* Step-timer health; written by the timer interrupt, read by diagnostics. */
+    volatile uint32_t timing_faults;
+    volatile uint32_t isr_max_cycles;
+    /* In timer kernel clocks, so the interrupt only multiplies by the prescaler. */
+    volatile uint32_t min_slack_timer_clocks;
 } MotionAxisHardwareContext_t;
 
 typedef MotionAxisHardwareContext_t Ctx_t;
 
 static MotionAxisHardwareContext_t motion_axis_contexts[MOTION_AXIS_HARDWARE_COUNT] = {
-    [MOTION_AXIS_X] = {.board = &motion_axis_boards[MOTION_AXIS_X]},
-    [MOTION_AXIS_Y] = {.board = &motion_axis_boards[MOTION_AXIS_Y]},
-    [MOTION_AXIS_Z] = {.board = &motion_axis_boards[MOTION_AXIS_Z]},
+    [MOTION_AXIS_X] = {.board = &motion_axis_boards[MOTION_AXIS_X],
+        .min_slack_timer_clocks = MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE},
+    [MOTION_AXIS_Y] = {.board = &motion_axis_boards[MOTION_AXIS_Y],
+        .min_slack_timer_clocks = MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE},
+    [MOTION_AXIS_Z] = {.board = &motion_axis_boards[MOTION_AXIS_Z],
+        .min_slack_timer_clocks = MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE},
 };
 extern uint32_t SystemCoreClock;
 
@@ -415,6 +427,8 @@ static void motion_axis_stop(Ctx_t *c, MotionAxisHardwareStatus_t final_status) 
     c->limit_deceleration_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
     if (motion_axis_status_is_fault(c->status) != 0) {
         final_status = c->status;
+    } else if (final_status == MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING) {
+        ++c->timing_faults;
     }
     c->status = final_status;
 }
@@ -431,25 +445,11 @@ static uint64_t motion_axis_next_jog_interval_ns(Ctx_t *c) {
     return interval_ns;
 }
 
-static uint64_t motion_axis_integer_sqrt(uint64_t value) {
-    uint64_t result = 0U;
-    uint64_t bit = 1ULL << 62U;
+/* One VSQRT.F64 instead of a 64-bit bit-by-bit loop. A double holds the square exactly and its rounded root
+ * truncates to the integer root for rates below 2^26 Hz, far above any step rate. */
+static uint32_t motion_axis_rate_from_square(uint64_t rate_squared) { return (uint32_t)sqrt((double)rate_squared); }
 
-    while (bit > value) {
-        bit >>= 2U;
-    }
-    while (bit != 0U) {
-        if (value >= result + bit) {
-            value -= result + bit;
-            result = (result >> 1U) + bit;
-        } else {
-            result >>= 1U;
-        }
-        bit >>= 2U;
-    }
-    return result;
-}
-
+/* Called on every step, so the constant-rate stretch of a move skips the square root. */
 static uint32_t motion_axis_jog_profile_rate_hz(const Ctx_t *c) {
     const uint32_t initial_rate_hz = c->jog_initial_step_rate_hz;
     const uint32_t target_rate_hz = c->jog_target_step_rate_hz;
@@ -465,6 +465,9 @@ static uint32_t motion_axis_jog_profile_rate_hz(const Ctx_t *c) {
     uint64_t acceleration_rate_squared = initial_rate_squared + 2ULL * acceleration_steps_per_s2 * completed_steps;
     uint64_t deceleration_rate_squared =
         initial_rate_squared + 2ULL * acceleration_steps_per_s2 * remaining_after_next_step;
+    if (acceleration_rate_squared >= target_rate_squared && deceleration_rate_squared >= target_rate_squared) {
+        return target_rate_hz;
+    }
 
     if (acceleration_rate_squared > target_rate_squared) {
         acceleration_rate_squared = target_rate_squared;
@@ -475,7 +478,7 @@ static uint32_t motion_axis_jog_profile_rate_hz(const Ctx_t *c) {
 
     const uint64_t rate_squared =
         acceleration_rate_squared < deceleration_rate_squared ? acceleration_rate_squared : deceleration_rate_squared;
-    uint32_t rate_hz = (uint32_t)motion_axis_integer_sqrt(rate_squared);
+    uint32_t rate_hz = motion_axis_rate_from_square(rate_squared);
     if (rate_hz < initial_rate_hz) {
         rate_hz = initial_rate_hz;
     }
@@ -489,8 +492,8 @@ static void motion_axis_update_jog_step_rate(Ctx_t *c) {
     }
 
     c->jog_step_rate_hz = rate_hz;
-    c->jog_interval_base_ns = MOTION_AXIS_NANOSECONDS_PER_SECOND / rate_hz;
-    c->jog_interval_remainder_ns = (uint32_t)(MOTION_AXIS_NANOSECONDS_PER_SECOND % rate_hz);
+    c->jog_interval_base_ns = MOTION_AXIS_NANOSECONDS_PER_SECOND_U32 / rate_hz;
+    c->jog_interval_remainder_ns = MOTION_AXIS_NANOSECONDS_PER_SECOND_U32 % rate_hz;
     c->jog_interval_remainder_accumulator = 0U;
 }
 
@@ -783,6 +786,14 @@ static volatile uint32_t *motion_axis_compare_register(TIM_TypeDef *timer, uint8
     }
 }
 
+/* The step interrupts time themselves with the DWT cycle counter. Cortex-M7 keeps DWT locked until LAR gets the key;
+ * enabling it again for another axis changes nothing. */
+static void motion_axis_enable_cycle_counter(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR = MOTION_AXIS_DWT_UNLOCK_KEY;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
 static void motion_axis_clear_timer_irqs(const Ctx_t *c) {
     for (uint32_t index = 0U; index < c->board->timer_irq_count; ++index) {
         NVIC_ClearPendingIRQ(c->board->timer_irq[index]);
@@ -806,6 +817,7 @@ MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const Mo
     const uint32_t channel_shift = ((uint32_t)board->channel - 1U) * 4U;
     *c = (Ctx_t){0};
     c->board = board;
+    c->min_slack_timer_clocks = MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE;
     c->step_compare = motion_axis_compare_register(board->timer, board->channel);
     c->step_compare_flag = TIM_SR_CC1IF << (board->channel - 1U);
     c->step_compare_interrupt = TIM_DIER_CC1IE << (board->channel - 1U);
@@ -825,6 +837,7 @@ MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const Mo
     (void)RCC->AHB4ENR;
     __DSB();
 
+    motion_axis_enable_cycle_counter();
     motion_axis_configure_gpio(c);
     motion_axis_configure_exti(c);
     motion_axis_configure_timer(c);
@@ -959,8 +972,8 @@ MotionAxisHardwareStatus_t motion_axis_hardware_start_jog_profile(
     c->jog_target_step_rate_hz = target_step_rate_hz;
     c->jog_acceleration_steps_per_s2 = acceleration_steps_per_s2;
     c->jog_step_rate_hz = initial_step_rate_hz;
-    c->jog_interval_base_ns = MOTION_AXIS_NANOSECONDS_PER_SECOND / initial_step_rate_hz;
-    c->jog_interval_remainder_ns = (uint32_t)(MOTION_AXIS_NANOSECONDS_PER_SECOND % initial_step_rate_hz);
+    c->jog_interval_base_ns = MOTION_AXIS_NANOSECONDS_PER_SECOND_U32 / initial_step_rate_hz;
+    c->jog_interval_remainder_ns = MOTION_AXIS_NANOSECONDS_PER_SECOND_U32 % initial_step_rate_hz;
     c->jog_interval_remainder_accumulator = 0U;
 
     const uint8_t step_mask = motion_axis_step_mask(c);
@@ -1161,6 +1174,15 @@ static void motion_axis_timer_update(Ctx_t *c) {
     motion_axis_exit_critical(primask);
 }
 
+/* Time left until the next step is due, kept as the minimum since the last peak reset. */
+static void motion_axis_record_slack(Ctx_t *c, uint64_t next_interval_ticks, uint32_t elapsed_ticks) {
+    const uint64_t slack_ticks = next_interval_ticks > elapsed_ticks ? next_interval_ticks - elapsed_ticks : 0U;
+    const uint64_t slack_clocks = slack_ticks * c->prescaler_divider;
+    if (slack_clocks < c->min_slack_timer_clocks) {
+        c->min_slack_timer_clocks = (uint32_t)slack_clocks;
+    }
+}
+
 /* Compare interrupt while RUNNING: one STEP pulse has ended, so the next interval is loaded. */
 static void motion_axis_timer_step(Ctx_t *c) {
     TIM_TypeDef *timer = c->board->timer;
@@ -1239,7 +1261,9 @@ static void motion_axis_timer_step(Ctx_t *c) {
         motion_axis_set_direction(c, next_direction_positive);
     }
 
-    if (next_interval_ticks <= (uint64_t)timer->CNT + MOTION_AXIS_ISR_GUARD_TICKS +
+    const uint32_t elapsed_ticks = timer->CNT;
+    motion_axis_record_slack(c, next_interval_ticks, elapsed_ticks);
+    if (next_interval_ticks <= (uint64_t)elapsed_ticks + MOTION_AXIS_ISR_GUARD_TICKS +
                                    (direction_changed != 0U ? c->direction_setup_ticks : 0U)) {
         motion_axis_stop(c, MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING);
         motion_axis_exit_critical(primask);
@@ -1260,11 +1284,7 @@ static void motion_axis_timer_step(Ctx_t *c) {
     motion_axis_exit_critical(primask);
 }
 
-void motion_axis_hardware_timer_irq(MotionAxis_t axis) {
-    Ctx_t *c = motion_axis_context(axis);
-    if (c == NULL) {
-        return;
-    }
+static void motion_axis_timer_irq_dispatch(Ctx_t *c) {
     const uint32_t status = c->board->timer->SR;
     if (c->stop_requested != 0U && motion_axis_status_is_active(c->status) != 0) {
         if (c->jog_mode != 0U && c->status == MOTION_AXIS_HARDWARE_STATUS_RUNNING &&
@@ -1282,6 +1302,55 @@ void motion_axis_hardware_timer_irq(MotionAxis_t axis) {
     if ((status & c->step_compare_flag) != 0U && c->status == MOTION_AXIS_HARDWARE_STATUS_RUNNING) {
         motion_axis_timer_step(c);
     }
+}
+
+void motion_axis_hardware_timer_irq(MotionAxis_t axis) {
+    Ctx_t *c = motion_axis_context(axis);
+    if (c == NULL) {
+        return;
+    }
+    /* DWT counts core cycles; the difference stays right across a counter wrap. */
+    const uint32_t start_cycles = DWT->CYCCNT;
+    motion_axis_timer_irq_dispatch(c);
+    const uint32_t cycles = DWT->CYCCNT - start_cycles;
+    if (cycles > c->isr_max_cycles) {
+        c->isr_max_cycles = cycles;
+    }
+}
+
+static uint32_t motion_axis_scale_to_ns(uint32_t count, uint32_t clock_hz) {
+    if (clock_hz == 0U) {
+        return 0U;
+    }
+    const uint64_t ns = (uint64_t)count * MOTION_AXIS_NANOSECONDS_PER_SECOND / clock_hz;
+    return ns > UINT32_MAX ? UINT32_MAX : (uint32_t)ns;
+}
+
+void motion_axis_hardware_get_timing(MotionAxis_t axis, MotionAxisHardwareTiming_t *timing) {
+    const Ctx_t *c = motion_axis_context(axis);
+    if (c == NULL || timing == NULL) {
+        return;
+    }
+    const uint32_t min_slack_clocks = c->min_slack_timer_clocks;
+    *timing = (MotionAxisHardwareTiming_t){
+        .status = (uint32_t)c->status,
+        .timing_faults = c->timing_faults,
+        .isr_max_ns = motion_axis_scale_to_ns(c->isr_max_cycles, SystemCoreClock),
+        .min_slack_ns = min_slack_clocks == MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE
+                            ? MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE
+                            : motion_axis_scale_to_ns(min_slack_clocks, c->timer_clock_hz),
+    };
+}
+
+void motion_axis_hardware_reset_timing_peaks(MotionAxis_t axis) {
+    Ctx_t *c = motion_axis_context(axis);
+    if (c == NULL) {
+        return;
+    }
+    const uint32_t primask = motion_axis_enter_critical();
+    c->isr_max_cycles = 0U;
+    c->min_slack_timer_clocks = MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE;
+    motion_axis_exit_critical(primask);
 }
 
 static void motion_axis_limit_irq_for(Ctx_t *c, uint32_t pending_lines) {
