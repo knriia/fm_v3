@@ -14,8 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 656U
-#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 664U
+#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 704U
+#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 712U
 
 struct netif gnetif;
 struct stats lwip_stats;
@@ -127,8 +127,9 @@ static void test_payload_layout(void) {
     expect_u32(offsetof(DiagnosticPayloadDTO_t, execution_buffer), 392U, "execution buffer offset");
     expect_u32(offsetof(DiagnosticPayloadDTO_t, x_axis), 400U, "X axis offset");
     expect_u32(offsetof(DiagnosticPayloadDTO_t, y_axis), 448U, "Y axis offset");
-    expect_u32(offsetof(DiagnosticPayloadDTO_t, ethernet), 496U, "Ethernet offset");
-    expect_u32(offsetof(DiagnosticPayloadDTO_t, lwip), 556U, "LwIP offset");
+    expect_u32(offsetof(DiagnosticPayloadDTO_t, z_axis), 496U, "Z axis offset");
+    expect_u32(offsetof(DiagnosticPayloadDTO_t, ethernet), 544U, "Ethernet offset");
+    expect_u32(offsetof(DiagnosticPayloadDTO_t, lwip), 604U, "LwIP offset");
     expect_u32(DIAGNOSTIC_TASK_SLOT_COUNT, 9U, "task slot count");
     expect_u32(DIAGNOSTIC_TASK_SLOT_TCPIP, 8U, "tcpip is the last task slot");
 }

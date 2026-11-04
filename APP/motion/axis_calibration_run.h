@@ -1,25 +1,24 @@
 #ifndef FM_V3_AXIS_CALIBRATION_RUN_H
 #define FM_V3_AXIS_CALIBRATION_RUN_H
 
+#include "motion/axis_bench.h"
 #include "motion/axis_calibration.h"
 #include "motion_axis_hardware.h"
 
 #include <stdint.h>
 
-/* After the reversal at the end switch this move takes up the belt slack, so the measurement does not include it.
- * About 1 mm at 1/40000 and 2 mm at 1/20000 microstepping. */
-#define AXIS_CALIBRATION_RUN_TAKE_UP_STEPS 2000U
-/* The measured stretch: about 25 mm at 1/40000 and 50 mm at 1/20000, well inside the travel, so the 1 um scale
- * resolution stays far below 0.01 %. */
-#define AXIS_CALIBRATION_RUN_MEASURE_STEPS 50000U
-/* Both moves ramp up and down; the scale is read only at rest, so the ramp itself adds no error. */
-#define AXIS_CALIBRATION_RUN_MEASURE_INITIAL_STEP_RATE_HZ 100U
-#define AXIS_CALIBRATION_RUN_MEASURE_STEP_RATE_HZ 2000U
-#define AXIS_CALIBRATION_RUN_MEASURE_ACCELERATION_STEPS_PER_S2 2000U
-/* Seek toward the end switch; the switch, not the step count, ends it. */
-#define AXIS_CALIBRATION_RUN_SEEK_INITIAL_STEP_RATE_HZ 1000U
-#define AXIS_CALIBRATION_RUN_SEEK_STEP_RATE_HZ 50000U
-#define AXIS_CALIBRATION_RUN_SEEK_ACCELERATION_STEPS_PER_S2 100000U
+/* Speeds and lengths of the procedure; each axis has its own, since a belt and a screw differ by orders of
+ * magnitude. */
+typedef struct {
+    /* Toward the end switch; the switch, not the step count, ends it. */
+    AxisBenchProfile_t seek;
+    /* Take-up and measurement; the scale is read only at rest, so a ramp adds no error. */
+    AxisBenchProfile_t measure;
+    /* After the reversal at the end switch this move takes up the slack, so the measurement does not include it. */
+    uint32_t take_up_steps;
+    /* The measured stretch; it must fit in the travel together with the take-up. */
+    uint32_t measure_steps;
+} AxisCalibrationRunSettings_t;
 
 /* Values are sent in the diagnostics frame. */
 typedef enum {
@@ -46,6 +45,8 @@ typedef enum {
 
 typedef struct {
     MotionAxis_t axis;
+    /* Set by begin and used while the procedure is active. */
+    const AxisCalibrationRunSettings_t *settings;
     AxisCalibrationRunPhase_t phase;
     uint32_t travel_um;
     int32_t measure_start_um;
@@ -53,9 +54,13 @@ typedef struct {
 
 /* Starts at the homed start switch with the scale zeroed there: drives to the end switch to measure the travel,
  * takes up the slack back toward the start, then measures one long move further toward the start. The scale is
- * read through config->position_reader, which must not be NULL. */
-AxisCalibrationRunResult_t
-axis_calibration_run_begin(AxisCalibrationRun_t *run, MotionAxis_t axis, const MotionAxisHardwareConfig_t *config);
+ * read through config->position_reader, which must not be NULL; `settings` must outlive the procedure. */
+AxisCalibrationRunResult_t axis_calibration_run_begin(
+    AxisCalibrationRun_t *run,
+    MotionAxis_t axis,
+    const MotionAxisHardwareConfig_t *config,
+    const AxisCalibrationRunSettings_t *settings
+);
 /* Supervises the active phase; on OK `result` holds the measured axis values. */
 AxisCalibrationRunResult_t axis_calibration_run_poll(
     AxisCalibrationRun_t *run,

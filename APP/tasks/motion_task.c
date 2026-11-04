@@ -13,23 +13,11 @@
 #include <stddef.h>
 
 /* HOME and CALIBRATE accept any combination of these axes; the axes of one command run at the same time. */
-#define MOTION_TASK_HOME_AXES_MASK (MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK)
+#define MOTION_TASK_HOME_AXES_MASK MOTION_PLANNER_ALL_AXES_MASK
 /* Axes the planned step stream can drive. Until each axis has its own stream, a planned move of any other axis is
  * refused as NOT_HOMED; homing and calibration move those axes directly. */
 #define MOTION_TASK_STREAM_AXES_MASK MOTION_PLANNER_AXIS_X_MASK
 #define MOTION_TASK_HOME_POLL_INTERVAL_MS 1U
-#define MOTION_TASK_HOME_FAST_STEP_RATE_HZ 50000U
-#define MOTION_TASK_HOME_INITIAL_STEP_RATE_HZ 1000U
-#define MOTION_TASK_HOME_ACCELERATION_STEPS_PER_S2 100000U
-/* The fast seek brakes past the start switch, so the backoff has up to 1 mm to cover; its speed does not affect
- * the zero. */
-#define MOTION_TASK_HOME_BACKOFF_STEP_RATE_HZ 2000U
-#define MOTION_TASK_HOME_BACKOFF_INITIAL_STEP_RATE_HZ 100U
-#define MOTION_TASK_HOME_BACKOFF_ACCELERATION_STEPS_PER_S2 2000U
-/* The approach runs slowly so the start switch stops the axis within a step of its edge. */
-#define MOTION_TASK_HOME_SLOW_STEP_RATE_HZ 100U
-#define MOTION_TASK_HOME_SLOW_INITIAL_STEP_RATE_HZ 10U
-#define MOTION_TASK_HOME_SLOW_ACCELERATION_STEPS_PER_S2 500U
 /* Lets the belt come to rest between the backoff and the approach. */
 #define MOTION_TASK_HOME_SETTLE_MS 10U
 /* The start switch, not a step count, ends every homing move; a switch that never changes is a separate open
@@ -40,15 +28,67 @@ static volatile MotionTaskDiagnostics motion_task_diagnostics = {
     .last_planner_status = MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
 };
 
+/* The three homing moves; the switches, not step counts, end them. */
+typedef struct {
+    /* Toward the start switch. */
+    AxisBenchProfile_t fast_seek;
+    /* Away from the start switch until it turns off; its speed does not affect the zero. */
+    AxisBenchProfile_t backoff;
+    /* Back onto the start switch, slowly, so it stops the axis within a step of its edge. */
+    AxisBenchProfile_t approach;
+} MotionTaskHomeSettings_t;
+
 typedef struct {
     MotionAxisHardwareConfig_t hardware;
     /* Zeroes the axis scale; runs in the start-switch interrupt that ends the homing approach. */
     MotionAxisHardwareStartLimitHook_t zero_scale;
+    MotionTaskHomeSettings_t home;
+    AxisCalibrationRunSettings_t calibration;
+    /* Highest step rate the motor still follows; with the calibration it sets the axis speed limit. */
+    uint32_t max_step_rate_hz;
 } MotionTaskAxisConfig_t;
 
-/* Bring-up defaults, the same for both axes: switches are active-high with pull-downs; positive motion points to
+/* X and Y are belt axes at about 0.5 um per step. */
+#define MOTION_TASK_BELT_HOME_SETTINGS                                                                                 \
+    {                                                                                                                  \
+        .fast_seek = {1000U, 25000U, 100000U},                                                                         \
+        .backoff = {100U, 2000U, 2000U},                                                                               \
+        .approach = {10U, 100U, 500U},                                                                                 \
+    }
+
+#define MOTION_TASK_BELT_CALIBRATION_SETTINGS                                                                          \
+    {                                                                                                                  \
+        .seek = {1000U, 25000U, 100000U},                                                                              \
+        .measure = {100U, 2000U, 2000U},                                                                               \
+        .take_up_steps = 2000U,                                                                                        \
+        .measure_steps = 50000U,                                                                                       \
+    }
+
+/* Z drives a screw through a belt: about 335 um per motor turn, travel about 16.3 mm. The driver runs at 6400 pulses
+ * per turn, about 0.052 um per step. Fast moves ramp from 8 kHz to 40 kHz (about 2.1 mm/s) within about 2400 steps
+ * (0.13 mm). At 80 kHz Z faulted whenever X ran fast at the same time. All step counts and rates here assume that
+ * driver setting: scale them together with its divider. */
+#define MOTION_TASK_Z_FAST_PROFILE {8000U, 40000U, 320000U}
+
+#define MOTION_TASK_Z_HOME_SETTINGS                                                                                    \
+    {                                                                                                                  \
+        .fast_seek = MOTION_TASK_Z_FAST_PROFILE,                                                                       \
+        .backoff = {3200U, 16000U, 80000U},                                                                            \
+        .approach = {800U, 4800U, 32000U},                                                                             \
+    }
+
+/* The take-up is about 0.08 mm and the measurement about 12.2 mm. */
+#define MOTION_TASK_Z_CALIBRATION_SETTINGS                                                                             \
+    {                                                                                                                  \
+        .seek = MOTION_TASK_Z_FAST_PROFILE,                                                                            \
+        .measure = {3200U, 32000U, 80000U},                                                                            \
+        .take_up_steps = 1600U,                                                                                        \
+        .measure_steps = 233600U,                                                                                      \
+    }
+
+/* Bring-up defaults, the same for every axis: switches are active-high with pull-downs; positive motion points to
  * the end switch. Both Y motors share one STEP/DIR/ENA wiring, so firmware sees one Y motor. */
-#define MOTION_TASK_AXIS_HARDWARE_CONFIG(position_reader_)                                                             \
+#define MOTION_TASK_AXIS_HARDWARE_CONFIG(position_reader_, limit_deceleration_)                                        \
     {                                                                                                                  \
         .step_active_high = 1U,                                                                                        \
         .enable_active_high = 0U,                                                                                      \
@@ -62,21 +102,38 @@ typedef struct {
         .direction_setup_ns = MOTION_AXIS_HARDWARE_DM556_MIN_DIRECTION_SETUP_NS,                                       \
         .direction_hold_ns = 0U,                                                                                       \
         .enable_setup_ns = MOTION_AXIS_HARDWARE_DM556_MIN_ENABLE_LEAD_NS,                                              \
-        .enable_hold_ns = 0U, /* Brakes a 50 kHz seek within about 2100 steps, i.e. under 1 mm at 1/51200. */          \
-        .limit_deceleration_steps_per_s2 = 600000U,                                                                    \
+        .enable_hold_ns = 0U,                                                                                          \
+        .limit_deceleration_steps_per_s2 = (limit_deceleration_),                                                      \
         .position_reader = (position_reader_),                                                                         \
     }
 
 static const MotionTaskAxisConfig_t motion_task_axis_configs[MOTION_AXIS_HARDWARE_COUNT] = {
     [MOTION_AXIS_X] =
         {
-            .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_ox_get_coordinate),
+            /* Brakes a 25 kHz seek within about 520 steps, i.e. under 0.3 mm at 1/51200. */
+            .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_ox_get_coordinate, 600000U),
             .zero_scale = encoder_ox_reset_coordinate,
+            .home = MOTION_TASK_BELT_HOME_SETTINGS,
+            .calibration = MOTION_TASK_BELT_CALIBRATION_SETTINGS,
+            .max_step_rate_hz = MOTION_TASK_MAX_STEP_RATE_HZ,
         },
     [MOTION_AXIS_Y] =
         {
-            .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_oy_get_coordinate),
+            .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_oy_get_coordinate, 600000U),
             .zero_scale = encoder_oy_reset_coordinate,
+            .home = MOTION_TASK_BELT_HOME_SETTINGS,
+            .calibration = MOTION_TASK_BELT_CALIBRATION_SETTINGS,
+            .max_step_rate_hz = MOTION_TASK_MAX_STEP_RATE_HZ,
+        },
+    [MOTION_AXIS_Z] =
+        {
+            /* Brakes a 40 kHz seek within about 500 steps (0.03 mm) past the switch. */
+            .hardware = MOTION_TASK_AXIS_HARDWARE_CONFIG(encoder_oz_get_coordinate, 1600000U),
+            .zero_scale = encoder_oz_reset_coordinate,
+            .home = MOTION_TASK_Z_HOME_SETTINGS,
+            .calibration = MOTION_TASK_Z_CALIBRATION_SETTINGS,
+            /* About 2.1 mm/s, the fast-move rate. */
+            .max_step_rate_hz = 40000U,
         },
 };
 
@@ -199,16 +256,21 @@ static void motion_task_queue_x_jog(MotionTaskContext_t *context, const CommandD
     motion_task_queue_move(context, &request);
 }
 
-/* Calibrated axes get their planner limits from the measured values; the others keep the context defaults. */
+_Static_assert(MOTION_PLANNER_AXIS_COUNT == MOTION_AXIS_HARDWARE_COUNT, "planner axes index the axis configs");
+
+/* Calibrated axes get their planner limits from the measured values; the others keep the context defaults. The speed
+ * limit uses the lower of the axis motor rate and the planner step rate. */
 static void motion_task_apply_calibration(MotionTaskContext_t *context, const MachineCalibration_t *calibration) {
     for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
         if ((calibration->calibrated_axes_mask & (uint8_t)(1U << axis)) == 0U) {
             continue;
         }
+        const uint32_t axis_rate_hz = motion_task_axis_configs[axis].max_step_rate_hz;
+        const uint32_t planner_rate_hz = context->planner_config.max_step_event_rate_hz;
         MotionPlannerAxisConfig_t axis_config = {0};
         if (axis_calibration_to_planner_axis(
                 &calibration->axis[axis],
-                context->planner_config.max_step_event_rate_hz,
+                axis_rate_hz < planner_rate_hz ? axis_rate_hz : planner_rate_hz,
                 &axis_config
             ) == AXIS_CALIBRATION_STATUS_OK) {
             context->planner_config.axis[axis] = axis_config;
@@ -266,9 +328,7 @@ static void motion_task_home_start_move(
     MotionTaskAxisState_t *state,
     MotionTaskContext_t *context,
     AxisBenchDirection_t direction,
-    uint32_t initial_step_rate_hz,
-    uint32_t target_step_rate_hz,
-    uint32_t acceleration_steps_per_s2,
+    const AxisBenchProfile_t *profile,
     MotionTaskHomePhase_t phase
 ) {
     MotionAxisHardwareStatus_t hardware_status = MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
@@ -277,9 +337,9 @@ static void motion_task_home_start_move(
         motion_task_hardware_config(state->axis),
         direction,
         MOTION_TASK_HOME_MOVE_STEPS,
-        initial_step_rate_hz,
-        target_step_rate_hz,
-        acceleration_steps_per_s2,
+        profile->initial_step_rate_hz,
+        profile->target_step_rate_hz,
+        profile->acceleration_steps_per_s2,
         &hardware_status
     );
 
@@ -297,9 +357,7 @@ static void motion_task_home_start_backoff(MotionTaskAxisState_t *state, MotionT
         state,
         context,
         AXIS_BENCH_TOWARD_END,
-        MOTION_TASK_HOME_BACKOFF_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_HOME_BACKOFF_STEP_RATE_HZ,
-        MOTION_TASK_HOME_BACKOFF_ACCELERATION_STEPS_PER_S2,
+        &motion_task_axis_configs[state->axis].home.backoff,
         MOTION_TASK_HOME_BACKOFF
     );
 }
@@ -311,9 +369,7 @@ static void motion_task_home_start_approach(MotionTaskAxisState_t *state, Motion
         state,
         context,
         AXIS_BENCH_TOWARD_START,
-        MOTION_TASK_HOME_SLOW_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_HOME_SLOW_STEP_RATE_HZ,
-        MOTION_TASK_HOME_SLOW_ACCELERATION_STEPS_PER_S2,
+        &motion_task_axis_configs[state->axis].home.approach,
         MOTION_TASK_HOME_APPROACH
     );
 }
@@ -341,9 +397,7 @@ static void motion_task_home_begin(MotionTaskAxisState_t *state, MotionTaskConte
         state,
         context,
         AXIS_BENCH_TOWARD_START,
-        MOTION_TASK_HOME_INITIAL_STEP_RATE_HZ,
-        MOTION_TASK_HOME_FAST_STEP_RATE_HZ,
-        MOTION_TASK_HOME_ACCELERATION_STEPS_PER_S2,
+        &motion_task_axis_configs[state->axis].home.fast_seek,
         MOTION_TASK_HOME_FAST_SEEK
     );
 }
@@ -448,7 +502,8 @@ static void motion_task_calibration_poll(MotionTaskAxisState_t *state, MotionTas
                                                    : axis_calibration_run_begin(
                                                          &calibration->procedure,
                                                          state->axis,
-                                                         motion_task_hardware_config(state->axis)
+                                                         motion_task_hardware_config(state->axis),
+                                                         &motion_task_axis_configs[state->axis].calibration
                                                      );
         return;
     }

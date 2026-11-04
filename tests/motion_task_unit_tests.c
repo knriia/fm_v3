@@ -45,13 +45,7 @@ static void expect_u32(uint32_t actual, uint32_t expected, const char *message) 
 static void expect_i64(int64_t actual, int64_t expected, const char *message) {
     if (actual != expected) {
         ++test_failures;
-        (void)fprintf(
-            stderr,
-            "FAIL: %s (expected %lld, got %lld)\n",
-            message,
-            (long long)expected,
-            (long long)actual
-        );
+        (void)fprintf(stderr, "FAIL: %s (expected %lld, got %lld)\n", message, (long long)expected, (long long)actual);
     }
 }
 
@@ -75,6 +69,9 @@ typedef struct {
     uint32_t ready_after_home_calls;
     uint32_t bench_starts;
     int32_t bench_last_signed_steps;
+    uint32_t bench_last_initial_rate_hz;
+    uint32_t bench_last_target_rate_hz;
+    uint32_t bench_last_acceleration;
     uint32_t release_stop_arms;
     /* 1-based index of the profile start that fails, leaving the hardware in failed_start_status. */
     uint32_t failing_start;
@@ -106,6 +103,7 @@ static FakeAxis_t fake_axes[MOTION_AXIS_HARDWARE_COUNT];
 #define fake_encoder_x_um fake_axes[MOTION_AXIS_X].encoder_um
 #define test_x_state_script fake_axes[MOTION_AXIS_X].state_script
 #define fake_y fake_axes[MOTION_AXIS_Y]
+#define fake_z fake_axes[MOTION_AXIS_Z]
 
 static void script_axis_state(
     MotionAxis_t axis,
@@ -269,6 +267,10 @@ void encoder_oy_reset_coordinate(void) {}
 
 int32_t encoder_oy_get_coordinate(void) { return fake_axes[MOTION_AXIS_Y].encoder_um; }
 
+void encoder_oz_reset_coordinate(void) {}
+
+int32_t encoder_oz_get_coordinate(void) { return fake_axes[MOTION_AXIS_Z].encoder_um; }
+
 /* The calibration procedure has its own tests; here it only reports scripted outcomes. */
 static AxisCalibrationRunResult_t fake_calibration_begin_result;
 static AxisCalibrationRunResult_t fake_calibration_poll_result;
@@ -278,9 +280,16 @@ static uint32_t fake_calibration_poll_calls;
 static uint32_t fake_calibration_abort_calls;
 static MotionAxis_t fake_calibration_last_axis;
 
-AxisCalibrationRunResult_t
-axis_calibration_run_begin(AxisCalibrationRun_t *run, MotionAxis_t axis, const MotionAxisHardwareConfig_t *config) {
+static const AxisCalibrationRunSettings_t *fake_calibration_last_settings;
+
+AxisCalibrationRunResult_t axis_calibration_run_begin(
+    AxisCalibrationRun_t *run,
+    MotionAxis_t axis,
+    const MotionAxisHardwareConfig_t *config,
+    const AxisCalibrationRunSettings_t *settings
+) {
     (void)config;
+    fake_calibration_last_settings = settings;
     ++fake_calibration_begin_calls;
     fake_calibration_last_axis = axis;
     run->axis = axis;
@@ -326,10 +335,10 @@ AxisBenchStatus_t axis_bench_start_profile(
     MotionAxisHardwareStatus_t *hardware_status
 ) {
     (void)hardware_config;
-    (void)initial_step_rate_hz;
-    (void)target_step_rate_hz;
-    (void)acceleration_steps_per_s2;
     FakeAxis_t *fake = &fake_axes[axis];
+    fake->bench_last_initial_rate_hz = initial_step_rate_hz;
+    fake->bench_last_target_rate_hz = target_step_rate_hz;
+    fake->bench_last_acceleration = acceleration_steps_per_s2;
     ++fake->bench_starts;
     /* Both axes are configured with positive motion toward the end switch. */
     fake->bench_last_signed_steps = direction == AXIS_BENCH_TOWARD_END ? (int32_t)steps : -(int32_t)steps;
@@ -399,13 +408,15 @@ static void script_read(uint32_t index, osStatus_t status, const CommandDTO_t *c
 
 static MotionTaskContext_t valid_motion_context(void) {
     MotionTaskContext_t context = {
-        .machine_state = {
-            .position_um = {0, 0, 0},
-            .homed_axes_mask = MOTION_PLANNER_ALL_AXES_MASK,
-        },
-        .planner_config = {
-            .max_step_event_rate_hz = 50000U,
-        },
+        .machine_state =
+            {
+                .position_um = {0, 0, 0},
+                .homed_axes_mask = MOTION_PLANNER_ALL_AXES_MASK,
+            },
+        .planner_config =
+            {
+                .max_step_event_rate_hz = 50000U,
+            },
     };
     for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
         context.planner_config.axis[axis] = (MotionPlannerAxisConfig_t){
@@ -435,13 +446,14 @@ static void test_successful_receive_marks_dequeue(void) {
     const CommandDTO_t command = {
         .sequence = 101U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-            .x = 1234,
-            .y = 0,
-            .z = 0,
-            .speed = 12000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = 1234,
+                .y = 0,
+                .z = 0,
+                .speed = 12000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
@@ -469,7 +481,11 @@ static void test_successful_receive_marks_dequeue(void) {
     const MotionPlannerResult_t planner_result = motion_task_test_get_last_planner_result();
     expect_u32(motion_task_test_get_planner_call_count(), 1U, "XYZ command invokes MotionPlanner once");
     expect_u32(planner_result.status, MOTION_PLANNER_STATUS_OK, "valid dequeued XYZ command produces a plan");
-    expect_u32(motion_task_get_last_planner_status(), MOTION_PLANNER_STATUS_OK, "last planner status is retained for callers");
+    expect_u32(
+        motion_task_get_last_planner_status(),
+        MOTION_PLANNER_STATUS_OK,
+        "last planner status is retained for callers"
+    );
     expect_u32(planner_result.block.sequence, 101U, "planner receives the command sequence");
     expect_i64(planner_result.block.step_delta[0], 99, "planner receives the X target");
     expect_i64(planner_result.block.step_delta[1], 0, "Y stays in place");
@@ -489,7 +505,11 @@ static void test_successful_receive_marks_dequeue(void) {
     expect_u32((uint32_t)context.machine_state.position_um[1], 0U, "planned Y is unchanged");
     expect_u32((uint32_t)context.machine_state.position_um[2], 0U, "planned Z is unchanged");
     MotionPlanBlock_t buffered_block = {0};
-    expect_u32(plan_buffer_try_pop(&buffered_block), PLAN_BUFFER_STATUS_OK, "plan is available to the next pipeline block");
+    expect_u32(
+        plan_buffer_try_pop(&buffered_block),
+        PLAN_BUFFER_STATUS_OK,
+        "plan is available to the next pipeline block"
+    );
     expect_u32(buffered_block.sequence, 101U, "plan buffer preserves source command sequence");
     expect_i64(buffered_block.step_delta[0], 99, "plan buffer preserves planner X output");
     expect_i64(buffered_block.step_delta[1], 0, "plan buffer preserves planner Y output");
@@ -501,7 +521,7 @@ static void test_fifo_commands_are_dequeued_once(void) {
     const MotionPlanBlock_t pending_plan = {.sequence = 90U};
     expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before STOP");
     const CommandDTO_t commands[] = {
-        {.sequence = 102U, .code = COMMAND_CODE_HOME, .parameters.home = {.axes = 5U}},
+        {.sequence = 102U, .code = COMMAND_CODE_HOME, .parameters.home = {.axes = 0x08U}},
         {.sequence = 103U, .code = COMMAND_CODE_STOP},
         {
             .sequence = 104U,
@@ -517,7 +537,11 @@ static void test_fifo_commands_are_dequeued_once(void) {
     test_block_when_empty = 1U;
 
     MotionTaskContext_t context = {0};
-    expect_u32((uint32_t)run_motion_task_until_scripted_stop(&context), 2U, "consumer blocks again after draining scripted commands");
+    expect_u32(
+        (uint32_t)run_motion_task_until_scripted_stop(&context),
+        2U,
+        "consumer blocks again after draining scripted commands"
+    );
     expect_u32(test_receive_calls, 6U, "consumer performs one receive per command then waits again");
     expect_u32(test_receive_script_position, 5U, "each scripted queue item is removed exactly once");
     expect_u32(test_last_receive_timeout, osWaitForever, "each consumer read blocks indefinitely");
@@ -566,13 +590,14 @@ static void test_diagnostic_counters_saturate(void) {
     const CommandDTO_t command = {
         .sequence = 107U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-            .x = 1000,
-            .y = 0,
-            .z = 0,
-            .speed = 1000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = 1000,
+                .y = 0,
+                .z = 0,
+                .speed = 1000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
@@ -597,13 +622,14 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     const CommandDTO_t command = {
         .sequence = 108U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-            .x = 1000,
-            .y = 0,
-            .z = 0,
-            .speed = 1000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = 1000,
+                .y = 0,
+                .z = 0,
+                .speed = 1000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
@@ -626,7 +652,11 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     expect_u32(diagnostics.planner_calls, 1U, "unconfigured XYZ command increments planner calls");
     expect_u32(diagnostics.planner_blocks_created, 0U, "unconfigured XYZ command creates no block");
     expect_u32(diagnostics.planner_errors, 1U, "unconfigured XYZ command increments planner errors");
-    expect_u32(diagnostics.last_planner_status, MOTION_PLANNER_STATUS_INVALID_CONFIGURATION, "invalid configuration status is recorded");
+    expect_u32(
+        diagnostics.last_planner_status,
+        MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
+        "invalid configuration status is recorded"
+    );
     expect_u32(diagnostics.last_planner_sequence, 108U, "failed planner sequence is recorded");
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
     (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
@@ -637,18 +667,23 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
 static void test_xyz_command_without_position_change_counts_no_motion(void) {
     reset_receive_script();
     const MotionPlanBlock_t pending_plan = {.sequence = 92U};
-    expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before no-motion command");
+    expect_u32(
+        plan_buffer_try_push(&pending_plan),
+        PLAN_BUFFER_STATUS_OK,
+        "pending plan exists before no-motion command"
+    );
     MotionTaskContext_t context = valid_motion_context();
     const CommandDTO_t command = {
         .sequence = 111U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-            .x = 0,
-            .y = 0,
-            .z = 0,
-            .speed = 1000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = 0,
+                .y = 0,
+                .z = 0,
+                .speed = 1000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
@@ -679,13 +714,14 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
     const CommandDTO_t command = {
         .sequence = 112U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-            .x = 1234,
-            .y = 0,
-            .z = 0,
-            .speed = 12000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = 1234,
+                .y = 0,
+                .z = 0,
+                .speed = 12000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
@@ -698,12 +734,20 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
     (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, PLAN_BUFFER_CAPACITY, "full buffer retains existing plans");
-    expect_u32(plan_buffer_diagnostics.enqueued_total, PLAN_BUFFER_CAPACITY, "rejected plan is not counted as enqueued");
+    expect_u32(
+        plan_buffer_diagnostics.enqueued_total,
+        PLAN_BUFFER_CAPACITY,
+        "rejected plan is not counted as enqueued"
+    );
     expect_u32(plan_buffer_diagnostics.full_rejections, 1U, "full plan buffer rejection is visible");
     expect_u32(test_block_ready_notifications, 0U, "rejected plan does not wake the step generator");
 
     MotionPlanBlock_t first_block = {0};
-    expect_u32(plan_buffer_try_pop(&first_block), PLAN_BUFFER_STATUS_OK, "existing plans remain consumable after full rejection");
+    expect_u32(
+        plan_buffer_try_pop(&first_block),
+        PLAN_BUFFER_STATUS_OK,
+        "existing plans remain consumable after full rejection"
+    );
     expect_u32(first_block.sequence, 1U, "full rejection does not replace earlier plans");
 }
 
@@ -712,20 +756,25 @@ static void test_xyz_command_with_null_context_reaches_planner_as_invalid_input(
     const CommandDTO_t command = {
         .sequence = 109U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-            .x = 1000,
-            .y = 0,
-            .z = 0,
-            .speed = 1000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = 1000,
+                .y = 0,
+                .z = 0,
+                .speed = 1000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(NULL);
-    expect_u32(motion_task_test_get_planner_call_count(), 1U, "MotionPlanner is called even when task context is absent");
+    expect_u32(
+        motion_task_test_get_planner_call_count(),
+        1U,
+        "MotionPlanner is called even when task context is absent"
+    );
     expect_u32(
         motion_task_test_get_last_planner_result().status,
         MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
@@ -734,7 +783,11 @@ static void test_xyz_command_with_null_context_reaches_planner_as_invalid_input(
     MotionTaskDiagnostics diagnostics = {0};
     motion_task_get_diagnostics(&diagnostics);
     expect_u32(diagnostics.planner_errors, 1U, "missing motion context increments planner errors");
-    expect_u32(diagnostics.last_planner_status, MOTION_PLANNER_STATUS_INVALID_ARGUMENT, "missing context status is recorded");
+    expect_u32(
+        diagnostics.last_planner_status,
+        MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
+        "missing context status is recorded"
+    );
     expect_u32(diagnostics.last_planner_sequence, 109U, "missing context sequence is recorded");
 }
 
@@ -744,10 +797,11 @@ static void test_motion_operation_without_xyz_flag_does_not_call_planner(void) {
     const CommandDTO_t command = {
         .sequence = 110U,
         .code = COMMAND_CODE_MOTION_OPERATION,
-        .parameters.motion_operation = {
-            .operation_flags = 0x04U,
-            .spindle_pwm = 5000U,
-        },
+        .parameters.motion_operation =
+            {
+                .operation_flags = 0x04U,
+                .spindle_pwm = 5000U,
+            },
     };
     script_read(0U, osOK, &command);
     script_read(1U, osErrorResource, NULL);
@@ -837,7 +891,12 @@ static void test_home_fast_seek_aborts_on_end_limit(void) {
  * fast seek stopped by PF10, backoff stopped by the PF10 release, approach stopped by PF10. */
 static void script_successful_home_states(uint32_t first) {
     script_x_state(first, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
-    script_x_state(first + 1U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE, 0U);
+    script_x_state(
+        first + 1U,
+        MOTION_AXIS_HARDWARE_STATUS_STOPPED,
+        MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE,
+        0U
+    );
     script_x_state(first + 2U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
 }
 
@@ -919,7 +978,11 @@ static void test_calibration_runs_after_homing_and_applies_result(void) {
     run_calibration_with_final_home_polls(&context, 1U);
     expect_u32(test_last_receive_timeout, 1U, "calibration keeps polling during the final homing");
     motion_task_get_axis_diagnostics(MOTION_AXIS_X, &axis);
-    expect_u32(axis.calibration_result, AXIS_CALIBRATION_RUN_RESULT_RUNNING, "calibration is not done before X is home");
+    expect_u32(
+        axis.calibration_result,
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "calibration is not done before X is home"
+    );
 
     /* The final homing fails: the measurement is kept, X is left unhomed. */
     reset_receive_script();
@@ -1071,15 +1134,15 @@ static void test_calibration_is_cancelled_and_guarded(void) {
 
     reset_receive_script();
     context = valid_motion_context();
-    const CommandDTO_t calibrate_all = {
+    const CommandDTO_t calibrate_unknown = {
         .sequence = 142U,
         .code = COMMAND_CODE_CALIBRATE,
-        .parameters.calibrate.axes = MOTION_PLANNER_ALL_AXES_MASK,
+        .parameters.calibrate.axes = MOTION_PLANNER_ALL_AXES_MASK | 0x08U,
     };
-    script_read(0U, osOK, &calibrate_all);
+    script_read(0U, osOK, &calibrate_unknown);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
-    expect_u32(fake_x_bench_starts, 0U, "only X can be calibrated for now");
+    expect_u32(fake_x_bench_starts, 0U, "a mask with an unknown axis is refused as a whole");
 }
 
 static void test_home_completes_only_on_pf10_during_approach(void) {
@@ -1208,11 +1271,7 @@ static void test_stop_without_fault_keeps_homing(void) {
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "homing survives a switch stop");
 }
 
-typedef enum {
-    TEST_HOME_PHASE_FAST_SEEK = 0,
-    TEST_HOME_PHASE_BACKOFF,
-    TEST_HOME_PHASE_APPROACH
-} TestHomePhase_t;
+typedef enum { TEST_HOME_PHASE_FAST_SEEK = 0, TEST_HOME_PHASE_BACKOFF, TEST_HOME_PHASE_APPROACH } TestHomePhase_t;
 
 typedef struct {
     const char *name;
@@ -1228,32 +1287,52 @@ static void script_home_prefix(TestHomePhase_t phase) {
         script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
     }
     if (phase >= TEST_HOME_PHASE_APPROACH) {
-        script_x_state(2U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE, 0U);
+        script_x_state(
+            2U,
+            MOTION_AXIS_HARDWARE_STATUS_STOPPED,
+            MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE,
+            0U
+        );
     }
 }
 
 #define TEST_X_STATE(status_, reason_, limit_)                                                                         \
     {.apply = 1U,                                                                                                      \
-     .status = MOTION_AXIS_HARDWARE_STATUS_##status_,                                                                     \
-     .stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_##reason_,                                                           \
-     .start_limit_active = (limit_)}
+        .status = MOTION_AXIS_HARDWARE_STATUS_##status_,                                                               \
+        .stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_##reason_,                                                     \
+        .start_limit_active = (limit_)}
 
 static const TestHomePhaseCase_t test_home_phase_cases[] = {
     {"fast seek fault aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(FAULT_TIMING, NONE, 0U), 0U, 1U},
     {"fast seek completing without PF10 aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(COMPLETE, NONE, 0U), 0U, 1U},
     {"fast seek with idle hardware aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(READY, NONE, 0U), 0U, 1U},
     {"fast seek stopped on request aborts", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(STOPPED, REQUEST, 0U), 0U, 1U},
-    {"fast seek keeps waiting while STEP is pending", TEST_HOME_PHASE_FAST_SEEK, TEST_X_STATE(WAITING, NONE, 0U), 1U, 1U},
+    {"fast seek keeps waiting while STEP is pending",
+        TEST_HOME_PHASE_FAST_SEEK,
+        TEST_X_STATE(WAITING, NONE, 0U),
+        1U,
+        1U},
 
     {"backoff fault aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(FAULT_TIMING, NONE, 1U), 0U, 2U},
-    {"backoff completing without the PF10 release aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(COMPLETE, NONE, 1U), 0U, 2U},
+    {"backoff completing without the PF10 release aborts",
+        TEST_HOME_PHASE_BACKOFF,
+        TEST_X_STATE(COMPLETE, NONE, 1U),
+        0U,
+        2U},
     {"backoff with idle hardware aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(READY, NONE, 0U), 0U, 2U},
     {"backoff stopped on request aborts", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(STOPPED, REQUEST, 0U), 0U, 2U},
     {"backoff keeps running while PF10 is active", TEST_HOME_PHASE_BACKOFF, TEST_X_STATE(RUNNING, NONE, 1U), 1U, 2U},
-    {"backoff stopped by the PF10 release starts the approach", TEST_HOME_PHASE_BACKOFF,
-     TEST_X_STATE(STOPPED, START_LIMIT_RELEASE, 0U), 1U, 3U},
+    {"backoff stopped by the PF10 release starts the approach",
+        TEST_HOME_PHASE_BACKOFF,
+        TEST_X_STATE(STOPPED, START_LIMIT_RELEASE, 0U),
+        1U,
+        3U},
 
-    {"approach PF10 stop with released switch aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(STOPPED, START_LIMIT, 0U), 0U, 3U},
+    {"approach PF10 stop with released switch aborts",
+        TEST_HOME_PHASE_APPROACH,
+        TEST_X_STATE(STOPPED, START_LIMIT, 0U),
+        0U,
+        3U},
     {"approach keeps running", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(RUNNING, NONE, 0U), 1U, 3U},
     {"approach fault aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(FAULT_TIMING, NONE, 0U), 0U, 3U},
     {"approach completing without PF10 aborts", TEST_HOME_PHASE_APPROACH, TEST_X_STATE(COMPLETE, NONE, 0U), 0U, 3U},
@@ -1272,11 +1351,7 @@ static void test_home_phase_outcomes(void) {
 
         (void)run_motion_task_until_scripted_stop(&context);
         expect_u32(fake_x_bench_starts, test_case->expect_starts, test_case->name);
-        expect_u32(
-            test_last_receive_timeout,
-            test_case->expect_active != 0U ? 1U : osWaitForever,
-            test_case->name
-        );
+        expect_u32(test_last_receive_timeout, test_case->expect_active != 0U ? 1U : osWaitForever, test_case->name);
         expect_u32(
             context.machine_state.homed_axes_mask,
             MOTION_PLANNER_ALL_AXES_MASK & (uint8_t)~MOTION_PLANNER_AXIS_X_MASK,
@@ -1330,11 +1405,12 @@ static const CommandDTO_t test_x_jog_command = {
 static const CommandDTO_t test_xyz_move_command = {
     .sequence = 141U,
     .code = COMMAND_CODE_MOTION_OPERATION,
-    .parameters.motion_operation = {
-        .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
-        .x = 1000,
-        .speed = 1000U,
-    },
+    .parameters.motion_operation =
+        {
+            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+            .x = 1000,
+            .speed = 1000U,
+        },
 };
 
 static const CommandDTO_t test_stop_command = {
@@ -1487,7 +1563,8 @@ static void test_stored_calibration_sets_planner_limits(void) {
     const MotionPlannerAxisConfig_t default_y = context.planner_config.axis[1];
     test_calibration_load_status = CALIBRATION_STORE_STATUS_OK;
     test_stored_calibration.calibrated_axes_mask = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK;
-    test_stored_calibration.axis[0] = (AxisCalibration_t){.steps = 100000U, .distance_um = 50000U, .travel_um = 301000U};
+    test_stored_calibration.axis[0] =
+        (AxisCalibration_t){.steps = 100000U, .distance_um = 50000U, .travel_um = 301000U};
     /* Z is marked but its travel does not fit the planner, so it keeps the default limits. */
     test_stored_calibration.axis[2] =
         (AxisCalibration_t){.steps = 1U, .distance_um = 1U, .travel_um = (uint32_t)INT32_MAX + 1U};
@@ -1496,8 +1573,16 @@ static void test_stored_calibration_sets_planner_limits(void) {
     (void)run_motion_task_until_scripted_stop(&context);
 
     expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 100000U, "X steps come from the calibration");
-    expect_u32(context.planner_config.axis[0].steps_per_um_denominator, 50000U, "X micrometres come from the calibration");
-    expect_u32((uint32_t)context.planner_config.axis[0].max_position_um, 301000U, "X travel comes from the calibration");
+    expect_u32(
+        context.planner_config.axis[0].steps_per_um_denominator,
+        50000U,
+        "X micrometres come from the calibration"
+    );
+    expect_u32(
+        (uint32_t)context.planner_config.axis[0].max_position_um,
+        301000U,
+        "X travel comes from the calibration"
+    );
     expect_u32(context.planner_config.axis[0].max_speed_um_per_s, 25000U, "X speed follows from the step-rate limit");
     expect_u32(
         context.planner_config.axis[1].steps_per_um_numerator,
@@ -1525,7 +1610,13 @@ static const CommandDTO_t test_home_y_command = {
 
 /* The three hardware states of a successful homing of `axis`, applied on reads first..first+2. */
 static void script_axis_home_success(MotionAxis_t axis, uint32_t first) {
-    script_axis_state(axis, first, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
+    script_axis_state(
+        axis,
+        first,
+        MOTION_AXIS_HARDWARE_STATUS_STOPPED,
+        MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT,
+        1U
+    );
     script_axis_state(
         axis,
         first + 1U,
@@ -1582,7 +1673,13 @@ static void test_y_home_runs_on_its_own_hardware(void) {
     /* A failed Y homing leaves only Y unhomed. */
     reset_receive_script();
     context = valid_motion_context();
-    script_axis_state(MOTION_AXIS_Y, 1U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT, 0U);
+    script_axis_state(
+        MOTION_AXIS_Y,
+        1U,
+        MOTION_AXIS_HARDWARE_STATUS_STOPPED,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT,
+        0U
+    );
     run_command_with_polls(&context, &test_home_y_command, 1U);
     expect_u32(fake_y.stop_requests, 1U, "the end switch aborts the Y homing");
     expect_u32(
@@ -1607,6 +1704,7 @@ static void test_x_and_y_home_together(void) {
 
     expect_u32(fake_x_bench_starts, 3U, "X homes");
     expect_u32(fake_y.bench_starts, 3U, "Y homes at the same time");
+    expect_u32(fake_y.bench_last_target_rate_hz, 100U, "the belt approach tops out at 100 Hz");
     expect_u32(
         context.machine_state.homed_axes_mask,
         MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK,
@@ -1693,6 +1791,56 @@ static void test_y_calibration_reports_on_y(void) {
     expect_u32(axis.calibration_result, AXIS_CALIBRATION_RUN_RESULT_NONE, "X has no calibration result");
 }
 
+static void test_z_home_and_calibration(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.homed_axes_mask = 0U;
+    const CommandDTO_t home_all = {
+        .sequence = 156U,
+        .code = COMMAND_CODE_HOME,
+        .parameters.home.axes = MOTION_PLANNER_ALL_AXES_MASK,
+    };
+    script_axis_home_success(MOTION_AXIS_X, 1U);
+    script_axis_home_success(MOTION_AXIS_Y, 1U);
+    script_axis_home_success(MOTION_AXIS_Z, 1U);
+    run_command_with_polls(&context, &home_all, 3U);
+    expect_u32(fake_z.bench_starts, 3U, "Z homes together with X and Y");
+    expect_u32(
+        fake_z.start_limit_hook == encoder_oz_reset_coordinate ? 1U : 0U,
+        1U,
+        "the Z approach zeroes the Z scale"
+    );
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "all three axes are homed");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    context.planner_config.max_step_event_rate_hz = 150000U;
+    fake_calibration_poll_result = AXIS_CALIBRATION_RUN_RESULT_OK;
+    fake_calibration_measured = (AxisCalibration_t){.steps = 50000U, .distance_um = 25000U, .travel_um = 50300U};
+    fake_z.encoder_um = -42;
+    script_axis_home_success(MOTION_AXIS_Z, 1U);
+    script_axis_home_success(MOTION_AXIS_Z, 5U);
+    const CommandDTO_t calibrate_z = {
+        .sequence = 157U,
+        .code = COMMAND_CODE_CALIBRATE,
+        .parameters.calibrate.axes = MOTION_PLANNER_AXIS_Z_MASK,
+    };
+    run_command_with_polls(&context, &calibrate_z, 7U);
+    expect_u32(fake_calibration_last_axis, MOTION_AXIS_Z, "the procedure runs on Z");
+    expect_u32(fake_calibration_last_settings->measure_steps, 233600U, "Z measures 12 mm of its screw");
+    expect_u32(fake_calibration_last_settings->seek.target_step_rate_hz, 40000U, "Z seeks its end at 40 kHz");
+    expect_u32(fake_calibration_last_settings->seek.acceleration_steps_per_s2, 320000U, "Z ramps up its seek");
+    expect_u32(fake_z.bench_last_target_rate_hz, 4800U, "Z approaches its home switch slowly");
+    expect_u32(fake_z.bench_last_initial_rate_hz, 800U, "Z starts its approach below the target rate");
+    expect_u32(fake_z.bench_last_acceleration, 32000U, "Z ramps its approach");
+    expect_u32(context.calibration.calibrated_axes_mask, MOTION_PLANNER_AXIS_Z_MASK, "Z is marked calibrated");
+    MotionAxisDiagnostics axis = {0};
+    motion_task_get_axis_diagnostics(MOTION_AXIS_Z, &axis);
+    expect_u32(axis.travel_um, 50300U, "Z diagnostics report the Z travel");
+    expect_u32(axis.max_speed_um_per_s, 20000U, "Z speed follows from its own 40 kHz motor limit");
+    expect_u32((uint32_t)axis.scale_position_um, (uint32_t)-42, "Z diagnostics read the Z scale");
+}
+
 static void test_axis_diagnostics_edges(void) {
     MotionAxisDiagnostics axis = {.travel_um = 77U};
     motion_task_get_axis_diagnostics(MOTION_AXIS_Y, NULL);
@@ -1724,7 +1872,13 @@ static void test_stop_reaches_every_axis(void) {
 
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_axis_state(MOTION_AXIS_Y, 0U, MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    script_axis_state(
+        MOTION_AXIS_Y,
+        0U,
+        MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING,
+        MOTION_AXIS_HARDWARE_STOP_REASON_NONE,
+        0U
+    );
     run_single_stop(&context, MOTION_AXIS_HARDWARE_STATUS_READY);
     expect_u32(fake_y.clear_fault_calls, 1U, "STOP acknowledges a Y fault");
     expect_u32(fake_x_clear_fault_calls, 0U, "X without a fault is left alone");
@@ -1776,6 +1930,7 @@ int main(void) {
     test_home_and_calibrate_masks();
     test_y_calibration_reports_on_y();
     test_axis_diagnostics_edges();
+    test_z_home_and_calibration();
     test_planned_moves_of_other_axes_are_refused();
     test_stop_reaches_every_axis();
 

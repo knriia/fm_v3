@@ -5,6 +5,13 @@
 #include <stdio.h>
 
 static uint32_t test_failures;
+
+static const AxisCalibrationRunSettings_t test_settings = {
+    .seek = {1000U, 50000U, 100000U},
+    .measure = {100U, 2000U, 2000U},
+    .take_up_steps = 2000U,
+    .measure_steps = 50000U,
+};
 static MotionAxisHardwareStatus_t fake_status;
 static MotionAxisHardwareStopReason_t fake_stop_reason;
 static uint32_t fake_jog_steps_completed;
@@ -121,7 +128,11 @@ static void reset_fakes(void) {
 /* Drives the procedure up to the take-up move with the scale at `end_um` on the end switch. */
 static void reach_take_up(AxisCalibrationRun_t *calibration, const MotionAxisHardwareConfig_t *config, int32_t end_um) {
     AxisCalibration_t result = {0};
-    expect_u32(axis_calibration_run_begin(calibration, fake_expected_axis, config), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "seek starts");
+    expect_u32(
+        axis_calibration_run_begin(calibration, fake_expected_axis, config, &test_settings),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "seek starts"
+    );
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
     fake_limit_trigger_um = end_um;
@@ -143,7 +154,7 @@ static void reach_measure(
     AxisCalibration_t result = {0};
     reach_take_up(calibration, config, end_um);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_TAKE_UP_STEPS;
+    fake_jog_steps_completed = test_settings.take_up_steps;
     fake_encoder_um = start_um;
     expect_u32(
         axis_calibration_run_poll(calibration, config, &result),
@@ -159,50 +170,90 @@ static void test_successful_calibration(void) {
     AxisCalibration_t result = {0};
 
     expect_u32(axis_calibration_run_is_active(&calibration), 0U, "idle procedure is not active");
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_NONE, "idle poll");
-    expect_u32(axis_calibration_run_begin(&calibration, fake_expected_axis, &config), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "seek starts");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_NONE,
+        "idle poll"
+    );
+    expect_u32(
+        axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "seek starts"
+    );
     expect_u32(axis_calibration_run_is_active(&calibration), 1U, "seek makes the procedure active");
     expect_u32((uint32_t)fake_last_steps, AXIS_BENCH_MAX_STEPS, "seek drives toward the end switch");
-    expect_u32(fake_last_rate_hz, AXIS_CALIBRATION_RUN_SEEK_STEP_RATE_HZ, "seek uses the seek rate");
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "seek runs");
+    expect_u32(fake_last_rate_hz, test_settings.seek.target_step_rate_hz, "seek uses the seek rate");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "seek runs"
+    );
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STARTING;
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "seek starting");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "seek starting"
+    );
     fake_status = MOTION_AXIS_HARDWARE_STATUS_WAITING;
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "seek waiting");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "seek waiting"
+    );
 
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
     fake_limit_trigger_um = 179500;
     /* The seek brakes about 1 mm past the switch; the travel still ends where the switch fired. */
     fake_encoder_um = 180400;
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "take-up");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "take-up"
+    );
     expect_u32(calibration.travel_um, 179500U, "travel is the scale reading latched when the end switch fired");
     expect_u32(calibration.phase, AXIS_CALIBRATION_RUN_PHASE_TAKE_UP, "the slack is taken up first");
-    expect_u32((uint32_t)fake_last_steps, (uint32_t)-(int32_t)AXIS_CALIBRATION_RUN_TAKE_UP_STEPS, "take-up heads back");
-    expect_u32(fake_last_initial_rate_hz, AXIS_CALIBRATION_RUN_MEASURE_INITIAL_STEP_RATE_HZ, "take-up ramps up");
-    expect_u32(fake_last_rate_hz, AXIS_CALIBRATION_RUN_MEASURE_STEP_RATE_HZ, "take-up uses the measuring rate");
+    expect_u32((uint32_t)fake_last_steps, (uint32_t)-(int32_t)test_settings.take_up_steps, "take-up heads back");
+    expect_u32(fake_last_initial_rate_hz, test_settings.measure.initial_step_rate_hz, "take-up ramps up");
+    expect_u32(fake_last_rate_hz, test_settings.measure.target_step_rate_hz, "take-up uses the measuring rate");
     expect_u32(
         fake_last_acceleration,
-        AXIS_CALIBRATION_RUN_MEASURE_ACCELERATION_STEPS_PER_S2,
+        test_settings.measure.acceleration_steps_per_s2,
         "take-up uses the measuring acceleration"
     );
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "take-up runs");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "take-up runs"
+    );
 
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_TAKE_UP_STEPS;
+    fake_jog_steps_completed = test_settings.take_up_steps;
     fake_encoder_um = 178480;
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "measuring");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "measuring"
+    );
     expect_u32(calibration.phase, AXIS_CALIBRATION_RUN_PHASE_MEASURE, "the measurement follows the take-up");
     expect_u32((uint32_t)calibration.measure_start_um, 178480U, "the measurement starts after the slack");
-    expect_u32((uint32_t)fake_last_steps, (uint32_t)-(int32_t)AXIS_CALIBRATION_RUN_MEASURE_STEPS, "measure heads back");
-    expect_u32(fake_last_rate_hz, AXIS_CALIBRATION_RUN_MEASURE_STEP_RATE_HZ, "measure uses the measuring rate");
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_RUNNING, "measure runs");
+    expect_u32((uint32_t)fake_last_steps, (uint32_t)-(int32_t)test_settings.measure_steps, "measure heads back");
+    expect_u32(fake_last_rate_hz, test_settings.measure.target_step_rate_hz, "measure uses the measuring rate");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_RUNNING,
+        "measure runs"
+    );
 
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_MEASURE_STEPS;
+    fake_jog_steps_completed = test_settings.measure_steps;
     fake_encoder_um = 153230;
-    expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_OK, "calibration ends");
-    expect_u32(result.steps, AXIS_CALIBRATION_RUN_MEASURE_STEPS, "result holds the measured steps");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &config, &result),
+        AXIS_CALIBRATION_RUN_RESULT_OK,
+        "calibration ends"
+    );
+    expect_u32(result.steps, test_settings.measure_steps, "result holds the measured steps");
     expect_u32(result.distance_um, 25250U, "result holds the distance after the take-up");
     expect_u32(result.travel_um, 179500U, "result holds the travel");
     expect_u32(axis_calibration_run_is_active(&calibration), 0U, "finished procedure is idle");
@@ -211,17 +262,21 @@ static void test_successful_calibration(void) {
     const MotionAxisHardwareConfig_t reversed = config_toward_end(0U);
     calibration = (AxisCalibrationRun_t){0};
     reach_take_up(&calibration, &reversed, -50000);
-    expect_u32((uint32_t)fake_last_steps, AXIS_CALIBRATION_RUN_TAKE_UP_STEPS, "reversed motor takes up with positive steps");
+    expect_u32((uint32_t)fake_last_steps, test_settings.take_up_steps, "reversed motor takes up with positive steps");
     expect_u32(calibration.travel_um, 50000U, "negative scale reading gives the travel");
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_TAKE_UP_STEPS;
+    fake_jog_steps_completed = test_settings.take_up_steps;
     fake_encoder_um = -49000;
     (void)axis_calibration_run_poll(&calibration, &reversed, &result);
-    expect_u32((uint32_t)fake_last_steps, AXIS_CALIBRATION_RUN_MEASURE_STEPS, "reversed motor measures with positive steps");
+    expect_u32((uint32_t)fake_last_steps, test_settings.measure_steps, "reversed motor measures with positive steps");
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_MEASURE_STEPS;
+    fake_jog_steps_completed = test_settings.measure_steps;
     fake_encoder_um = -23750;
-    expect_u32(axis_calibration_run_poll(&calibration, &reversed, &result), AXIS_CALIBRATION_RUN_RESULT_OK, "reversed ends");
+    expect_u32(
+        axis_calibration_run_poll(&calibration, &reversed, &result),
+        AXIS_CALIBRATION_RUN_RESULT_OK,
+        "reversed ends"
+    );
     expect_u32(result.distance_um, 25250U, "distance is measured in either direction");
 }
 
@@ -232,11 +287,15 @@ static void test_failures_during_seek(void) {
 
     reset_fakes();
     fake_profile_result = AXIS_BENCH_STATUS_BUSY;
-    expect_u32(axis_calibration_run_begin(&calibration, fake_expected_axis, &config), AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED, "seek start fails");
+    expect_u32(
+        axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings),
+        AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED,
+        "seek start fails"
+    );
     expect_u32(axis_calibration_run_is_active(&calibration), 0U, "failed start leaves it idle");
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config);
+    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
     expect_u32(
         axis_calibration_run_poll(&calibration, &config, &result),
@@ -245,7 +304,7 @@ static void test_failures_during_seek(void) {
     );
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config);
+    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT;
     expect_u32(
@@ -255,7 +314,7 @@ static void test_failures_during_seek(void) {
     );
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config);
+    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
     fake_limit_trigger_um = 0;
@@ -266,7 +325,7 @@ static void test_failures_during_seek(void) {
     );
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config);
+    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
     fake_limit_trigger_um = 1000;
@@ -295,7 +354,7 @@ static void test_failures_during_take_up(void) {
     reset_fakes();
     reach_take_up(&calibration, &config, 100000);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_TAKE_UP_STEPS - 1U;
+    fake_jog_steps_completed = test_settings.take_up_steps - 1U;
     expect_u32(
         axis_calibration_run_poll(&calibration, &config, &result),
         AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED,
@@ -305,7 +364,7 @@ static void test_failures_during_take_up(void) {
     reset_fakes();
     reach_take_up(&calibration, &config, 100000);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_TAKE_UP_STEPS;
+    fake_jog_steps_completed = test_settings.take_up_steps;
     fake_profile_result = AXIS_BENCH_STATUS_HARDWARE_ERROR;
     expect_u32(
         axis_calibration_run_poll(&calibration, &config, &result),
@@ -331,7 +390,7 @@ static void test_failures_during_measure(void) {
     reset_fakes();
     reach_measure(&calibration, &config, 100000, 99000);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_MEASURE_STEPS - 1U;
+    fake_jog_steps_completed = test_settings.measure_steps - 1U;
     expect_u32(
         axis_calibration_run_poll(&calibration, &config, &result),
         AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED,
@@ -341,7 +400,7 @@ static void test_failures_during_measure(void) {
     reset_fakes();
     reach_measure(&calibration, &config, 100000, 99000);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_MEASURE_STEPS;
+    fake_jog_steps_completed = test_settings.measure_steps;
     expect_u32(
         axis_calibration_run_poll(&calibration, &config, &result),
         AXIS_CALIBRATION_RUN_RESULT_NO_DISTANCE,
@@ -357,7 +416,7 @@ static void test_abort(void) {
     axis_calibration_run_abort(&calibration);
     expect_u32(fake_stop_requests, 0U, "idle abort does not stop the axis");
 
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config);
+    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
     axis_calibration_run_abort(&calibration);
     expect_u32(fake_stop_requests, 1U, "active abort stops the axis");
     expect_u32(axis_calibration_run_is_active(&calibration), 0U, "aborted procedure is idle");
@@ -372,16 +431,16 @@ static void test_other_axis(void) {
     reset_fakes();
     fake_expected_axis = MOTION_AXIS_Y;
     reach_measure(&calibration, &config, -100000, -99000);
-    expect_u32((uint32_t)fake_last_steps, AXIS_CALIBRATION_RUN_MEASURE_STEPS, "Y measures back toward its start");
+    expect_u32((uint32_t)fake_last_steps, test_settings.measure_steps, "Y measures back toward its start");
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
-    fake_jog_steps_completed = AXIS_CALIBRATION_RUN_MEASURE_STEPS;
+    fake_jog_steps_completed = test_settings.measure_steps;
     fake_encoder_um = -74000;
     expect_u32(axis_calibration_run_poll(&calibration, &config, &result), AXIS_CALIBRATION_RUN_RESULT_OK, "Y result");
     expect_u32(result.distance_um, 25000U, "Y distance comes from the Y scale reader");
     expect_u32(result.travel_um, 100000U, "Y travel comes from the Y switch point");
     expect_u32(calibration.axis, MOTION_AXIS_Y, "finished run stays bound to Y");
 
-    (void)axis_calibration_run_begin(&calibration, MOTION_AXIS_Y, &config);
+    (void)axis_calibration_run_begin(&calibration, MOTION_AXIS_Y, &config, &test_settings);
     axis_calibration_run_abort(&calibration);
     expect_u32(calibration.axis, MOTION_AXIS_Y, "aborted run stays bound to Y");
     expect_u32(fake_wrong_axis_calls, 0U, "no call reaches another axis");

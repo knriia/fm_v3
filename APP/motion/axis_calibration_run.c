@@ -33,9 +33,9 @@ static AxisCalibrationRunResult_t axis_calibration_run_start_return_move(
             config,
             AXIS_BENCH_TOWARD_START,
             steps,
-            AXIS_CALIBRATION_RUN_MEASURE_INITIAL_STEP_RATE_HZ,
-            AXIS_CALIBRATION_RUN_MEASURE_STEP_RATE_HZ,
-            AXIS_CALIBRATION_RUN_MEASURE_ACCELERATION_STEPS_PER_S2,
+            run->settings->measure.initial_step_rate_hz,
+            run->settings->measure.target_step_rate_hz,
+            run->settings->measure.acceleration_steps_per_s2,
             &hardware_status
         ) != AXIS_BENCH_STATUS_STARTED) {
         return axis_calibration_run_fail(run, AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED);
@@ -52,18 +52,22 @@ static uint8_t axis_calibration_run_move_completed(const AxisCalibrationRun_t *r
                : 0U;
 }
 
-AxisCalibrationRunResult_t
-axis_calibration_run_begin(AxisCalibrationRun_t *run, MotionAxis_t axis, const MotionAxisHardwareConfig_t *config) {
+AxisCalibrationRunResult_t axis_calibration_run_begin(
+    AxisCalibrationRun_t *run,
+    MotionAxis_t axis,
+    const MotionAxisHardwareConfig_t *config,
+    const AxisCalibrationRunSettings_t *settings
+) {
     MotionAxisHardwareStatus_t hardware_status = MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
-    *run = (AxisCalibrationRun_t){.axis = axis};
+    *run = (AxisCalibrationRun_t){.axis = axis, .settings = settings};
     if (axis_bench_start_profile(
             axis,
             config,
             AXIS_BENCH_TOWARD_END,
             AXIS_BENCH_MAX_STEPS,
-            AXIS_CALIBRATION_RUN_SEEK_INITIAL_STEP_RATE_HZ,
-            AXIS_CALIBRATION_RUN_SEEK_STEP_RATE_HZ,
-            AXIS_CALIBRATION_RUN_SEEK_ACCELERATION_STEPS_PER_S2,
+            settings->seek.initial_step_rate_hz,
+            settings->seek.target_step_rate_hz,
+            settings->seek.acceleration_steps_per_s2,
             &hardware_status
         ) != AXIS_BENCH_STATUS_STARTED) {
         return AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED;
@@ -93,7 +97,7 @@ axis_calibration_run_poll_seek_end(AxisCalibrationRun_t *run, const MotionAxisHa
     return axis_calibration_run_start_return_move(
         run,
         config,
-        AXIS_CALIBRATION_RUN_TAKE_UP_STEPS,
+        run->settings->take_up_steps,
         AXIS_CALIBRATION_RUN_PHASE_TAKE_UP
     );
 }
@@ -104,14 +108,14 @@ axis_calibration_run_poll_take_up(AxisCalibrationRun_t *run, const MotionAxisHar
     if (axis_calibration_run_hardware_is_moving(motion_axis_hardware_get_status(run->axis)) != 0U) {
         return AXIS_CALIBRATION_RUN_RESULT_RUNNING;
     }
-    if (axis_calibration_run_move_completed(run, AXIS_CALIBRATION_RUN_TAKE_UP_STEPS) == 0U) {
+    if (axis_calibration_run_move_completed(run, run->settings->take_up_steps) == 0U) {
         return axis_calibration_run_fail(run, AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED);
     }
     run->measure_start_um = config->position_reader();
     return axis_calibration_run_start_return_move(
         run,
         config,
-        AXIS_CALIBRATION_RUN_MEASURE_STEPS,
+        run->settings->measure_steps,
         AXIS_CALIBRATION_RUN_PHASE_MEASURE
     );
 }
@@ -124,7 +128,7 @@ static AxisCalibrationRunResult_t axis_calibration_run_poll_measure(
     if (axis_calibration_run_hardware_is_moving(motion_axis_hardware_get_status(run->axis)) != 0U) {
         return AXIS_CALIBRATION_RUN_RESULT_RUNNING;
     }
-    if (axis_calibration_run_move_completed(run, AXIS_CALIBRATION_RUN_MEASURE_STEPS) == 0U) {
+    if (axis_calibration_run_move_completed(run, run->settings->measure_steps) == 0U) {
         return axis_calibration_run_fail(run, AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED);
     }
 
@@ -134,7 +138,7 @@ static AxisCalibrationRunResult_t axis_calibration_run_poll_measure(
     }
 
     *result = (AxisCalibration_t){
-        .steps = AXIS_CALIBRATION_RUN_MEASURE_STEPS,
+        .steps = run->settings->measure_steps,
         .distance_um = distance_um,
         .travel_um = run->travel_um,
     };

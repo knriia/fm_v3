@@ -193,6 +193,7 @@ static void diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePerc
     step_generator_task_get_diagnostics(&payload->step_generator);
     motion_task_get_axis_diagnostics(MOTION_AXIS_X, &payload->x_axis);
     motion_task_get_axis_diagnostics(MOTION_AXIS_Y, &payload->y_axis);
+    motion_task_get_axis_diagnostics(MOTION_AXIS_Z, &payload->z_axis);
     diagnostic_task_collect_buffers(payload);
     diagnostic_task_collect_ethernet(&payload->ethernet);
     lwip_diagnostics_collect(&payload->lwip);
