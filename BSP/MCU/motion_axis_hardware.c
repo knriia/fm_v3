@@ -1,6 +1,6 @@
 #include "motion_axis_hardware.h"
 
-#include "motion/step_executor.h"
+#include "motion/motion_event_source.h"
 
 #include "stm32h723xx.h"
 #include "system_stm32h7xx.h"
@@ -190,9 +190,11 @@ typedef struct {
     volatile uint32_t last_jog_steps_completed;
     volatile uint8_t current_direction_positive;
     volatile uint8_t jog_mode;
-    /* The last move ran the shared step_executor stream, so only this axis may reset it. Unlike jog_mode it
+    /* The last move pulled events from event_source, so only then may the stream be reset. Unlike jog_mode it
      * survives the stop, for the fault and homing paths that reset the stream afterwards. */
     volatile uint8_t uses_stream;
+    /* Set while the axis is idle; survives init. Read by the step ISR through begin and pulse_complete. */
+    MotionEventSource_t event_source;
     volatile uint8_t stop_requested;
     volatile MotionAxisHardwareStopReason_t pending_stop_reason;
     volatile MotionAxisHardwareStopReason_t stop_reason;
@@ -396,11 +398,15 @@ static void motion_axis_set_step_alternate_function(const Ctx_t *c) {
     motion_axis_set_pin_mode(port, pin, MOTION_AXIS_GPIO_MODE_ALTERNATE);
 }
 
-/* Only the axis that ran the stream resets it; a jog of another axis must not cut a running stream. */
+/* Only a move that pulled events resets its source; a jog must not cut a stream another move still needs. */
 static void motion_axis_reset_stream(const Ctx_t *c) {
     if (c->uses_stream != 0U) {
-        step_executor_reset();
+        c->event_source.reset(c->event_source.context);
     }
+}
+
+static int motion_axis_event_source_is_valid(const MotionEventSource_t *source) {
+    return source != NULL && source->begin != NULL && source->pulse_complete != NULL && source->reset != NULL;
 }
 
 static void motion_axis_stop(Ctx_t *c, MotionAxisHardwareStatus_t final_status) {
@@ -815,8 +821,10 @@ MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const Mo
 
     const MotionAxisBoard_t *board = c->board;
     const uint32_t channel_shift = ((uint32_t)board->channel - 1U) * 4U;
+    const MotionEventSource_t event_source = c->event_source;
     *c = (Ctx_t){0};
     c->board = board;
+    c->event_source = event_source;
     c->min_slack_timer_clocks = MOTION_AXIS_HARDWARE_NO_SLACK_SAMPLE;
     c->step_compare = motion_axis_compare_register(board->timer, board->channel);
     c->step_compare_flag = TIM_SR_CC1IF << (board->channel - 1U);
@@ -907,6 +915,18 @@ static MotionAxisHardwareStatus_t motion_axis_start_event(Ctx_t *c, const Motion
     return c->status;
 }
 
+MotionAxisHardwareStatus_t motion_axis_hardware_set_event_source(MotionAxis_t axis, const MotionEventSource_t *source) {
+    Ctx_t *c = motion_axis_context(axis);
+    if (c == NULL) {
+        return MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
+    }
+    if (motion_axis_status_is_active(c->status) != 0 || !motion_axis_event_source_is_valid(source)) {
+        return c->status;
+    }
+    c->event_source = *source;
+    return c->status;
+}
+
 MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis) {
     Ctx_t *c = motion_axis_context(axis);
     if (c == NULL) {
@@ -916,15 +936,20 @@ MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis) {
         return c->status;
     }
 
+    if (!motion_axis_event_source_is_valid(&c->event_source)) {
+        c->status = MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT;
+        return c->status;
+    }
+
     c->jog_mode = 0U;
     c->uses_stream = 1U;
-    step_executor_reset();
+    c->event_source.reset(c->event_source.context);
     MotionExecutionEvent_t first_event = {0};
-    const StepExecutorStatus_t executor_status = step_executor_begin(&first_event);
-    if (executor_status != STEP_EXECUTOR_STATUS_OK) {
-        step_executor_reset();
-        c->status = executor_status == STEP_EXECUTOR_STATUS_UNDERRUN ? MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN
-                                                                     : MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT;
+    const MotionEventSourceStatus_t source_status = c->event_source.begin(c->event_source.context, &first_event);
+    if (source_status != MOTION_EVENT_SOURCE_STATUS_OK) {
+        c->event_source.reset(c->event_source.context);
+        c->status = source_status == MOTION_EVENT_SOURCE_STATUS_UNDERRUN ? MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN
+                                                                         : MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT;
         return c->status;
     }
     return motion_axis_start_event(c, &first_event);
@@ -1188,21 +1213,21 @@ static void motion_axis_timer_step(Ctx_t *c) {
     TIM_TypeDef *timer = c->board->timer;
     timer->SR = ~(c->step_compare_flag | TIM_SR_UIF);
     MotionExecutionEvent_t next_event = {0};
-    StepExecutorStatus_t executor_status;
+    MotionEventSourceStatus_t source_status;
     if (c->jog_mode != 0U) {
         if (c->jog_steps_remaining <= 1U) {
             c->jog_steps_remaining = 0U;
-            executor_status = STEP_EXECUTOR_STATUS_COMPLETE;
+            source_status = MOTION_EVENT_SOURCE_STATUS_COMPLETE;
         } else {
             --c->jog_steps_remaining;
             next_event = c->current_event;
             next_event.interval_ns = motion_axis_next_profiled_jog_interval_ns(c);
-            executor_status = STEP_EXECUTOR_STATUS_OK;
+            source_status = MOTION_EVENT_SOURCE_STATUS_OK;
         }
     } else {
-        executor_status = step_executor_pulse_complete(&next_event);
+        source_status = c->event_source.pulse_complete(c->event_source.context, &next_event);
     }
-    if (executor_status == STEP_EXECUTOR_STATUS_COMPLETE) {
+    if (source_status == MOTION_EVENT_SOURCE_STATUS_COMPLETE) {
         const uint32_t primask = motion_axis_enter_critical();
         if (c->status != MOTION_AXIS_HARDWARE_STATUS_RUNNING) {
             motion_axis_exit_critical(primask);
@@ -1221,11 +1246,11 @@ static void motion_axis_timer_step(Ctx_t *c) {
         motion_axis_exit_critical(primask);
         return;
     }
-    if (executor_status != STEP_EXECUTOR_STATUS_OK || motion_axis_event_is_valid(c, &next_event) == 0U) {
+    if (source_status != MOTION_EVENT_SOURCE_STATUS_OK || motion_axis_event_is_valid(c, &next_event) == 0U) {
         motion_axis_stop(
             c,
-            executor_status == STEP_EXECUTOR_STATUS_UNDERRUN ? MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN
-                                                             : MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT
+            source_status == MOTION_EVENT_SOURCE_STATUS_UNDERRUN ? MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN
+                                                                 : MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT
         );
         return;
     }

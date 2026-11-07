@@ -56,6 +56,8 @@ void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics);
 /* An axis outside MotionAxis_t leaves `diagnostics` untouched. */
 void motion_task_get_axis_diagnostics(MotionAxis_t axis, MotionAxisDiagnostics *diagnostics);
 MotionPlannerStatus_t motion_task_get_last_planner_status(void);
+/* Times a planned step stream ran dry in the middle of a motion since start, summed over all axes. */
+uint32_t motion_task_get_stream_underrun_count(void);
 
 #ifdef FM_V3_ENABLE_TEST_HOOKS
 void motion_task_test_seed_diagnostics(const MotionTaskDiagnostics *diagnostics);

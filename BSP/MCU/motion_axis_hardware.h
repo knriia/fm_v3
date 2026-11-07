@@ -1,6 +1,8 @@
 #ifndef FM_V3_MOTION_AXIS_HARDWARE_H
 #define FM_V3_MOTION_AXIS_HARDWARE_H
 
+#include "motion/motion_event_source.h"
+
 #include <stdint.h>
 
 #define MOTION_AXIS_HARDWARE_DM556_MIN_STEP_PULSE_NS 2500U
@@ -89,8 +91,11 @@ typedef struct {
 /* Every call takes the axis; an axis outside MotionAxis_t is ignored (status UNINITIALIZED, values 0).
  * Electrical levels and driver timing are mandatory; no board defaults are assumed. */
 MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const MotionAxisHardwareConfig_t *config);
-/* Runs the planned step stream from step_executor. The stream is shared, so only one axis may use it at a time;
- * until per-axis streams exist that axis is X. */
+/* Where the axis pulls its planned step events from. Needed before start; survives init. Ignored (status returned
+ * unchanged) while the axis is moving or when `source` is incomplete. */
+MotionAxisHardwareStatus_t motion_axis_hardware_set_event_source(MotionAxis_t axis, const MotionEventSource_t *source);
+/* Runs the planned step stream of the axis event source. Without a valid source the axis ends in
+ * MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT. */
 MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis);
 MotionAxisHardwareStatus_t motion_axis_hardware_start_jog_profile(
     MotionAxis_t axis,

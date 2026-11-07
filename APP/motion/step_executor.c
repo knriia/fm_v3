@@ -5,91 +5,99 @@
 
 #include <stddef.h>
 
-typedef enum {
-    STEP_EXECUTOR_STATE_IDLE = 0,
-    STEP_EXECUTOR_STATE_RUNNING,
-    STEP_EXECUTOR_STATE_COMPLETE,
-    STEP_EXECUTOR_STATE_UNDERRUN
-} StepExecutorState_t;
-
-static StepExecutorState_t step_executor_state;
-static uint8_t step_executor_current_is_last;
-/* Written only by the step ISR; a 32-bit read from a task is atomic. */
-static volatile uint32_t step_executor_underruns;
-
-static StepExecutorStatus_t step_executor_take_event(MotionExecutionEvent_t *event) {
+static MotionEventSourceStatus_t step_executor_take_event(StepExecutor_t *executor, MotionExecutionEvent_t *event) {
     if (execution_buffer_try_pop(event) != EXECUTION_BUFFER_STATUS_OK) {
-        step_executor_state = STEP_EXECUTOR_STATE_UNDERRUN;
-        return STEP_EXECUTOR_STATUS_UNDERRUN;
+        executor->state = STEP_EXECUTOR_STATE_UNDERRUN;
+        return MOTION_EVENT_SOURCE_STATUS_UNDERRUN;
     }
     if (event->interval_ns == 0U || event->step_mask == 0U || event->last_in_block > 1U ||
         (event->step_mask & (uint8_t)~MOTION_PLANNER_ALL_AXES_MASK) != 0U ||
         (event->positive_direction_mask & (uint8_t)~MOTION_PLANNER_ALL_AXES_MASK) != 0U) {
-        step_executor_state = STEP_EXECUTOR_STATE_IDLE;
-        return STEP_EXECUTOR_STATUS_INVALID_ARGUMENT;
+        executor->state = STEP_EXECUTOR_STATE_IDLE;
+        return MOTION_EVENT_SOURCE_STATUS_INVALID_ARGUMENT;
     }
 
-    step_executor_current_is_last = event->last_in_block != 0U;
-    return STEP_EXECUTOR_STATUS_OK;
+    executor->current_is_last = event->last_in_block != 0U;
+    return MOTION_EVENT_SOURCE_STATUS_OK;
 }
 
-StepExecutorStatus_t step_executor_begin(MotionExecutionEvent_t *first_event) {
+MotionEventSourceStatus_t step_executor_begin(StepExecutor_t *executor, MotionExecutionEvent_t *first_event) {
     if (first_event == NULL) {
-        return STEP_EXECUTOR_STATUS_INVALID_ARGUMENT;
+        return MOTION_EVENT_SOURCE_STATUS_INVALID_ARGUMENT;
     }
-    if (step_executor_state == STEP_EXECUTOR_STATE_RUNNING) {
-        return STEP_EXECUTOR_STATUS_NOT_RUNNING;
+    if (executor->state == STEP_EXECUTOR_STATE_RUNNING) {
+        return MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING;
     }
 
-    step_executor_state = STEP_EXECUTOR_STATE_IDLE;
-    step_executor_current_is_last = 0U;
-    const StepExecutorStatus_t status = step_executor_take_event(first_event);
-    if (status != STEP_EXECUTOR_STATUS_OK) {
+    executor->state = STEP_EXECUTOR_STATE_IDLE;
+    executor->current_is_last = 0U;
+    const MotionEventSourceStatus_t status = step_executor_take_event(executor, first_event);
+    if (status != MOTION_EVENT_SOURCE_STATUS_OK) {
         return status;
     }
 
-    step_executor_state = STEP_EXECUTOR_STATE_RUNNING;
-    return STEP_EXECUTOR_STATUS_OK;
+    executor->state = STEP_EXECUTOR_STATE_RUNNING;
+    return MOTION_EVENT_SOURCE_STATUS_OK;
 }
 
-StepExecutorStatus_t step_executor_pulse_complete(MotionExecutionEvent_t *next_event) {
+MotionEventSourceStatus_t step_executor_pulse_complete(StepExecutor_t *executor, MotionExecutionEvent_t *next_event) {
     if (next_event == NULL) {
-        return STEP_EXECUTOR_STATUS_INVALID_ARGUMENT;
+        return MOTION_EVENT_SOURCE_STATUS_INVALID_ARGUMENT;
     }
-    if (step_executor_state != STEP_EXECUTOR_STATE_RUNNING) {
-        return step_executor_state == STEP_EXECUTOR_STATE_COMPLETE ? STEP_EXECUTOR_STATUS_COMPLETE
-                                                                   : STEP_EXECUTOR_STATUS_NOT_RUNNING;
+    if (executor->state != STEP_EXECUTOR_STATE_RUNNING) {
+        return executor->state == STEP_EXECUTOR_STATE_COMPLETE ? MOTION_EVENT_SOURCE_STATUS_COMPLETE
+                                                               : MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING;
     }
     /* A finished block is the end of motion only when no next block is queued; otherwise motion continues. */
-    if (step_executor_current_is_last != 0U && execution_buffer_count() == 0U) {
-        step_executor_state = STEP_EXECUTOR_STATE_COMPLETE;
-        return STEP_EXECUTOR_STATUS_COMPLETE;
+    if (executor->current_is_last != 0U && execution_buffer_count() == 0U) {
+        executor->state = STEP_EXECUTOR_STATE_COMPLETE;
+        return MOTION_EVENT_SOURCE_STATUS_COMPLETE;
     }
 
-    const StepExecutorStatus_t status = step_executor_take_event(next_event);
-    if (status == STEP_EXECUTOR_STATUS_UNDERRUN) {
+    const MotionEventSourceStatus_t status = step_executor_take_event(executor, next_event);
+    if (status == MOTION_EVENT_SOURCE_STATUS_UNDERRUN) {
         /* One per fault, and every fault needs a STOP, so the counter cannot realistically wrap. */
-        ++step_executor_underruns;
+        ++executor->underruns;
     }
     return status;
 }
 
-StepExecutorStatus_t step_executor_get_status(void) {
-    switch (step_executor_state) {
+MotionEventSourceStatus_t step_executor_get_status(const StepExecutor_t *executor) {
+    switch (executor->state) {
     case STEP_EXECUTOR_STATE_RUNNING:
-        return STEP_EXECUTOR_STATUS_OK;
+        return MOTION_EVENT_SOURCE_STATUS_OK;
     case STEP_EXECUTOR_STATE_COMPLETE:
-        return STEP_EXECUTOR_STATUS_COMPLETE;
+        return MOTION_EVENT_SOURCE_STATUS_COMPLETE;
     case STEP_EXECUTOR_STATE_UNDERRUN:
-        return STEP_EXECUTOR_STATUS_UNDERRUN;
+        return MOTION_EVENT_SOURCE_STATUS_UNDERRUN;
     default:
-        return STEP_EXECUTOR_STATUS_NOT_RUNNING;
+        return MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING;
     }
 }
 
-uint32_t step_executor_get_underrun_count(void) { return step_executor_underruns; }
+uint32_t step_executor_get_underrun_count(const StepExecutor_t *executor) { return executor->underruns; }
 
-void step_executor_reset(void) {
-    step_executor_state = STEP_EXECUTOR_STATE_IDLE;
-    step_executor_current_is_last = 0U;
+void step_executor_reset(StepExecutor_t *executor) {
+    executor->state = STEP_EXECUTOR_STATE_IDLE;
+    executor->current_is_last = 0U;
+}
+
+static MotionEventSourceStatus_t step_executor_source_begin(void *context, MotionExecutionEvent_t *first_event) {
+    return step_executor_begin(context, first_event);
+}
+
+static MotionEventSourceStatus_t
+step_executor_source_pulse_complete(void *context, MotionExecutionEvent_t *next_event) {
+    return step_executor_pulse_complete(context, next_event);
+}
+
+static void step_executor_source_reset(void *context) { step_executor_reset(context); }
+
+MotionEventSource_t step_executor_event_source(StepExecutor_t *executor) {
+    return (MotionEventSource_t){
+        .context = executor,
+        .begin = step_executor_source_begin,
+        .pulse_complete = step_executor_source_pulse_complete,
+        .reset = step_executor_source_reset,
+    };
 }

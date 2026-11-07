@@ -9,7 +9,6 @@
 #include "diagnostic_dto.h"
 #include "motion/execution_buffer.h"
 #include "motion/plan_buffer.h"
-#include "motion/step_executor.h"
 #include "network_events.h"
 #include "task_context.h"
 #include "task_names.h"
@@ -156,7 +155,7 @@ static void diagnostic_task_collect_buffers(DiagnosticPayloadDTO_t *payload) {
 
     payload->execution_buffer = (ExecutionBufferDiagnosticsDTO_t){
         .level = execution_buffer_count(),
-        .underruns = step_executor_get_underrun_count(),
+        .underruns = motion_task_get_stream_underrun_count(),
     };
 }
 

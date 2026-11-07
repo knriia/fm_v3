@@ -3,9 +3,11 @@
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
 #include "motion/plan_buffer.h"
+#include "motion/step_executor.h"
 #include "motion_axis_hardware.h"
 #include "motion_task.h"
 
+#include <assert.h>
 #include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -219,6 +221,27 @@ MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const Mo
     fake->init_receive_calls = test_receive_calls;
     fake->status = config != NULL ? MOTION_AXIS_HARDWARE_STATUS_READY : MOTION_AXIS_HARDWARE_STATUS_FAULT_CONFIG;
     return fake->status;
+}
+
+static uint32_t test_event_source_registrations[MOTION_AXIS_HARDWARE_COUNT];
+static void *test_event_source_contexts[MOTION_AXIS_HARDWARE_COUNT];
+static uint32_t test_executor_underruns[MOTION_AXIS_HARDWARE_COUNT];
+
+MotionAxisHardwareStatus_t motion_axis_hardware_set_event_source(MotionAxis_t axis, const MotionEventSource_t *source) {
+    ++test_event_source_registrations[axis];
+    test_event_source_contexts[axis] = source->context;
+    return fake_axes[axis].status;
+}
+
+MotionEventSource_t step_executor_event_source(StepExecutor_t *executor) {
+    return (MotionEventSource_t){.context = executor};
+}
+
+/* motion_task keeps one executor per axis in an array; the X source is bound to its first element. */
+uint32_t step_executor_get_underrun_count(const StepExecutor_t *executor) {
+    const StepExecutor_t *first = test_event_source_contexts[MOTION_AXIS_X];
+    assert(first != NULL && executor >= first && executor < first + MOTION_AXIS_HARDWARE_COUNT);
+    return test_executor_underruns[executor - first];
 }
 
 MotionAxisHardwareStatus_t motion_axis_hardware_get_status(MotionAxis_t axis) { return fake_axes[axis].status; }
@@ -829,6 +852,24 @@ static void test_x_hardware_is_initialized_before_first_command(void) {
     expect_u32(fake_x_init_calls, 1U, "X hardware is initialized once at task start");
     expect_u32(fake_x_init_receive_calls, 0U, "X hardware is initialized before the first queue read");
     expect_u32(fake_x_bench_starts, 0U, "initialization does not start motion");
+}
+
+static void test_stream_event_source_is_registered_for_stream_axes_only(void) {
+    memset(test_event_source_registrations, 0, sizeof(test_event_source_registrations));
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    script_read(0U, osErrorResource, NULL);
+    test_jump_on_delay = 1U;
+
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(test_event_source_registrations[MOTION_AXIS_X], 1U, "X gets an event source");
+    expect_u32(test_event_source_registrations[MOTION_AXIS_Y], 0U, "Y has no planned stream yet");
+    expect_u32(test_event_source_registrations[MOTION_AXIS_Z], 0U, "Z has no planned stream yet");
+    expect_u32(test_event_source_contexts[MOTION_AXIS_X] != NULL, 1U, "the source is bound to an executor instance");
+
+    test_executor_underruns[MOTION_AXIS_X] = 3U;
+    test_executor_underruns[MOTION_AXIS_Y] = 4U;
+    expect_u32(motion_task_get_stream_underrun_count(), 7U, "underruns are summed over axes");
 }
 
 static void run_single_stop(MotionTaskContext_t *context, MotionAxisHardwareStatus_t status_after_init) {
@@ -1907,6 +1948,7 @@ int main(void) {
     test_calibration_failures();
     test_calibration_is_cancelled_and_guarded();
     test_x_hardware_is_initialized_before_first_command();
+    test_stream_event_source_is_registered_for_stream_axes_only();
     test_home_phase_outcomes();
     test_home_start_failures();
     test_commands_during_home();
