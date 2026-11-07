@@ -6,6 +6,7 @@
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
 #include "motion/plan_buffer.h"
+#include "motion/step_executor.h"
 #include "step_generator_task.h"
 
 #include "cmsis_os.h"
@@ -27,6 +28,9 @@
 static volatile MotionTaskDiagnostics motion_task_diagnostics = {
     .last_planner_status = MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
 };
+
+/* The planned step stream of each axis in MOTION_TASK_STREAM_AXES_MASK; the other entries stay unused. */
+static StepExecutor_t motion_task_stream_executors[MOTION_AXIS_HARDWARE_COUNT];
 
 /* The three homing moves; the switches, not step counts, end them. */
 typedef struct {
@@ -676,6 +680,10 @@ void MotionTask(void *argument) {
         axes[axis].axis = (MotionAxis_t)axis;
         axes[axis].calibration.procedure.axis = (MotionAxis_t)axis;
         (void)motion_axis_hardware_init((MotionAxis_t)axis, motion_task_hardware_config((MotionAxis_t)axis));
+        if (((1U << axis) & MOTION_TASK_STREAM_AXES_MASK) != 0U) {
+            const MotionEventSource_t source = step_executor_event_source(&motion_task_stream_executors[axis]);
+            (void)motion_axis_hardware_set_event_source((MotionAxis_t)axis, &source);
+        }
     }
     motion_task_load_calibration(context);
     motion_task_publish_axes(axes, context);
@@ -726,6 +734,14 @@ void MotionTask(void *argument) {
         motion_task_poll_axes(axes, context);
         motion_task_publish_axes(axes, context);
     }
+}
+
+uint32_t motion_task_get_stream_underrun_count(void) {
+    uint32_t underruns = 0U;
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        underruns += step_executor_get_underrun_count(&motion_task_stream_executors[axis]);
+    }
+    return underruns;
 }
 
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics) {

@@ -146,7 +146,7 @@ PlanBufferStatus_t plan_buffer_get_diagnostics(PlanBufferDiagnostics_t *diagnost
 
 uint32_t execution_buffer_count(void) { return test_execution_buffer_level; }
 
-uint32_t step_executor_get_underrun_count(void) { return test_underruns; }
+uint32_t motion_task_get_stream_underrun_count(void) { return test_underruns; }
 
 uint32_t osEventFlagsWait(osEventFlagsId_t event_flags_id, uint32_t flags, uint32_t options, uint32_t timeout) {
     (void)event_flags_id;

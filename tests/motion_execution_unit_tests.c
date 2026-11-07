@@ -252,67 +252,69 @@ static MotionExecutionEvent_t make_event(uint32_t sequence, uint8_t last) {
     };
 }
 
+static StepExecutor_t executor;
+
 static void test_step_executor_completion_and_underrun(void) {
     execution_buffer_clear();
-    step_executor_reset();
+    step_executor_reset(&executor);
     MotionExecutionEvent_t first = make_event(1U, 0U);
     MotionExecutionEvent_t second = make_event(1U, 1U);
     MotionExecutionEvent_t output = {0};
     assert(execution_buffer_try_push(&first) == EXECUTION_BUFFER_STATUS_OK);
     assert(execution_buffer_try_push(&second) == EXECUTION_BUFFER_STATUS_OK);
-    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
+    assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
     assert(output.sequence == 1U && output.last_in_block == 0U);
-    assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_OK);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_OK);
+    assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_OK);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
     assert(output.last_in_block == 1U);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_COMPLETE);
-    assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_COMPLETE);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_COMPLETE);
+    assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_COMPLETE);
 
-    step_executor_reset();
+    step_executor_reset(&executor);
     first = make_event(2U, 0U);
     assert(execution_buffer_try_push(&first) == EXECUTION_BUFFER_STATUS_OK);
-    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
-    const uint32_t underruns_before = step_executor_get_underrun_count();
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_UNDERRUN);
-    assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_UNDERRUN);
-    assert(step_executor_get_underrun_count() == underruns_before + 1U);
+    assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
+    const uint32_t underruns_before = step_executor_get_underrun_count(&executor);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_UNDERRUN);
+    assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_UNDERRUN);
+    assert(step_executor_get_underrun_count(&executor) == underruns_before + 1U);
 
     /* Queued blocks run back to back: the end of one block is not a stop when the next one is waiting. */
     execution_buffer_clear();
-    step_executor_reset();
+    step_executor_reset(&executor);
     MotionExecutionEvent_t block_end = make_event(3U, 1U);
     MotionExecutionEvent_t next_block = make_event(4U, 1U);
     assert(execution_buffer_try_push(&block_end) == EXECUTION_BUFFER_STATUS_OK);
     assert(execution_buffer_try_push(&next_block) == EXECUTION_BUFFER_STATUS_OK);
-    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
+    assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
     assert(output.sequence == 3U);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_OK);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
     assert(output.sequence == 4U && output.last_in_block == 1U);
-    assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_OK);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_COMPLETE);
+    assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_OK);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_COMPLETE);
 }
 
 static void test_step_executor_state_guards(void) {
     execution_buffer_clear();
-    step_executor_reset();
+    step_executor_reset(&executor);
     MotionExecutionEvent_t output = {0};
 
-    assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_NOT_RUNNING);
-    assert(step_executor_begin(NULL) == STEP_EXECUTOR_STATUS_INVALID_ARGUMENT);
-    assert(step_executor_pulse_complete(NULL) == STEP_EXECUTOR_STATUS_INVALID_ARGUMENT);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_NOT_RUNNING);
+    assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING);
+    assert(step_executor_begin(&executor, NULL) == MOTION_EVENT_SOURCE_STATUS_INVALID_ARGUMENT);
+    assert(step_executor_pulse_complete(&executor, NULL) == MOTION_EVENT_SOURCE_STATUS_INVALID_ARGUMENT);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING);
 
-    const uint32_t underruns_before = step_executor_get_underrun_count();
-    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_UNDERRUN);
-    assert(step_executor_get_underrun_count() == underruns_before);
+    const uint32_t underruns_before = step_executor_get_underrun_count(&executor);
+    assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_UNDERRUN);
+    assert(step_executor_get_underrun_count(&executor) == underruns_before);
 
-    step_executor_reset();
+    step_executor_reset(&executor);
     MotionExecutionEvent_t event = make_event(3U, 1U);
     assert(execution_buffer_try_push(&event) == EXECUTION_BUFFER_STATUS_OK);
-    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_OK);
-    assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_NOT_RUNNING);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_COMPLETE);
-    assert(step_executor_pulse_complete(&output) == STEP_EXECUTOR_STATUS_COMPLETE);
+    assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
+    assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_COMPLETE);
+    assert(step_executor_pulse_complete(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_COMPLETE);
 }
 
 static void test_step_executor_rejects_invalid_events(void) {
@@ -328,12 +330,37 @@ static void test_step_executor_rejects_invalid_events(void) {
 
     for (uint32_t index = 0U; index < 5U; ++index) {
         execution_buffer_clear();
-        step_executor_reset();
+        step_executor_reset(&executor);
         MotionExecutionEvent_t output = {0};
         assert(execution_buffer_try_push(&invalid_events[index]) == EXECUTION_BUFFER_STATUS_OK);
-        assert(step_executor_begin(&output) == STEP_EXECUTOR_STATUS_INVALID_ARGUMENT);
-        assert(step_executor_get_status() == STEP_EXECUTOR_STATUS_NOT_RUNNING);
+        assert(step_executor_begin(&executor, &output) == MOTION_EVENT_SOURCE_STATUS_INVALID_ARGUMENT);
+        assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING);
     }
+}
+
+static void test_step_executor_event_source_adapter(void) {
+    execution_buffer_clear();
+    StepExecutor_t source_executor = {0};
+    const MotionEventSource_t source = step_executor_event_source(&source_executor);
+    assert(source.context == &source_executor);
+    assert(source.begin != NULL && source.pulse_complete != NULL && source.reset != NULL);
+
+    MotionExecutionEvent_t output = {0};
+    MotionExecutionEvent_t first = make_event(5U, 0U);
+    MotionExecutionEvent_t last = make_event(5U, 1U);
+    assert(execution_buffer_try_push(&first) == EXECUTION_BUFFER_STATUS_OK);
+    assert(execution_buffer_try_push(&last) == EXECUTION_BUFFER_STATUS_OK);
+    assert(source.begin(source.context, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
+    assert(output.sequence == 5U && output.last_in_block == 0U);
+    assert(source.pulse_complete(source.context, &output) == MOTION_EVENT_SOURCE_STATUS_OK);
+    assert(output.last_in_block == 1U);
+    assert(source.pulse_complete(source.context, &output) == MOTION_EVENT_SOURCE_STATUS_COMPLETE);
+    source.reset(source.context);
+    assert(step_executor_get_status(&source_executor) == MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING);
+
+    /* Instances do not share state: the first one stayed idle. */
+    assert(step_executor_get_status(&executor) == MOTION_EVENT_SOURCE_STATUS_NOT_RUNNING);
+    assert(step_executor_get_underrun_count(&source_executor) == 0U);
 }
 
 int main(void) {
@@ -347,6 +374,7 @@ int main(void) {
     test_step_executor_completion_and_underrun();
     test_step_executor_state_guards();
     test_step_executor_rejects_invalid_events();
+    test_step_executor_event_source_adapter();
     puts("motion execution unit tests passed");
     return 0;
 }
