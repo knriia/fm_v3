@@ -126,6 +126,8 @@ add_executable(${PROJECT_NAME}.elf ${SOURCES} ${LINKER_SCRIPT})
 # -fno-math-errno lets sqrt() become a single VSQRT instruction.
 set_source_files_properties(
         BSP/MCU/motion_axis_hardware.c
+        BSP/MCU/step_stream_axis.c
+        BSP/MCU/step_stream_format.c
         APP/motion/step_executor.c
         APP/motion/execution_buffer.c
         PROPERTIES COMPILE_OPTIONS "-O2;-fno-math-errno")

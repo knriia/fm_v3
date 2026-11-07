@@ -3,6 +3,7 @@ Debug/
 Release/
 /cmake-build-debug
 /tests/build/
+/docs
 cmake-build-*/
 .clangd
 *.elf
