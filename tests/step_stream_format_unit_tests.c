@@ -27,6 +27,14 @@ static void test_fill_rejects_invalid_pulse_and_period(void) {
     assert(step_stream_format_fill(buffer, 1U, 100U, 101U) == STEP_STREAM_FORMAT_STATUS_INVALID_ARGUMENT);
 }
 
+static void test_fill_rejects_invalid_buffer_and_record_count(void) {
+    uint16_t buffer[STEP_STREAM_FORMAT_DMA_BURST_LENGTH];
+
+    assert(step_stream_format_fill(NULL, 1U, 100U, 10U) == STEP_STREAM_FORMAT_STATUS_INVALID_ARGUMENT);
+    assert(step_stream_format_fill(buffer, 0U, 100U, 10U) == STEP_STREAM_FORMAT_STATUS_INVALID_ARGUMENT);
+    assert(step_stream_format_fill(buffer, SIZE_MAX, 100U, 10U) == STEP_STREAM_FORMAT_STATUS_INVALID_ARGUMENT);
+}
+
 static void test_steps_done_accounts_for_burst_and_preload(void) {
     const uint32_t record_count = 4U;
     const uint32_t total_transfers = record_count * STEP_STREAM_FORMAT_DMA_BURST_LENGTH;
@@ -47,13 +55,30 @@ static void test_steps_done_rejects_invalid_ndtr_and_handles_zero_played_records
     assert(step_stream_format_steps_done(0U, record_count, total_transfers) == 0U);
     assert(step_stream_format_steps_done(0U, record_count, total_transfers + 1U) == 0U);
     assert(step_stream_format_steps_done(0U, 3U, total_transfers) == 0U);
+    assert(step_stream_format_steps_done(0U, 0U, 0U) == 0U);
+}
+
+static void test_steps_done_in_second_pass_of_even_half(void) {
+    const uint32_t record_count = 4U;
+    const uint32_t total_transfers = record_count * STEP_STREAM_FORMAT_DMA_BURST_LENGTH;
+    const uint32_t half_transfers = total_transfers / 2U;
+
+    /* Even completed halves with NDTR already below half: the interrupt has not counted the half-transfer yet. */
+    assert(step_stream_format_steps_done(2U, record_count, half_transfers - 1U) == 3U);
+}
+
+static void test_steps_done_saturates_to_uint32_max(void) {
+    assert(step_stream_format_steps_done(UINT32_MAX, 4U, 12U) == UINT32_MAX);
 }
 
 int main(void) {
     test_fill_accepts_period_boundaries();
     test_fill_rejects_invalid_pulse_and_period();
+    test_fill_rejects_invalid_buffer_and_record_count();
     test_steps_done_accounts_for_burst_and_preload();
     test_steps_done_rejects_invalid_ndtr_and_handles_zero_played_records();
+    test_steps_done_in_second_pass_of_even_half();
+    test_steps_done_saturates_to_uint32_max();
     puts("Step stream format unit tests passed");
     return 0;
 }
