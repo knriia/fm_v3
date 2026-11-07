@@ -48,9 +48,10 @@ MEMORY
   FLASH    (rx)    : ORIGIN = 0x08000000,   LENGTH = 896K
   /* Last 128 KB sector (sector 7) holds machine settings; it is erased separately, so no code may live here. */
   SETTINGS (r)     : ORIGIN = 0x080E0000,   LENGTH = 128K
-  RAM_D1  (xrw)    : ORIGIN = 0x24000000,   LENGTH = 320K
-  RAM_D2  (xrw)    : ORIGIN = 0x30000000,   LENGTH = 32K
-  RAM_D3  (xrw)    : ORIGIN = 0x38000000,   LENGTH = 16K
+  RAM_D1      (xrw) : ORIGIN = 0x24000000,   LENGTH = 256K
+  RAM_D1_DMA  (xrw) : ORIGIN = 0x24040000,   LENGTH = 64K
+  RAM_D2      (xrw) : ORIGIN = 0x30000000,   LENGTH = 32K
+  RAM_D3      (xrw) : ORIGIN = 0x38000000,   LENGTH = 16K
 }
 
 /* Settings sector contract used by the flash storage driver. */
@@ -176,6 +177,24 @@ SECTIONS
   } >RAM_D1
   ASSERT(__lwip_pool_end__ <= (ORIGIN(RAM_D1) + LENGTH(RAM_D1)),
          "LwIP pools do not fit in RAM_D1")
+
+  /* Stepper stream buffers occupy the dedicated non-cacheable D1 DMA area. */
+  .stepper_dma_buffers (NOLOAD) :
+  {
+    . = ALIGN(64K);
+    __stepper_dma_buffers_start__ = .;
+    KEEP(*(.stepper_dma_buffers))
+    . = __stepper_dma_buffers_start__ + LENGTH(RAM_D1_DMA);
+    __stepper_dma_buffers_end__ = .;
+  } >RAM_D1_DMA
+  ASSERT((__stepper_dma_buffers_start__ % 0x10000) == 0,
+         "Stepper DMA buffers are not 64K-aligned")
+  ASSERT((__stepper_dma_buffers_end__ - __stepper_dma_buffers_start__) == LENGTH(RAM_D1_DMA),
+         "Stepper DMA buffer area size changed")
+  ASSERT(__stepper_dma_buffers_start__ == ORIGIN(RAM_D1_DMA),
+         "Stepper DMA buffers are not at the RAM_D1_DMA base")
+  ASSERT(__stepper_dma_buffers_end__ <= (ORIGIN(RAM_D1_DMA) + LENGTH(RAM_D1_DMA)),
+         "Stepper DMA buffers do not fit in RAM_D1_DMA")
 
   /* Ethernet DMA descriptors must be placed in D2 SRAM, accessible by ETH DMA. */
   .RxDecripSection (NOLOAD) :

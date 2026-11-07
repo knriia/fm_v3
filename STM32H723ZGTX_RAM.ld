@@ -6,7 +6,7 @@
 **  Author      : STM32CubeIDE
 **
 **  Abstract    : Linker script for STM32H7 series
-**                320Kbytes RAM_EXEC and 240Kbytes RAM
+**                256Kbytes RAM_EXEC and 240Kbytes RAM
 **
 **                Set heap size, stack size and stack location according
 **                to application requirements.
@@ -43,11 +43,12 @@ _Min_Stack_Size = 0x400 ; /* required amount of stack */
 /* Specify the memory areas */
 MEMORY
 {
-  RAM_EXEC (xrw)  : ORIGIN = 0x24000000, LENGTH = 320K
-  DTCMRAM  (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
-  ITCMRAM (xrw)   : ORIGIN = 0x00000000, LENGTH = 64K
-  RAM_D2  (xrw)   : ORIGIN = 0x30000000, LENGTH = 32K
-  RAM_D3  (xrw)   : ORIGIN = 0x38000000, LENGTH = 16K
+  RAM_EXEC    (xrw) : ORIGIN = 0x24000000, LENGTH = 256K
+  RAM_D1_DMA  (xrw) : ORIGIN = 0x24040000, LENGTH = 64K
+  DTCMRAM     (xrw) : ORIGIN = 0x20000000, LENGTH = 128K
+  ITCMRAM     (xrw) : ORIGIN = 0x00000000, LENGTH = 64K
+  RAM_D2      (xrw) : ORIGIN = 0x30000000, LENGTH = 32K
+  RAM_D3      (xrw) : ORIGIN = 0x38000000, LENGTH = 16K
 }
 
 /* Ethernet memory layout contract. Keep these values in sync with the
@@ -168,6 +169,24 @@ SECTIONS
   } >RAM_EXEC
   ASSERT(__lwip_pool_end__ <= (ORIGIN(RAM_EXEC) + LENGTH(RAM_EXEC)),
          "LwIP pools do not fit in RAM_EXEC")
+
+  /* Stepper stream buffers occupy the dedicated non-cacheable D1 DMA area. */
+  .stepper_dma_buffers (NOLOAD) :
+  {
+    . = ALIGN(64K);
+    __stepper_dma_buffers_start__ = .;
+    KEEP(*(.stepper_dma_buffers))
+    . = __stepper_dma_buffers_start__ + LENGTH(RAM_D1_DMA);
+    __stepper_dma_buffers_end__ = .;
+  } >RAM_D1_DMA
+  ASSERT((__stepper_dma_buffers_start__ % 0x10000) == 0,
+         "Stepper DMA buffers are not 64K-aligned")
+  ASSERT((__stepper_dma_buffers_end__ - __stepper_dma_buffers_start__) == LENGTH(RAM_D1_DMA),
+         "Stepper DMA buffer area size changed")
+  ASSERT(__stepper_dma_buffers_start__ == ORIGIN(RAM_D1_DMA),
+         "Stepper DMA buffers are not at the RAM_D1_DMA base")
+  ASSERT(__stepper_dma_buffers_end__ <= (ORIGIN(RAM_D1_DMA) + LENGTH(RAM_D1_DMA)),
+         "Stepper DMA buffers do not fit in RAM_D1_DMA")
 
   /* Ethernet DMA descriptors must be placed in D2 SRAM, accessible by ETH DMA. */
   .RxDecripSection (NOLOAD) :
