@@ -120,6 +120,11 @@ add_executable(step_stream_generator_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/step_stream_generator.c
 )
 
+add_executable(step_stream_ring_unit_tests
+    step_stream_ring_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/step_stream_ring.c
+)
+
 target_include_directories(diagnostic_protocol_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
@@ -257,6 +262,11 @@ target_include_directories(step_stream_generator_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
 )
 
+target_include_directories(step_stream_ring_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
+)
+
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(diagnostic_protocol_tests PRIVATE
         -Wall
@@ -354,6 +364,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(step_stream_ring_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
 endif ()
 
 if (FM_V3_ENABLE_LLVM_COVERAGE)
@@ -409,3 +424,4 @@ add_test(NAME axis_calibration_run_unit_tests COMMAND axis_calibration_run_unit_
 add_test(NAME axis_bench_unit_tests COMMAND axis_bench_unit_tests)
 add_test(NAME step_stream_format_unit_tests COMMAND step_stream_format_unit_tests)
 add_test(NAME step_stream_generator_unit_tests COMMAND step_stream_generator_unit_tests)
+add_test(NAME step_stream_ring_unit_tests COMMAND step_stream_ring_unit_tests)

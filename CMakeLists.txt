@@ -129,6 +129,7 @@ set_source_files_properties(
         BSP/MCU/step_stream_axis.c
         BSP/MCU/step_stream_format.c
         APP/motion/step_stream_generator.c
+        APP/motion/step_stream_ring.c
         APP/motion/step_executor.c
         APP/motion/execution_buffer.c
         PROPERTIES COMPILE_OPTIONS "-O2;-fno-math-errno")
