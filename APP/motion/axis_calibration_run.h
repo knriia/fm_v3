@@ -43,10 +43,42 @@ typedef enum {
     AXIS_CALIBRATION_RUN_RESULT_LIMITS_CONFLICT
 } AxisCalibrationRunResult_t;
 
+/* How a move of the procedure ended, as seen by the mover that drives the axis. */
+typedef enum {
+    AXIS_CALIBRATION_RUN_MOVE_RUNNING = 0,
+    /* Every commanded step was played. */
+    AXIS_CALIBRATION_RUN_MOVE_COMPLETED,
+    /* The end switch stopped the move. */
+    AXIS_CALIBRATION_RUN_MOVE_END_LIMIT,
+    /* Any other stop: the axis did not travel as commanded. */
+    AXIS_CALIBRATION_RUN_MOVE_FAILED
+} AxisCalibrationRunMoveState_t;
+
+/* Drives the moves of the procedure. An axis moved by its own jog and an axis moved by the planned step stream
+ * differ only here; the procedure itself is the same. */
+typedef struct {
+    /* Starts a constant-profile move of `steps` steps; returns 0 when it did not start. */
+    uint8_t (*start)(
+        MotionAxis_t axis,
+        const MotionAxisHardwareConfig_t *config,
+        AxisBenchDirection_t direction,
+        uint32_t steps,
+        const AxisBenchProfile_t *profile
+    );
+    /* `steps` is the length given to start. */
+    AxisCalibrationRunMoveState_t (*poll)(MotionAxis_t axis, uint32_t steps);
+    /* Stops the move that is running. */
+    void (*abort)(MotionAxis_t axis);
+} AxisCalibrationRunMover_t;
+
+/* Moves the axis with its own jog profile (axis_bench). */
+extern const AxisCalibrationRunMover_t axis_calibration_run_jog_mover;
+
 typedef struct {
     MotionAxis_t axis;
     /* Set by begin and used while the procedure is active. */
     const AxisCalibrationRunSettings_t *settings;
+    const AxisCalibrationRunMover_t *mover;
     AxisCalibrationRunPhase_t phase;
     uint32_t travel_um;
     int32_t measure_start_um;
@@ -54,12 +86,13 @@ typedef struct {
 
 /* Starts at the homed start switch with the scale zeroed there: drives to the end switch to measure the travel,
  * takes up the slack back toward the start, then measures one long move further toward the start. The scale is
- * read through config->position_reader, which must not be NULL; `settings` must outlive the procedure. */
+ * read through config->position_reader, which must not be NULL; `settings` and `mover` must outlive the procedure. */
 AxisCalibrationRunResult_t axis_calibration_run_begin(
     AxisCalibrationRun_t *run,
     MotionAxis_t axis,
     const MotionAxisHardwareConfig_t *config,
-    const AxisCalibrationRunSettings_t *settings
+    const AxisCalibrationRunSettings_t *settings,
+    const AxisCalibrationRunMover_t *mover
 );
 /* Supervises the active phase; on OK `result` holds the measured axis values. */
 AxisCalibrationRunResult_t axis_calibration_run_poll(

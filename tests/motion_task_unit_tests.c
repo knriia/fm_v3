@@ -343,15 +343,23 @@ static uint32_t fake_calibration_abort_calls;
 static MotionAxis_t fake_calibration_last_axis;
 
 static const AxisCalibrationRunSettings_t *fake_calibration_last_settings;
+static const AxisCalibrationRunMover_t *fake_calibration_last_mover;
+
+/* Only its address matters here: the jog mover is covered through the axis_calibration_run tests. A move of it is
+ * never made, so it has no functions to call. */
+const AxisCalibrationRunMover_t axis_calibration_run_jog_mover = {0};
 
 AxisCalibrationRunResult_t axis_calibration_run_begin(
     AxisCalibrationRun_t *run,
     MotionAxis_t axis,
     const MotionAxisHardwareConfig_t *config,
-    const AxisCalibrationRunSettings_t *settings
+    const AxisCalibrationRunSettings_t *settings,
+    const AxisCalibrationRunMover_t *mover
 ) {
     (void)config;
     fake_calibration_last_settings = settings;
+    fake_calibration_last_mover = mover;
+    run->mover = mover;
     ++fake_calibration_begin_calls;
     fake_calibration_last_axis = axis;
     run->axis = axis;
@@ -379,6 +387,9 @@ AxisCalibrationRunResult_t axis_calibration_run_poll(
 
 void axis_calibration_run_abort(AxisCalibrationRun_t *run) {
     ++fake_calibration_abort_calls;
+    if (run->mover != NULL && run->mover->abort != NULL) {
+        run->mover->abort(run->axis);
+    }
     run->phase = AXIS_CALIBRATION_RUN_PHASE_IDLE;
 }
 
@@ -487,6 +498,7 @@ static void reset_receive_script(void) {
     fake_calibration_poll_calls = 0U;
     fake_calibration_abort_calls = 0U;
     fake_calibration_last_axis = MOTION_AXIS_X;
+    fake_calibration_last_mover = NULL;
 }
 
 static void script_read(uint32_t index, osStatus_t status, const CommandDTO_t *command) {
@@ -1127,6 +1139,127 @@ static void test_calibration_runs_after_homing_and_applies_result(void) {
     motion_task_get_axis_diagnostics(MOTION_AXIS_X, &axis);
     expect_u32(axis.calibration_result, AXIS_CALIBRATION_RUN_RESULT_ABORTED, "STOP aborts the final homing");
     expect_u32(axis.homed, 0U, "aborted final homing leaves X unhomed");
+}
+
+static const CommandDTO_t test_calibrate_y_command = {
+    .sequence = 141U,
+    .code = COMMAND_CODE_CALIBRATE,
+    .parameters.calibrate.axes = MOTION_PLANNER_AXIS_Y_MASK,
+};
+
+/* CALIBRATE of `command`'s axis, homing on reads 1..3; the procedure starts on read 3. A final read 4 follows when
+ * `final_command` is given or `final_status` is not osOK. */
+static void run_calibration_until_start(
+    MotionTaskContext_t *context,
+    MotionAxis_t axis,
+    const CommandDTO_t *command,
+    osStatus_t final_status,
+    const CommandDTO_t *final_command
+) {
+    reset_receive_script();
+    *context = valid_motion_context();
+    script_axis_state(axis, 1U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
+    script_axis_state(
+        axis,
+        2U,
+        MOTION_AXIS_HARDWARE_STATUS_STOPPED,
+        MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE,
+        0U
+    );
+    script_axis_state(axis, 3U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
+    script_read(0U, osOK, command);
+    for (uint32_t index = 1U; index <= 3U; ++index) {
+        script_read(index, osErrorTimeout, NULL);
+    }
+    if (final_command != NULL || final_status != osOK) {
+        script_read(4U, final_status, final_command);
+    }
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(context);
+}
+
+static void test_calibration_moves_follow_the_axis_kind(void) {
+    MotionTaskContext_t context;
+    const MotionAxisHardwareConfig_t hardware = {0};
+    const AxisBenchProfile_t profile = {1000U, 2000U, 2000U};
+
+    run_calibration_until_start(&context, MOTION_AXIS_Y, &test_calibrate_y_command, osOK, NULL);
+    expect_u32(fake_calibration_begin_calls, 1U, "Y calibration starts after its homing");
+    expect_u32(fake_calibration_last_mover == &axis_calibration_run_jog_mover, 1U, "Y moves by its own jog");
+
+    run_calibration_until_start(&context, MOTION_AXIS_X, &test_calibrate_x_command, osOK, NULL);
+    const AxisCalibrationRunMover_t *mover = fake_calibration_last_mover;
+    expect_u32(mover != NULL && mover != &axis_calibration_run_jog_mover, 1U, "X moves by the planned stream");
+    if (mover == NULL || mover == &axis_calibration_run_jog_mover) {
+        return;
+    }
+
+    /* A block that cannot be built does not start. */
+    fake_x_failing_start = fake_x_bench_starts + 1U;
+    expect_u32(
+        mover->start(MOTION_AXIS_X, &hardware, AXIS_BENCH_TOWARD_END, 12345U, &profile),
+        0U,
+        "no block, no move"
+    );
+    fake_x_failing_start = 0U;
+
+    const uint32_t notifications = test_block_ready_notifications;
+    expect_u32(mover->start(MOTION_AXIS_X, &hardware, AXIS_BENCH_TOWARD_END, 12345U, &profile), 1U, "move starts");
+    expect_i64(fake_x_bench_last_signed_steps, 12345, "the move has the requested length");
+    expect_u32(fake_axes[MOTION_AXIS_X].bench_last_target_rate_hz, 2000U, "the move runs at the target rate");
+    expect_u32(test_block_ready_notifications, notifications + 1U, "the generator is told about the block");
+    plan_buffer_test_reset();
+
+    test_generator_busy = 1U;
+    test_generator_halted = 0U;
+    fake_x_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+    expect_u32(mover->poll(MOTION_AXIS_X, 12345U), AXIS_CALIBRATION_RUN_MOVE_RUNNING, "playing block runs");
+
+    fake_x_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
+    expect_u32(mover->poll(MOTION_AXIS_X, 12345U), AXIS_CALIBRATION_RUN_MOVE_END_LIMIT, "end switch ends the move");
+
+    test_generator_busy = 0U;
+    fake_x_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+    expect_u32(mover->poll(MOTION_AXIS_X, 12345U), AXIS_CALIBRATION_RUN_MOVE_COMPLETED, "played block completes");
+
+    test_generator_halted = 1U;
+    expect_u32(mover->poll(MOTION_AXIS_X, 12345U), AXIS_CALIBRATION_RUN_MOVE_FAILED, "halted generator fails");
+    expect_u32(test_generator_halted, 0U, "a failed move leaves the generator reset");
+
+    fake_x_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT;
+    expect_u32(mover->poll(MOTION_AXIS_X, 12345U), AXIS_CALIBRATION_RUN_MOVE_FAILED, "start switch fails the move");
+
+    fake_x_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
+    const uint32_t halts = test_generator_halts;
+    const uint32_t resumes = test_generator_resumes;
+    mover->abort(MOTION_AXIS_X);
+    expect_u32(test_generator_halts, halts + 1U, "abort stops the stream");
+    expect_u32(test_generator_resumes, resumes, "abort leaves the reset of the generator to STOP");
+    expect_u32(fake_x_stop_reason_clears > 0U, 1U, "abort does not leave the stop reason behind");
+}
+
+/* STOP and a queue failure while a calibration move runs: each axis kind is aborted its own way. */
+static void test_calibration_abort_follows_the_axis_kind(void) {
+    MotionTaskContext_t context;
+    const CommandDTO_t stop = {.sequence = 143U, .code = COMMAND_CODE_STOP};
+
+    /* The homing flushes the generator on every switch stop; that is the baseline of the runs below. */
+    run_calibration_until_start(&context, MOTION_AXIS_X, &test_calibrate_x_command, osErrorTimeout, NULL);
+    const uint32_t base_halts = test_generator_halts;
+    const uint32_t base_resumes = test_generator_resumes;
+
+    run_calibration_until_start(&context, MOTION_AXIS_X, &test_calibrate_x_command, osOK, &stop);
+    expect_u32(fake_calibration_abort_calls, 1U, "STOP aborts the X calibration");
+    expect_u32(test_generator_halts, base_halts + 1U, "STOP halts the stream of the calibration move");
+    expect_u32(test_generator_resumes, base_resumes + 1U, "STOP resets the generator once, when the axes are at rest");
+
+    run_calibration_until_start(&context, MOTION_AXIS_X, &test_calibrate_x_command, osErrorParameter, NULL);
+    expect_u32(fake_calibration_abort_calls, 1U, "a queue failure aborts the X calibration");
+    expect_u32(test_generator_halts, base_halts + 2U, "a queue failure halts the stream and flushes it");
+    expect_u32(test_generator_resumes, base_resumes + 1U, "a queue failure resets the generator, no STOP follows");
+
+    run_calibration_until_start(&context, MOTION_AXIS_Y, &test_calibrate_y_command, osErrorParameter, NULL);
+    expect_u32(fake_calibration_abort_calls, 1U, "a queue failure aborts the Y calibration");
 }
 
 static void test_calibration_failures(void) {
@@ -2162,6 +2295,8 @@ int main(void) {
     test_stored_calibration_sets_planner_limits();
     test_calibration_runs_after_homing_and_applies_result();
     test_calibration_failures();
+    test_calibration_moves_follow_the_axis_kind();
+    test_calibration_abort_follows_the_axis_kind();
     test_calibration_is_cancelled_and_guarded();
     test_x_hardware_is_initialized_before_first_command();
     test_stream_event_source_is_registered_for_stream_axes_only();
