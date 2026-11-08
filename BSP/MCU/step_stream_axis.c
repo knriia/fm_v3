@@ -8,6 +8,7 @@
 #include "stm32h723xx.h"
 #include "system_stm32h7xx.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Must not be numerically below configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5): the interrupt calls FreeRTOS. */
@@ -22,8 +23,6 @@
 #define STEP_STREAM_AXIS_STEP_PIN_MASK (1UL << STEP_STREAM_AXIS_STEP_PIN)
 #define STEP_STREAM_AXIS_TIMER_DBA_ARR 11U
 #define STEP_STREAM_AXIS_TIMER_DBL 2U
-#define STEP_STREAM_AXIS_RECORD_COUNT 2730U
-#define STEP_STREAM_AXIS_HALF_RECORD_COUNT (STEP_STREAM_AXIS_RECORD_COUNT / 2U)
 #define STEP_STREAM_AXIS_BUFFER_WORD_COUNT (STEP_STREAM_AXIS_RECORD_COUNT * STEP_STREAM_FORMAT_DMA_BURST_LENGTH)
 #define STEP_STREAM_AXIS_NANOSECONDS_PER_SECOND 1000000000ULL
 #define STEP_STREAM_AXIS_MAX_PERIOD_TICKS 65536U
@@ -183,14 +182,17 @@ static void step_stream_axis_configure_timer(uint32_t period_ticks, uint32_t pul
     TIM4->SR = 0U;
 }
 
-static void step_stream_axis_configure_dma(void) {
+/* Returns 0 when the stream did not disable; the DMA registers are then left untouched. */
+static uint8_t step_stream_axis_configure_dma(void) {
     RCC->AHB1ENR |= STEP_STREAM_AXIS_DMA1_ENABLE;
     (void)RCC->AHB1ENR;
     __DSB();
 
     STEP_STREAM_AXIS_DMA_CHANNEL->CCR = STEP_STREAM_AXIS_DMA_REQUEST_TIM4_UP;
     STEP_STREAM_AXIS_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-    (void)step_stream_axis_logic_poll(step_stream_axis_dma_disabled, STEP_STREAM_AXIS_DMA_DISABLE_MAX_POLLS);
+    if (step_stream_axis_logic_poll(step_stream_axis_dma_disabled, STEP_STREAM_AXIS_DMA_DISABLE_MAX_POLLS) == 0U) {
+        return 0U;
+    }
 
     step_stream_axis_clear_dma_flags();
     STEP_STREAM_AXIS_DMA_STREAM->PAR = (uint32_t)&TIM4->DMAR;
@@ -203,6 +205,7 @@ static void step_stream_axis_configure_dma(void) {
     NVIC_SetPriority(DMA1_Stream0_IRQn, STEP_STREAM_AXIS_DMA_IRQ_PRIORITY);
     NVIC_EnableIRQ(DMA1_Stream0_IRQn);
     STEP_STREAM_AXIS_DMA_STREAM->CR |= DMA_SxCR_EN;
+    return 1U;
 }
 
 static uint32_t step_stream_axis_current_steps(void) {
@@ -216,15 +219,65 @@ static uint32_t step_stream_axis_current_steps(void) {
     return steps;
 }
 
-static StepStreamAxisStatus_t
-step_stream_axis_start_with_mode(uint32_t frequency_hz, uint32_t pulse_width_ns, uint8_t auto_refill);
+/* Common start: the ring is already prepared (stream) or prepared here (stand). The timer idles at period_ticks with
+ * the first pulse at pulse_ticks (0 = none) until the DMA delivers the first record. */
+static StepStreamAxisStatus_t step_stream_axis_launch(uint32_t period_ticks, uint32_t pulse_ticks, uint8_t stand) {
+    const uint32_t primask = step_stream_axis_enter_critical();
+    if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_BUSY;
+    }
 
-StepStreamAxisStatus_t step_stream_axis_start(uint32_t frequency_hz, uint32_t pulse_width_ns) {
-    return step_stream_axis_start_with_mode(frequency_hz, pulse_width_ns, 1U);
+    const MotionAxisHardwareStatus_t motion_status = motion_axis_hardware_get_status(MOTION_AXIS_X);
+    if (motion_status == MOTION_AXIS_HARDWARE_STATUS_STARTING || motion_status == MOTION_AXIS_HARDWARE_STATUS_WAITING ||
+        motion_status == MOTION_AXIS_HARDWARE_STATUS_RUNNING) {
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_AXIS_BUSY;
+    }
+
+    /* Decide on the ring before any register is touched, so a refusal leaves the hardware as it was. */
+    if (stand != 0U) {
+        if (step_stream_axis_logic_prepare_stand_ring(&step_stream_axis_ring) != 0U) {
+            step_stream_axis_exit_critical(primask);
+            return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+        }
+    } else {
+        const StepStreamRingStatus_t ring_status = step_stream_ring_start(&step_stream_axis_ring);
+        if (ring_status != STEP_STREAM_RING_STATUS_OK) {
+            step_stream_axis_exit_critical(primask);
+            return ring_status == STEP_STREAM_RING_STATUS_NOT_READY ? STEP_STREAM_AXIS_STATUS_NOT_READY
+                                                                    : STEP_STREAM_AXIS_STATUS_NOT_PREPARED;
+        }
+    }
+
+    RCC->APB1LENR |= STEP_STREAM_AXIS_TIMER_APB1_ENABLE;
+    (void)RCC->APB1LENR;
+    __DSB();
+    step_stream_axis_configure_gpio();
+    step_stream_axis_configure_timer(period_ticks, pulse_ticks);
+    step_stream_axis_completed_half_buffers = 0U;
+    step_stream_axis_last_steps_done = 0U;
+    step_stream_axis_last_stale_steps = 0U;
+    step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
+    step_stream_axis_auto_refill = stand;
+    if (step_stream_axis_configure_dma() == 0U) {
+        /* The ring was started above; return it to the start so that the next attempt begins clean. */
+        step_stream_ring_init(&step_stream_axis_ring);
+        step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_DMA;
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_DMA_ERROR;
+    }
+    TIM4->DIER = TIM_DIER_UDE;
+    step_stream_axis_state = STEP_STREAM_AXIS_STATE_STREAMING;
+    __DMB();
+    /* Enable the output only now: with CNT below CCR1 it would drive STEP high before the first period starts. */
+    TIM4->CCER = TIM_CCER_CC1E;
+    TIM4->CR1 |= TIM_CR1_CEN;
+    step_stream_axis_exit_critical(primask);
+    return STEP_STREAM_AXIS_STATUS_OK;
 }
 
-static StepStreamAxisStatus_t
-step_stream_axis_start_with_mode(uint32_t frequency_hz, uint32_t pulse_width_ns, uint8_t auto_refill) {
+StepStreamAxisStatus_t step_stream_axis_start(uint32_t frequency_hz, uint32_t pulse_width_ns) {
     if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
@@ -249,43 +302,75 @@ step_stream_axis_start_with_mode(uint32_t frequency_hz, uint32_t pulse_width_ns,
         ) != STEP_STREAM_FORMAT_STATUS_OK) {
         return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
     }
+    return step_stream_axis_launch(period_ticks, pulse_ticks, 1U);
+}
 
+StepStreamAxisStatus_t step_stream_axis_prepare_stream(void) {
     const uint32_t primask = step_stream_axis_enter_critical();
     if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
         step_stream_axis_exit_critical(primask);
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
-
-    const MotionAxisHardwareStatus_t motion_status = motion_axis_hardware_get_status(MOTION_AXIS_X);
-    if (motion_status == MOTION_AXIS_HARDWARE_STATUS_STARTING || motion_status == MOTION_AXIS_HARDWARE_STATUS_WAITING ||
-        motion_status == MOTION_AXIS_HARDWARE_STATUS_RUNNING) {
-        step_stream_axis_exit_critical(primask);
-        return STEP_STREAM_AXIS_STATUS_AXIS_BUSY;
-    }
-
-    RCC->APB1LENR |= STEP_STREAM_AXIS_TIMER_APB1_ENABLE;
-    (void)RCC->APB1LENR;
-    __DSB();
-    step_stream_axis_configure_gpio();
-    step_stream_axis_configure_timer(period_ticks, pulse_ticks);
-    step_stream_axis_completed_half_buffers = 0U;
+    /* The DMA is stopped and the interrupt ignores events while IDLE, so nobody else touches the ring. */
+    step_stream_ring_init(&step_stream_axis_ring);
+    step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
     step_stream_axis_last_steps_done = 0U;
     step_stream_axis_last_stale_steps = 0U;
-    step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
-    step_stream_axis_auto_refill = auto_refill;
-    if (step_stream_axis_logic_prepare_stand_ring(&step_stream_axis_ring) != 0U) {
-        step_stream_axis_exit_critical(primask);
-        return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
-    }
-    step_stream_axis_configure_dma();
-    TIM4->DIER = TIM_DIER_UDE;
-    step_stream_axis_state = STEP_STREAM_AXIS_STATE_STREAMING;
-    __DMB();
-    /* Enable the output only now: with CNT below CCR1 it would drive STEP high before the first period starts. */
-    TIM4->CCER = TIM_CCER_CC1E;
-    TIM4->CR1 |= TIM_CR1_CEN;
     step_stream_axis_exit_critical(primask);
     return STEP_STREAM_AXIS_STATUS_OK;
+}
+
+/* An IDLE axis whose ring still holds an earlier run must be prepared before the task touches the halves. */
+static uint8_t step_stream_axis_ring_needs_prepare(void) {
+    return (step_stream_axis_state == STEP_STREAM_AXIS_STATE_IDLE &&
+               step_stream_ring_get_state(&step_stream_axis_ring) != STEP_STREAM_RING_STATE_NOT_STARTED)
+               ? 1U
+               : 0U;
+}
+
+StepStreamAxisStatus_t step_stream_axis_acquire_half(uint8_t *half, uint16_t **records) {
+    if (half == NULL || records == NULL) {
+        return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (step_stream_axis_ring_needs_prepare() != 0U) {
+        return STEP_STREAM_AXIS_STATUS_NOT_PREPARED;
+    }
+    uint8_t candidate = 0U;
+    if (step_stream_ring_next_fill_request(&step_stream_axis_ring, &candidate) != STEP_STREAM_RING_STATUS_OK) {
+        return STEP_STREAM_AXIS_STATUS_NO_FILL_REQUEST;
+    }
+    *half = candidate;
+    *records = &step_stream_axis_dma_buffer
+                   [(size_t)candidate * STEP_STREAM_AXIS_HALF_RECORD_COUNT * STEP_STREAM_FORMAT_DMA_BURST_LENGTH];
+    return STEP_STREAM_AXIS_STATUS_OK;
+}
+
+StepStreamAxisStatus_t step_stream_axis_commit_half(uint8_t half) {
+    if (step_stream_axis_ring_needs_prepare() != 0U) {
+        return STEP_STREAM_AXIS_STATUS_NOT_PREPARED;
+    }
+    return step_stream_ring_mark_filled(&step_stream_axis_ring, half) == STEP_STREAM_RING_STATUS_OK
+               ? STEP_STREAM_AXIS_STATUS_OK
+               : STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+}
+
+StepStreamAxisStatus_t step_stream_axis_start_stream(uint32_t startup_period_ns) {
+    if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
+        return STEP_STREAM_AXIS_STATUS_BUSY;
+    }
+    const uint32_t timer_clock_hz = step_stream_axis_timer_clock_hz();
+    if (timer_clock_hz == 0U) {
+        return STEP_STREAM_AXIS_STATUS_CLOCK_ERROR;
+    }
+    const uint64_t ticks = step_stream_axis_ceil_div_u64(
+        (uint64_t)startup_period_ns * timer_clock_hz,
+        STEP_STREAM_AXIS_NANOSECONDS_PER_SECOND
+    );
+    if (startup_period_ns < STEP_STREAM_AXIS_MIN_STARTUP_NS || ticks < 2U ||
+        ticks > STEP_STREAM_AXIS_MAX_PERIOD_TICKS) {
+        return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    }
+    return step_stream_axis_launch((uint32_t)ticks, 0U, 0U);
 }
 
 /* Caller holds the critical section (or is the DMA interrupt itself) and the axis is STREAMING. */
