@@ -197,6 +197,10 @@ static uint32_t test_queue_discards;
 /* After this many 1 ms waits the X axis reports READY; 0 keeps it moving. */
 static uint32_t test_axis_settles_after_delays;
 
+static uint8_t test_generator_busy;
+
+uint8_t step_generator_task_is_busy(void) { return test_generator_busy; }
+
 void step_generator_task_halt(void) { ++test_generator_halts; }
 
 void step_generator_task_resume_after_stop(void) { ++test_generator_resumes; }
@@ -1522,6 +1526,42 @@ static void test_home_is_refused_when_it_cannot_start(void) {
     expect_u32(fake_x_bench_starts, 0U, "HOME without a task context is ignored");
 }
 
+static void test_home_and_calibrate_wait_for_the_planned_stream(void) {
+    MotionTaskContext_t context;
+
+    reset_receive_script();
+    context = valid_motion_context();
+    test_generator_busy = 1U;
+    script_read(0U, osOK, &test_home_x_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 0U, "HOME is ignored while the planned stream is busy");
+
+    reset_receive_script();
+    script_read(0U, osOK, &test_calibrate_x_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 0U, "CALIBRATE is ignored while the planned stream is busy");
+
+    test_generator_busy = 0U;
+}
+
+static void test_step_timing_comes_from_the_axis_config(void) {
+    uint32_t pulse_ns = 1U;
+    uint32_t low_ns = 2U;
+    motion_task_get_step_timing(MOTION_AXIS_X, &pulse_ns, &low_ns);
+    expect_u32(pulse_ns, 5000U, "X STEP pulse width");
+    expect_u32(low_ns, MOTION_AXIS_HARDWARE_DM556_MIN_STEP_LOW_NS, "X STEP low time");
+
+    pulse_ns = 1U;
+    low_ns = 2U;
+    motion_task_get_step_timing(MOTION_AXIS_HARDWARE_COUNT, &pulse_ns, &low_ns);
+    motion_task_get_step_timing(MOTION_AXIS_X, NULL, &low_ns);
+    motion_task_get_step_timing(MOTION_AXIS_X, &pulse_ns, NULL);
+    expect_u32(pulse_ns, 1U, "unknown axis leaves the pulse width");
+    expect_u32(low_ns, 2U, "unknown axis leaves the low time");
+}
+
 static void run_x_jog(MotionTaskContext_t *context, int32_t delta_um) {
     CommandDTO_t jog = test_x_jog_command;
     jog.parameters.x_jog.delta_um = delta_um;
@@ -1953,6 +1993,8 @@ int main(void) {
     test_home_start_failures();
     test_commands_during_home();
     test_home_is_refused_when_it_cannot_start();
+    test_home_and_calibrate_wait_for_the_planned_stream();
+    test_step_timing_comes_from_the_axis_config();
     test_x_jog_is_a_relative_planned_move();
     test_stop_fault_acknowledgement_edges();
     test_stop_clears_runtime_fault_and_x_homing();

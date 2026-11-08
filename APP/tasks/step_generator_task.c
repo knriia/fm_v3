@@ -1,8 +1,7 @@
 #include "step_generator_task.h"
 
-#include "motion/execution_buffer.h"
-#include "motion/motion_segment_generator.h"
 #include "motion/plan_buffer.h"
+#include "motion/step_stream_feeder.h"
 #include "motion_axis_hardware.h"
 #include "step_stream_axis.h"
 
@@ -11,26 +10,34 @@
 
 #include <stddef.h>
 
-#define STEP_GENERATOR_TASK_FLAG_BLOCK_READY (1UL << 0)
-#define STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE (1UL << 1)
-#define STEP_GENERATOR_TASK_FLAG_STOP_RESET (1UL << 2)
-#define STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED (1UL << 3)
-#define STEP_GENERATOR_TASK_FLAGS_ALL                                                                                  \
-    (STEP_GENERATOR_TASK_FLAG_BLOCK_READY | STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE |                                    \
-        STEP_GENERATOR_TASK_FLAG_STOP_RESET | STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED)
+/* X is the only axis with a planned stream so far (TIM4 CH1 and DMA1 stream 0 in step_stream_axis). */
+#define STEP_GENERATOR_TASK_AXIS MOTION_AXIS_X
+#define STEP_GENERATOR_TASK_PLANNER_AXIS_INDEX 0U
+/* The timer idles this long before the DMA delivers the first record of a stream. */
+#define STEP_GENERATOR_TASK_STARTUP_PERIOD_NS STEP_STREAM_AXIS_MIN_STARTUP_NS
+/* A record is never shorter than this: the DMA must finish a burst before the next timer update. */
+#define STEP_GENERATOR_TASK_MIN_RECORD_NS STEP_STREAM_AXIS_MIN_STARTUP_NS
+/* Filler record of an empty stretch. A half of them takes about 14 ms, which is how long a new block can wait behind
+ * an idle half; shorter records would only load the DMA interrupt more. */
+#define STEP_GENERATOR_TASK_IDLE_RECORD_NS 10000U
+/* DIR setup before the first STEP is at least this long; the shortest RTOS delay covers it. */
+#define STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS 1U
 
-typedef struct {
-    MotionSegmentGenerator_t generator;
-    /* Event already generated but not yet accepted by the full ExecutionBuffer. */
-    MotionExecutionEvent_t pending_event;
-    uint8_t block_active;
-    uint8_t event_pending;
-} StepGeneratorState_t;
+#define STEP_GENERATOR_TASK_FLAG_BLOCK_READY (1UL << 0)
+#define STEP_GENERATOR_TASK_FLAG_STOP_RESET (1UL << 1)
+#define STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED (1UL << 2)
+#define STEP_GENERATOR_TASK_FLAGS_ALL                                                                                  \
+    (STEP_GENERATOR_TASK_FLAG_BLOCK_READY | STEP_GENERATOR_TASK_FLAG_STOP_RESET |                                      \
+        STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED)
 
 static volatile StepGeneratorTaskDiagnostics step_generator_task_diagnostics;
-/* Written once at task start and read by MotionTask and the timer ISR to wake the task. */
+/* Owned by the task: only StepGeneratorTask touches it. */
+static StepStreamFeeder_t step_generator_task_feeder;
+/* Written once at task start and read by MotionTask and the DMA interrupt to wake the task. */
 static osThreadId_t volatile step_generator_task_thread_id;
-/* Set by STOP in another task and cleared by this task once its state is reset. */
+/* From the moment a block leaves the plan buffer until the stream has ended; STOP resets it. */
+static volatile uint8_t step_generator_task_stream_busy;
+/* Set by STOP in another task or by a ring fault in the DMA interrupt; cleared by this task once it is reset. */
 static volatile uint8_t step_generator_task_halted;
 
 static void step_generator_counter_increment(volatile uint32_t *counter) {
@@ -53,88 +60,140 @@ void step_generator_task_notify_ring_half_released(void) {
     step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED);
 }
 
-void step_generator_task_halt(void) { step_generator_task_halted = 1U; }
+void step_generator_task_halt(void) {
+    step_generator_task_halted = 1U;
+    /* The axis stops itself even if the task is in the middle of a fill: the start port checks the flag with task
+     * switching paused, so a stream cannot begin after this stop. */
+    step_stream_axis_stop();
+}
+
+uint8_t step_generator_task_is_busy(void) {
+    PlanBufferDiagnostics_t plan = {0};
+    /* Only a null pointer makes this fail, and the zeroed struct then reads as an empty plan. */
+    (void)plan_buffer_get_diagnostics(&plan);
+    return (uint8_t)(step_generator_task_stream_busy != 0U || plan.queued != 0U);
+}
 
 void step_generator_task_resume_after_stop(void) { step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_STOP_RESET); }
 
-/* Runs in the timer ISR when ExecutionBuffer drains to its low watermark. */
-static void step_generator_task_buffer_space_available(void) {
-    step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE);
+/* The ports below adapt the feeder to the stream axis and the plan buffer. */
+
+static StepStreamFeederAxisResult_t step_generator_task_port_result(StepStreamAxisStatus_t status) {
+    return status == STEP_STREAM_AXIS_STATUS_OK ? STEP_STREAM_FEEDER_AXIS_OK : STEP_STREAM_FEEDER_AXIS_ERROR;
 }
 
-/* Fills ExecutionBuffer until it is full or no planned block is left. */
-static void step_generator_task_fill(StepGeneratorState_t *state) {
-    for (;;) {
-        if (state->event_pending != 0U) {
-            if (execution_buffer_try_push(&state->pending_event) != EXECUTION_BUFFER_STATUS_OK) {
-                step_generator_counter_increment(&step_generator_task_diagnostics.buffer_full_waits);
-                return;
-            }
-            state->event_pending = 0U;
-            step_generator_counter_increment(&step_generator_task_diagnostics.events_generated);
-        }
-
-        if (state->block_active == 0U) {
-            MotionPlanBlock_t block;
-            if (plan_buffer_try_pop(&block) != PLAN_BUFFER_STATUS_OK) {
-                return;
-            }
-            if (motion_segment_generator_init(&state->generator, &block) != MOTION_SEGMENT_GENERATOR_STATUS_OK) {
-                /* The planner validated the block, so this is a defect; the block is skipped and counted. */
-                step_generator_counter_increment(&step_generator_task_diagnostics.generator_errors);
-                continue;
-            }
-            state->block_active = 1U;
-            step_generator_counter_increment(&step_generator_task_diagnostics.blocks_started);
-        }
-
-        const MotionSegmentGeneratorStatus_t status =
-            motion_segment_generator_next(&state->generator, &state->pending_event);
-        if (status == MOTION_SEGMENT_GENERATOR_STATUS_OK) {
-            state->event_pending = 1U;
-            continue;
-        }
-        state->block_active = 0U;
-        if (status == MOTION_SEGMENT_GENERATOR_STATUS_DONE) {
-            step_generator_counter_increment(&step_generator_task_diagnostics.blocks_completed);
-        } else {
-            step_generator_counter_increment(&step_generator_task_diagnostics.generator_errors);
-        }
-    }
+static StepStreamFeederAxisResult_t step_generator_task_port_prepare(void) {
+    return step_generator_task_port_result(step_stream_axis_prepare_stream());
 }
 
-/* Starts the idle X axis when events are waiting; X is the only axis on the planned stream for now. A running axis
- * picks new events up by itself, and one that stopped or faulted is left alone until MotionTask recovers it. */
-static void step_generator_task_start_axis(void) {
-    if (step_generator_task_halted != 0U || execution_buffer_count() == 0U) {
-        return;
+static StepStreamFeederAxisResult_t step_generator_task_port_acquire_half(uint8_t *half, uint16_t **records) {
+    const StepStreamAxisStatus_t status = step_stream_axis_acquire_half(half, records);
+    if (status == STEP_STREAM_AXIS_STATUS_NO_FILL_REQUEST) {
+        return STEP_STREAM_FEEDER_AXIS_NO_REQUEST;
     }
+    return step_generator_task_port_result(status);
+}
 
-    /* MotionTask also starts this axis (homing, X_JOG). With task switching paused, the status check and the
-     * start cannot interleave with its start; interrupts keep running. */
+static StepStreamFeederAxisResult_t step_generator_task_port_commit_half(uint8_t half) {
+    return step_generator_task_port_result(step_stream_axis_commit_half(half));
+}
+
+static StepStreamFeederAxisResult_t step_generator_task_port_set_direction(uint8_t positive) {
+    /* With task switching paused, STOP and MotionTask cannot touch the axis between the flag check and the write. */
+    MotionAxisHardwareStatus_t status = MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
     (void)osKernelLock();
-    const MotionAxisHardwareStatus_t status = motion_axis_hardware_get_status(MOTION_AXIS_X);
-    if (status == MOTION_AXIS_HARDWARE_STATUS_READY || status == MOTION_AXIS_HARDWARE_STATUS_COMPLETE) {
-        if (motion_axis_hardware_start(MOTION_AXIS_X) == MOTION_AXIS_HARDWARE_STATUS_STARTING) {
-            step_generator_counter_increment(&step_generator_task_diagnostics.axis_starts);
-        } else {
-            step_generator_counter_increment(&step_generator_task_diagnostics.axis_start_errors);
-        }
+    if (step_generator_task_halted == 0U) {
+        status = motion_axis_hardware_set_stream_outputs(STEP_GENERATOR_TASK_AXIS, positive);
     }
     (void)osKernelUnlock();
+    /* A refusal returns the status of a busy or faulted axis; a write leaves a status the axis can start from. */
+    if (status != MOTION_AXIS_HARDWARE_STATUS_READY && status != MOTION_AXIS_HARDWARE_STATUS_COMPLETE &&
+        status != MOTION_AXIS_HARDWARE_STATUS_STOPPED) {
+        return STEP_STREAM_FEEDER_AXIS_ERROR;
+    }
+    (void)osDelay(STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS);
+    return STEP_STREAM_FEEDER_AXIS_OK;
+}
+
+static StepStreamFeederAxisResult_t step_generator_task_port_start(uint32_t startup_period_ns) {
+    StepStreamAxisStatus_t status = STEP_STREAM_AXIS_STATUS_BUSY;
+    (void)osKernelLock();
+    if (step_generator_task_halted == 0U) {
+        status = step_stream_axis_start_stream(startup_period_ns);
+    }
+    (void)osKernelUnlock();
+    return step_generator_task_port_result(status);
+}
+
+static void step_generator_task_port_stop(void) { step_stream_axis_stop(); }
+
+static uint8_t step_generator_task_port_pop_block(MotionPlanBlock_t *block) {
+    if (plan_buffer_try_pop(block) != PLAN_BUFFER_STATUS_OK) {
+        return 0U;
+    }
+    /* Set before the block is out of sight, so HOME never sees an empty plan buffer and an idle stream in between. */
+    step_generator_task_stream_busy = 1U;
+    return 1U;
 }
 
 /* DMA interrupt: the stream axis has stopped itself after a ring fault, so stop feeding until STOP resets us. */
 static void step_generator_task_stream_fault(StepStreamAxisFault_t fault) {
     (void)fault;
-    step_generator_task_halt();
+    step_generator_task_halted = 1U;
+}
+
+static void step_generator_task_publish_diagnostics(void) {
+    StepStreamFeederDiagnostics_t feeder_diagnostics;
+    step_stream_feeder_get_diagnostics(&step_generator_task_feeder, &feeder_diagnostics);
+    step_generator_task_diagnostics.blocks_started = feeder_diagnostics.blocks_started;
+    step_generator_task_diagnostics.blocks_completed = feeder_diagnostics.blocks_completed;
+    step_generator_task_diagnostics.halves_filled = feeder_diagnostics.halves_filled;
+    step_generator_task_diagnostics.generator_errors = feeder_diagnostics.generator_errors;
+    step_generator_task_diagnostics.axis_errors = feeder_diagnostics.axis_errors;
+    step_generator_task_diagnostics.streams_started = feeder_diagnostics.streams_started;
+    step_generator_task_diagnostics.streams_stopped = feeder_diagnostics.streams_stopped;
+}
+
+/* Builds the feeder from the driver timing. Returns 0 when the clock or the timing cannot be used. */
+static uint8_t step_generator_task_setup_feeder(const StepGeneratorTaskConfig_t *task_config) {
+    if (task_config == NULL) {
+        return 0U;
+    }
+    StepStreamFeederConfig_t config;
+    if (step_stream_feeder_make_config(
+            step_stream_axis_get_timer_clock_hz(),
+            task_config->step_pulse_width_ns,
+            task_config->step_low_time_ns,
+            STEP_GENERATOR_TASK_MIN_RECORD_NS,
+            STEP_GENERATOR_TASK_IDLE_RECORD_NS,
+            STEP_GENERATOR_TASK_STARTUP_PERIOD_NS,
+            STEP_STREAM_AXIS_HALF_RECORD_COUNT,
+            STEP_GENERATOR_TASK_PLANNER_AXIS_INDEX,
+            &config
+        ) != STEP_STREAM_FEEDER_STATUS_OK) {
+        return 0U;
+    }
+    static const StepStreamFeederPorts_t ports = {
+        step_generator_task_port_prepare,
+        step_generator_task_port_acquire_half,
+        step_generator_task_port_commit_half,
+        step_generator_task_port_set_direction,
+        step_generator_task_port_start,
+        step_generator_task_port_stop,
+        step_generator_task_port_pop_block,
+    };
+    return (uint8_t)(step_stream_feeder_init(&step_generator_task_feeder, &config, &ports) ==
+                     STEP_STREAM_FEEDER_STATUS_OK);
 }
 
 void StepGeneratorTask(void *argument) {
-    (void)argument;
-    StepGeneratorState_t state = {0};
     step_generator_task_thread_id = osThreadGetId();
-    execution_buffer_set_space_listener(step_generator_task_buffer_space_available);
+    const uint8_t feeder_ready = step_generator_task_setup_feeder(argument);
+    if (feeder_ready == 0U) {
+        /* No usable timing: the task cannot feed the axis, so it refuses all work instead of guessing. */
+        step_generator_counter_increment(&step_generator_task_diagnostics.generator_errors);
+        step_generator_task_halted = 1U;
+    }
     static const StepStreamAxisListener_t stream_listener = {
         step_generator_task_notify_ring_half_released,
         step_generator_task_stream_fault,
@@ -143,18 +202,25 @@ void StepGeneratorTask(void *argument) {
 
     uint32_t flags = 0U;
     for (;;) {
-        if ((flags & STEP_GENERATOR_TASK_FLAG_STOP_RESET) != 0U) {
-            /* The axis has stopped and this task is not filling, so both ends of ExecutionBuffer are idle. */
-            state = (StepGeneratorState_t){0};
-            execution_buffer_clear();
+        if (feeder_ready != 0U && (flags & STEP_GENERATOR_TASK_FLAG_STOP_RESET) != 0U) {
+            /* The axis has stopped and this task is not filling, so the feeder owns no running stream. */
+            /* Lift the halt first: a STOP that arrives during the reset then stays in force. */
             step_generator_task_halted = 0U;
+            step_stream_feeder_reset(&step_generator_task_feeder);
+            step_generator_task_stream_busy = 0U;
             step_generator_counter_increment(&step_generator_task_diagnostics.stop_resets);
         }
-        if (step_generator_task_halted == 0U) {
-            step_generator_task_fill(&state);
-            step_generator_task_start_axis();
+        if (feeder_ready != 0U && step_generator_task_halted == 0U) {
+            if (step_stream_feeder_service(&step_generator_task_feeder) != STEP_STREAM_FEEDER_STATUS_OK) {
+                /* The feeder has stopped the axis; the plan is untrustworthy until STOP. */
+                step_generator_task_halted = 1U;
+            }
+            step_generator_task_publish_diagnostics();
+            if (step_stream_feeder_get_phase(&step_generator_task_feeder) == STEP_STREAM_FEEDER_PHASE_IDLE) {
+                step_generator_task_stream_busy = 0U;
+            }
         }
-        /* Flags set while filling stay pending, so a block or free space that arrives meanwhile is not missed. */
+        /* Flags set while filling stay pending, so a block or a released half that arrives meanwhile is not missed. */
         flags = osThreadFlagsWait(STEP_GENERATOR_TASK_FLAGS_ALL, osFlagsWaitAny, osWaitForever);
         configASSERT((flags & osFlagsError) == 0U);
     }
@@ -166,10 +232,10 @@ void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnosti
     }
     diagnostics->blocks_started = step_generator_task_diagnostics.blocks_started;
     diagnostics->blocks_completed = step_generator_task_diagnostics.blocks_completed;
-    diagnostics->events_generated = step_generator_task_diagnostics.events_generated;
+    diagnostics->halves_filled = step_generator_task_diagnostics.halves_filled;
     diagnostics->generator_errors = step_generator_task_diagnostics.generator_errors;
-    diagnostics->buffer_full_waits = step_generator_task_diagnostics.buffer_full_waits;
-    diagnostics->axis_starts = step_generator_task_diagnostics.axis_starts;
-    diagnostics->axis_start_errors = step_generator_task_diagnostics.axis_start_errors;
+    diagnostics->axis_errors = step_generator_task_diagnostics.axis_errors;
+    diagnostics->streams_started = step_generator_task_diagnostics.streams_started;
+    diagnostics->streams_stopped = step_generator_task_diagnostics.streams_stopped;
     diagnostics->stop_resets = step_generator_task_diagnostics.stop_resets;
 }

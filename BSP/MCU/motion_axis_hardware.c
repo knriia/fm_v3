@@ -955,6 +955,28 @@ MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis) {
     return motion_axis_start_event(c, &first_event);
 }
 
+/* Busy-waits with the DWT cycle counter; only for the few microseconds the driver data sheet asks for. */
+static void motion_axis_wait_ns(uint32_t ns) {
+    const uint64_t cycles = ((uint64_t)ns * SystemCoreClock + 999999999ULL) / 1000000000ULL;
+    const uint32_t start_cycles = DWT->CYCCNT;
+    while ((uint32_t)(DWT->CYCCNT - start_cycles) < (uint32_t)cycles) {
+    }
+}
+
+MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t axis, uint8_t positive_direction) {
+    Ctx_t *c = motion_axis_context(axis);
+    if (c == NULL) {
+        return MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
+    }
+    if (motion_axis_status_can_start(c->status) == 0) {
+        return c->status;
+    }
+    motion_axis_set_enabled(c, 1U);
+    motion_axis_wait_ns(c->config.enable_setup_ns);
+    motion_axis_set_direction(c, positive_direction != 0U ? 1U : 0U);
+    return c->status;
+}
+
 static void motion_axis_clear_jog(Ctx_t *c) {
     c->jog_mode = 0U;
     c->jog_steps_remaining = 0U;

@@ -305,6 +305,8 @@ StepStreamAxisStatus_t step_stream_axis_start(uint32_t frequency_hz, uint32_t pu
     return step_stream_axis_launch(period_ticks, pulse_ticks, 1U);
 }
 
+uint32_t step_stream_axis_get_timer_clock_hz(void) { return step_stream_axis_timer_clock_hz(); }
+
 StepStreamAxisStatus_t step_stream_axis_prepare_stream(void) {
     const uint32_t primask = step_stream_axis_enter_critical();
     if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {

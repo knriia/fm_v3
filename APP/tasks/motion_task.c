@@ -717,12 +717,16 @@ void MotionTask(void *argument) {
             continue;
         }
 
+        /* The planned stream owns X's timer from the first queued block to its end, so HOME and CALIBRATE are refused
+         * meanwhile like any other command that finds the axis busy. */
+        const uint8_t start_busy_mask =
+            (uint8_t)(busy_mask | (step_generator_task_is_busy() != 0U ? MOTION_PLANNER_AXIS_X_MASK : 0U));
         if (command.code == COMMAND_CODE_HOME) {
-            if (motion_task_axes_can_start(command.parameters.home.axes, busy_mask) != 0U) {
+            if (motion_task_axes_can_start(command.parameters.home.axes, start_busy_mask) != 0U) {
                 motion_task_start_axes(axes, context, command.parameters.home.axes, 0U);
             }
         } else if (command.code == COMMAND_CODE_CALIBRATE) {
-            if (motion_task_axes_can_start(command.parameters.calibrate.axes, busy_mask) != 0U) {
+            if (motion_task_axes_can_start(command.parameters.calibrate.axes, start_busy_mask) != 0U) {
                 motion_task_start_axes(axes, context, command.parameters.calibrate.axes, 1U);
             }
         } else if (command.code == COMMAND_CODE_X_JOG && busy_mask == 0U) {
@@ -734,6 +738,15 @@ void MotionTask(void *argument) {
         motion_task_poll_axes(axes, context);
         motion_task_publish_axes(axes, context);
     }
+}
+
+void motion_task_get_step_timing(MotionAxis_t axis, uint32_t *step_pulse_width_ns, uint32_t *step_low_time_ns) {
+    if ((uint32_t)axis >= (uint32_t)MOTION_AXIS_HARDWARE_COUNT || step_pulse_width_ns == NULL ||
+        step_low_time_ns == NULL) {
+        return;
+    }
+    *step_pulse_width_ns = motion_task_axis_configs[axis].hardware.step_pulse_width_ns;
+    *step_low_time_ns = motion_task_axis_configs[axis].hardware.step_low_time_ns;
 }
 
 uint32_t motion_task_get_stream_underrun_count(void) {
