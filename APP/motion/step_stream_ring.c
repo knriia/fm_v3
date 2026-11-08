@@ -1,5 +1,6 @@
 #include "motion/step_stream_ring.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 
 /* The half just played becomes EMPTY; the other one must be FULL before the DMA enters it. */
@@ -24,6 +25,8 @@ static StepStreamRingStatus_t step_stream_ring_half_event(StepStreamRing_t *ring
         return STEP_STREAM_RING_STATUS_UNDERRUN;
     }
 
+    /* Pairs with the release fence in mark_filled: the records are visible before the DMA plays them. */
+    atomic_thread_fence(memory_order_acquire);
     ring->half_states[next_half] = STEP_STREAM_RING_HALF_PLAYING;
     ring->current_half = next_half;
     return STEP_STREAM_RING_STATUS_OK;
@@ -47,6 +50,8 @@ StepStreamRingStatus_t step_stream_ring_mark_filled(StepStreamRing_t *ring, uint
         return STEP_STREAM_RING_STATUS_INVALID_STATE;
     }
 
+    /* The records written to this half must be visible before the half is announced as FULL. */
+    atomic_thread_fence(memory_order_release);
     ring->half_states[half] = STEP_STREAM_RING_HALF_FULL;
     ++ring->half_fills;
     return STEP_STREAM_RING_STATUS_OK;

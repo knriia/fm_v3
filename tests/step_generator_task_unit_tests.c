@@ -2,6 +2,7 @@
 #include "motion/motion_segment_generator.h"
 #include "motion/plan_buffer.h"
 #include "motion_axis_hardware.h"
+#include "step_stream_axis.h"
 #include "step_generator_task.h"
 
 #include "FreeRTOS.h"
@@ -112,6 +113,15 @@ int32_t osKernelUnlock(void) {
 
 /* Only X runs the planned stream; a call for any other axis is counted as a defect. */
 static uint32_t test_other_axis_calls;
+
+static StepStreamAxisListener_t test_stream_listener;
+static uint32_t test_stream_listener_calls;
+
+StepStreamAxisStatus_t step_stream_axis_set_listener(const StepStreamAxisListener_t *listener) {
+    ++test_stream_listener_calls;
+    test_stream_listener = *listener;
+    return STEP_STREAM_AXIS_STATUS_OK;
+}
 
 MotionAxisHardwareStatus_t motion_axis_hardware_get_status(MotionAxis_t axis) {
     if (axis != MOTION_AXIS_X) {
@@ -388,6 +398,25 @@ static void test_stop_halts_and_resets(void) {
     expect_u32(test_flags_set_value, STEP_GENERATOR_TASK_FLAG_STOP_RESET, "resume sets the reset flag");
 }
 
+static void test_stream_listener_registration(void) {
+    reset_fixture();
+    test_stream_listener_calls = 0U;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump();
+    expect_u32(test_stream_listener_calls, 1U, "the task registers its stream listener once");
+
+    test_flags_set_value = 0U;
+    test_stream_listener.on_half_released();
+    expect_u32(
+        test_flags_set_value,
+        STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED,
+        "a released ring half wakes the task"
+    );
+    expect_u32(step_generator_task_halted, 0U, "a released half does not halt the task");
+    test_stream_listener.on_fault(STEP_STREAM_AXIS_FAULT_UNDERRUN);
+    expect_u32(step_generator_task_halted, 1U, "a stream fault halts feeding");
+}
+
 static void test_notifications(void) {
     reset_fixture();
     step_generator_task_notify_block_ready();
@@ -401,6 +430,13 @@ static void test_notifications(void) {
     test_flags_set_value = 0U;
     step_generator_task_buffer_space_available();
     expect_u32(test_flags_set_value, STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE, "free space sets its flag");
+    test_flags_set_value = 0U;
+    step_generator_task_notify_ring_half_released();
+    expect_u32(
+        test_flags_set_value,
+        STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED,
+        "a released ring half sets its flag"
+    );
 
     volatile uint32_t counter = UINT32_MAX;
     step_generator_counter_increment(&counter);
@@ -413,6 +449,7 @@ int main(void) {
     test_invalid_blocks_are_skipped();
     test_axis_start();
     test_stop_halts_and_resets();
+    test_stream_listener_registration();
     test_notifications();
     expect_u32(test_other_axis_calls, 0U, "the generator drives only X");
 

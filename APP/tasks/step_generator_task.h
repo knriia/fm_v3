@@ -20,6 +20,8 @@ typedef struct {
 void StepGeneratorTask(void *argument);
 /* Called by MotionTask after it pushes a block into PlanBuffer. */
 void step_generator_task_notify_block_ready(void);
+/* Called from the axis DMA interrupt when a ring half has been played and needs refilling. */
+void step_generator_task_notify_ring_half_released(void);
 /* STOP: stop feeding and starting the axis right away; callable from any task. */
 void step_generator_task_halt(void);
 /* After STOP, once the axis no longer moves: drop the started block and all queued step events, then go on. */

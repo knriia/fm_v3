@@ -1,6 +1,8 @@
 #include "step_stream_axis.h"
 
+#include "motion/step_stream_ring.h"
 #include "motion_axis_hardware.h"
+#include "step_stream_axis_logic.h"
 #include "step_stream_format.h"
 
 #include "stm32h723xx.h"
@@ -8,7 +10,8 @@
 
 #include <stdint.h>
 
-#define STEP_STREAM_AXIS_TIMER_IRQ_PRIORITY 5U
+/* Must not be numerically below configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5): the interrupt calls FreeRTOS. */
+#define STEP_STREAM_AXIS_DMA_IRQ_PRIORITY 5U
 #define STEP_STREAM_AXIS_TIMER_APB1_ENABLE RCC_APB1LENR_TIM4EN
 #define STEP_STREAM_AXIS_GPIOB_ENABLE RCC_AHB4ENR_GPIOBEN
 #define STEP_STREAM_AXIS_DMA1_ENABLE RCC_AHB1ENR_DMA1EN
@@ -24,6 +27,8 @@
 #define STEP_STREAM_AXIS_BUFFER_WORD_COUNT (STEP_STREAM_AXIS_RECORD_COUNT * STEP_STREAM_FORMAT_DMA_BURST_LENGTH)
 #define STEP_STREAM_AXIS_NANOSECONDS_PER_SECOND 1000000000ULL
 #define STEP_STREAM_AXIS_MAX_PERIOD_TICKS 65536U
+/* DMA disable takes a few AHB cycles; the bound only keeps a broken DMA from hanging the caller (or the ISR). */
+#define STEP_STREAM_AXIS_DMA_DISABLE_MAX_POLLS 10000U
 
 static uint16_t step_stream_axis_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
@@ -31,6 +36,12 @@ static uint16_t step_stream_axis_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
 static volatile StepStreamAxisState_t step_stream_axis_state = STEP_STREAM_AXIS_STATE_IDLE;
 static volatile uint32_t step_stream_axis_completed_half_buffers;
 static volatile uint32_t step_stream_axis_last_steps_done;
+static volatile uint32_t step_stream_axis_last_stale_steps;
+static StepStreamRing_t step_stream_axis_ring;
+static volatile StepStreamAxisFault_t step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
+static volatile uint8_t step_stream_axis_auto_refill;
+static void (*volatile step_stream_axis_on_half_released)(void);
+static void (*volatile step_stream_axis_on_fault)(StepStreamAxisFault_t fault);
 
 extern uint32_t SystemCoreClock;
 
@@ -126,6 +137,17 @@ static uint32_t step_stream_axis_pending_half_buffers(void) {
     return ((flags & DMA_LISR_HTIF0) != 0U ? 1U : 0U) + ((flags & DMA_LISR_TCIF0) != 0U ? 1U : 0U);
 }
 
+static uint32_t step_stream_axis_dma_ndtr(void) { return STEP_STREAM_AXIS_DMA_STREAM->NDTR; }
+
+static uint8_t step_stream_axis_dma_disabled(void) {
+    return (STEP_STREAM_AXIS_DMA_STREAM->CR & DMA_SxCR_EN) == 0U ? 1U : 0U;
+}
+
+static const StepStreamAxisSnapshotSource_t step_stream_axis_snapshot_source = {
+    step_stream_axis_pending_half_buffers,
+    step_stream_axis_dma_ndtr,
+};
+
 static void step_stream_axis_clear_dma_flags(void) {
     DMA1->LIFCR = DMA_LIFCR_CFEIF0 | DMA_LIFCR_CDMEIF0 | DMA_LIFCR_CTEIF0 | DMA_LIFCR_CHTIF0 | DMA_LIFCR_CTCIF0;
 }
@@ -168,8 +190,7 @@ static void step_stream_axis_configure_dma(void) {
 
     STEP_STREAM_AXIS_DMA_CHANNEL->CCR = STEP_STREAM_AXIS_DMA_REQUEST_TIM4_UP;
     STEP_STREAM_AXIS_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-    while ((STEP_STREAM_AXIS_DMA_STREAM->CR & DMA_SxCR_EN) != 0U) {
-    }
+    (void)step_stream_axis_logic_poll(step_stream_axis_dma_disabled, STEP_STREAM_AXIS_DMA_DISABLE_MAX_POLLS);
 
     step_stream_axis_clear_dma_flags();
     STEP_STREAM_AXIS_DMA_STREAM->PAR = (uint32_t)&TIM4->DMAR;
@@ -177,24 +198,33 @@ static void step_stream_axis_configure_dma(void) {
     STEP_STREAM_AXIS_DMA_STREAM->NDTR = STEP_STREAM_AXIS_BUFFER_WORD_COUNT;
     STEP_STREAM_AXIS_DMA_STREAM->FCR = 0U;
     STEP_STREAM_AXIS_DMA_STREAM->CR = DMA_SxCR_PL_1 | DMA_SxCR_MSIZE_0 | DMA_SxCR_PSIZE_0 | DMA_SxCR_MINC |
-                                      DMA_SxCR_CIRC | DMA_SxCR_DIR_0 | DMA_SxCR_HTIE | DMA_SxCR_TCIE;
+                                      DMA_SxCR_CIRC | DMA_SxCR_DIR_0 | DMA_SxCR_HTIE | DMA_SxCR_TCIE | DMA_SxCR_TEIE;
     NVIC_ClearPendingIRQ(DMA1_Stream0_IRQn);
-    NVIC_SetPriority(DMA1_Stream0_IRQn, STEP_STREAM_AXIS_TIMER_IRQ_PRIORITY);
+    NVIC_SetPriority(DMA1_Stream0_IRQn, STEP_STREAM_AXIS_DMA_IRQ_PRIORITY);
     NVIC_EnableIRQ(DMA1_Stream0_IRQn);
     STEP_STREAM_AXIS_DMA_STREAM->CR |= DMA_SxCR_EN;
 }
 
 static uint32_t step_stream_axis_current_steps(void) {
     const uint32_t primask = step_stream_axis_enter_critical();
-    const uint32_t completed_half_buffers =
-        step_stream_axis_completed_half_buffers + step_stream_axis_pending_half_buffers();
-    const uint32_t ndtr = STEP_STREAM_AXIS_DMA_STREAM->NDTR;
-    const uint32_t steps = step_stream_format_steps_done(completed_half_buffers, STEP_STREAM_AXIS_RECORD_COUNT, ndtr);
+    const uint32_t steps = step_stream_axis_logic_read_steps(
+        &step_stream_axis_snapshot_source,
+        step_stream_axis_completed_half_buffers,
+        STEP_STREAM_AXIS_RECORD_COUNT
+    );
     step_stream_axis_exit_critical(primask);
     return steps;
 }
 
+static StepStreamAxisStatus_t
+step_stream_axis_start_with_mode(uint32_t frequency_hz, uint32_t pulse_width_ns, uint8_t auto_refill);
+
 StepStreamAxisStatus_t step_stream_axis_start(uint32_t frequency_hz, uint32_t pulse_width_ns) {
+    return step_stream_axis_start_with_mode(frequency_hz, pulse_width_ns, 1U);
+}
+
+static StepStreamAxisStatus_t
+step_stream_axis_start_with_mode(uint32_t frequency_hz, uint32_t pulse_width_ns, uint8_t auto_refill) {
     if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
@@ -240,6 +270,13 @@ StepStreamAxisStatus_t step_stream_axis_start(uint32_t frequency_hz, uint32_t pu
     step_stream_axis_configure_timer(period_ticks, pulse_ticks);
     step_stream_axis_completed_half_buffers = 0U;
     step_stream_axis_last_steps_done = 0U;
+    step_stream_axis_last_stale_steps = 0U;
+    step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
+    step_stream_axis_auto_refill = auto_refill;
+    if (step_stream_axis_logic_prepare_stand_ring(&step_stream_axis_ring) != 0U) {
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    }
     step_stream_axis_configure_dma();
     TIM4->DIER = TIM_DIER_UDE;
     step_stream_axis_state = STEP_STREAM_AXIS_STATE_STREAMING;
@@ -251,34 +288,65 @@ StepStreamAxisStatus_t step_stream_axis_start(uint32_t frequency_hz, uint32_t pu
     return STEP_STREAM_AXIS_STATUS_OK;
 }
 
-void step_stream_axis_stop(void) {
-    const uint32_t primask = step_stream_axis_enter_critical();
-    if (step_stream_axis_state != STEP_STREAM_AXIS_STATE_STREAMING) {
-        step_stream_axis_exit_critical(primask);
-        return;
-    }
-
+/* Caller holds the critical section (or is the DMA interrupt itself) and the axis is STREAMING. */
+static void step_stream_axis_halt(StepStreamAxisFault_t fault) {
     TIM4->CR1 &= ~TIM_CR1_CEN;
     TIM4->DIER &= ~TIM_DIER_UDE;
     STEP_STREAM_AXIS_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-    while ((STEP_STREAM_AXIS_DMA_STREAM->CR & DMA_SxCR_EN) != 0U) {
+    if (step_stream_axis_logic_poll(step_stream_axis_dma_disabled, STEP_STREAM_AXIS_DMA_DISABLE_MAX_POLLS) == 0U &&
+        fault == STEP_STREAM_AXIS_FAULT_NONE) {
+        fault = STEP_STREAM_AXIS_FAULT_DMA;
     }
 
     __DSB();
-    const uint32_t pending_half_buffers = step_stream_axis_pending_half_buffers();
-    const uint32_t completed_half_buffers = step_stream_axis_completed_half_buffers + pending_half_buffers;
-    const uint32_t ndtr = STEP_STREAM_AXIS_DMA_STREAM->NDTR;
-    step_stream_axis_last_steps_done =
-        step_stream_format_steps_done(completed_half_buffers, STEP_STREAM_AXIS_RECORD_COUNT, ndtr);
-    STEP_STREAM_AXIS_DMA_STREAM->CR &= ~(DMA_SxCR_HTIE | DMA_SxCR_TCIE);
+    const uint32_t raw_steps = step_stream_axis_logic_read_steps(
+        &step_stream_axis_snapshot_source,
+        step_stream_axis_completed_half_buffers,
+        STEP_STREAM_AXIS_RECORD_COUNT
+    );
+    uint32_t valid_steps = raw_steps;
+    if (fault == STEP_STREAM_AXIS_FAULT_UNDERRUN) {
+        /* The DMA had already entered a half that was never filled; only steps up to the half boundary count. */
+        valid_steps = step_stream_axis_logic_boundary_steps(
+            step_stream_axis_completed_half_buffers,
+            STEP_STREAM_AXIS_RECORD_COUNT
+        );
+    }
+    step_stream_axis_last_steps_done = valid_steps;
+    step_stream_axis_last_stale_steps = step_stream_axis_logic_stale_steps(raw_steps, valid_steps);
+    step_stream_axis_fault = fault;
+    STEP_STREAM_AXIS_DMA_STREAM->CR &= ~(DMA_SxCR_HTIE | DMA_SxCR_TCIE | DMA_SxCR_TEIE);
     step_stream_axis_clear_dma_flags();
     NVIC_DisableIRQ(DMA1_Stream0_IRQn);
     NVIC_ClearPendingIRQ(DMA1_Stream0_IRQn);
     TIM4->CCER &= ~TIM_CCER_CC1E;
     TIM4->SR = 0U;
     step_stream_axis_state = STEP_STREAM_AXIS_STATE_IDLE;
+}
+
+void step_stream_axis_stop(void) {
+    const uint32_t primask = step_stream_axis_enter_critical();
+    if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
+        step_stream_axis_halt(STEP_STREAM_AXIS_FAULT_NONE);
+    }
     step_stream_axis_exit_critical(primask);
 }
+
+StepStreamAxisStatus_t step_stream_axis_set_listener(const StepStreamAxisListener_t *listener) {
+    const uint32_t primask = step_stream_axis_enter_critical();
+    if (step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING) {
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_BUSY;
+    }
+    step_stream_axis_on_half_released = listener != NULL ? listener->on_half_released : NULL;
+    step_stream_axis_on_fault = listener != NULL ? listener->on_fault : NULL;
+    step_stream_axis_exit_critical(primask);
+    return STEP_STREAM_AXIS_STATUS_OK;
+}
+
+StepStreamAxisFault_t step_stream_axis_get_fault(void) { return step_stream_axis_fault; }
+
+uint32_t step_stream_axis_stale_steps(void) { return step_stream_axis_last_stale_steps; }
 
 uint32_t step_stream_axis_steps_done(void) {
     if (step_stream_axis_state != STEP_STREAM_AXIS_STATE_STREAMING) {
@@ -289,18 +357,53 @@ uint32_t step_stream_axis_steps_done(void) {
 
 StepStreamAxisState_t step_stream_axis_get_state(void) { return step_stream_axis_state; }
 
+/* Stops the axis from the interrupt and reports the fault. */
+static void step_stream_axis_fail(StepStreamAxisFault_t fault) {
+    step_stream_axis_halt(fault);
+    if (step_stream_axis_on_fault != NULL) {
+        step_stream_axis_on_fault(fault);
+    }
+}
+
+/* Returns 1 when the axis was stopped by a ring fault. The event's flag is already cleared and counted, so a flag
+ * of the other half still pending is counted once more by the halt, and the step count stays exact. */
+static uint8_t step_stream_axis_handle_half_event(uint8_t half_transfer) {
+    const StepStreamAxisLogicAction_t action =
+        step_stream_axis_logic_half_event(&step_stream_axis_ring, half_transfer, step_stream_axis_auto_refill);
+    if (action == STEP_STREAM_AXIS_LOGIC_ACTION_RELEASED) {
+        if (step_stream_axis_on_half_released != NULL) {
+            step_stream_axis_on_half_released();
+        }
+        return 0U;
+    }
+
+    step_stream_axis_fail(
+        action == STEP_STREAM_AXIS_LOGIC_ACTION_FAULT_UNDERRUN ? STEP_STREAM_AXIS_FAULT_UNDERRUN
+                                                               : STEP_STREAM_AXIS_FAULT_SEQUENCE
+    );
+    return 1U;
+}
+
 void DMA1_Stream0_IRQHandler(void) {
+    if (step_stream_axis_state != STEP_STREAM_AXIS_STATE_STREAMING) {
+        step_stream_axis_clear_dma_flags();
+        return;
+    }
     const uint32_t status = DMA1->LISR;
-    uint32_t clear_flags = 0U;
+    if ((status & DMA_LISR_TEIF0) != 0U) {
+        step_stream_axis_fail(STEP_STREAM_AXIS_FAULT_DMA);
+        return;
+    }
     if ((status & DMA_LISR_HTIF0) != 0U) {
         ++step_stream_axis_completed_half_buffers;
-        clear_flags |= DMA_LIFCR_CHTIF0;
+        DMA1->LIFCR = DMA_LIFCR_CHTIF0;
+        if (step_stream_axis_handle_half_event(1U) != 0U) {
+            return;
+        }
     }
     if ((status & DMA_LISR_TCIF0) != 0U) {
         ++step_stream_axis_completed_half_buffers;
-        clear_flags |= DMA_LIFCR_CTCIF0;
-    }
-    if (clear_flags != 0U) {
-        DMA1->LIFCR = clear_flags;
+        DMA1->LIFCR = DMA_LIFCR_CTCIF0;
+        (void)step_stream_axis_handle_half_event(0U);
     }
 }

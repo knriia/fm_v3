@@ -4,6 +4,7 @@
 #include "motion/motion_segment_generator.h"
 #include "motion/plan_buffer.h"
 #include "motion_axis_hardware.h"
+#include "step_stream_axis.h"
 
 #include "cmsis_os.h"
 #include "FreeRTOS.h"
@@ -13,8 +14,10 @@
 #define STEP_GENERATOR_TASK_FLAG_BLOCK_READY (1UL << 0)
 #define STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE (1UL << 1)
 #define STEP_GENERATOR_TASK_FLAG_STOP_RESET (1UL << 2)
+#define STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED (1UL << 3)
 #define STEP_GENERATOR_TASK_FLAGS_ALL                                                                                  \
-    (STEP_GENERATOR_TASK_FLAG_BLOCK_READY | STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE | STEP_GENERATOR_TASK_FLAG_STOP_RESET)
+    (STEP_GENERATOR_TASK_FLAG_BLOCK_READY | STEP_GENERATOR_TASK_FLAG_BUFFER_SPACE |                                    \
+        STEP_GENERATOR_TASK_FLAG_STOP_RESET | STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED)
 
 typedef struct {
     MotionSegmentGenerator_t generator;
@@ -45,6 +48,10 @@ static void step_generator_task_signal(uint32_t flags) {
 }
 
 void step_generator_task_notify_block_ready(void) { step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_BLOCK_READY); }
+
+void step_generator_task_notify_ring_half_released(void) {
+    step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED);
+}
 
 void step_generator_task_halt(void) { step_generator_task_halted = 1U; }
 
@@ -117,11 +124,22 @@ static void step_generator_task_start_axis(void) {
     (void)osKernelUnlock();
 }
 
+/* DMA interrupt: the stream axis has stopped itself after a ring fault, so stop feeding until STOP resets us. */
+static void step_generator_task_stream_fault(StepStreamAxisFault_t fault) {
+    (void)fault;
+    step_generator_task_halt();
+}
+
 void StepGeneratorTask(void *argument) {
     (void)argument;
     StepGeneratorState_t state = {0};
     step_generator_task_thread_id = osThreadGetId();
     execution_buffer_set_space_listener(step_generator_task_buffer_space_available);
+    static const StepStreamAxisListener_t stream_listener = {
+        step_generator_task_notify_ring_half_released,
+        step_generator_task_stream_fault,
+    };
+    (void)step_stream_axis_set_listener(&stream_listener);
 
     uint32_t flags = 0U;
     for (;;) {
