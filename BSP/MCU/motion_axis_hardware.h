@@ -115,6 +115,9 @@ MotionAxisHardwareStatus_t motion_axis_hardware_clear_fault(MotionAxis_t axis);
 MotionAxisHardwareStatus_t motion_axis_hardware_ready_after_home(MotionAxis_t axis);
 MotionAxisHardwareStatus_t motion_axis_hardware_get_status(MotionAxis_t axis);
 MotionAxisHardwareStopReason_t motion_axis_hardware_get_last_stop_reason(MotionAxis_t axis);
+/* Forgets the last stop reason. The planned stream of X records its stop here without clearing the old one, so
+ * MotionTask clears it, while the stream is not running, before it waits for a new stop. */
+void motion_axis_hardware_clear_stop_reason(MotionAxis_t axis);
 uint8_t motion_axis_hardware_start_limit_is_active(MotionAxis_t axis);
 uint8_t motion_axis_hardware_end_limit_is_active(MotionAxis_t axis);
 uint32_t motion_axis_hardware_get_last_jog_steps_completed(MotionAxis_t axis);
@@ -135,5 +138,8 @@ void motion_axis_hardware_reset_timing_peaks(MotionAxis_t axis);
  * they own (already cleared); lines of every axis may be passed together. */
 void motion_axis_hardware_timer_irq(MotionAxis_t axis);
 void motion_axis_hardware_limit_irq(uint32_t pending_lines);
+/* Looks at the level of the X limit switches and brakes the running planned stream if it moves toward a pressed one.
+ * The stream start calls it, because an edge that came before the start raised no interrupt that anybody acted on. */
+void motion_axis_hardware_poll_stream_limit(void);
 
 #endif /* FM_V3_MOTION_AXIS_HARDWARE_H */

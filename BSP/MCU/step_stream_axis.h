@@ -1,6 +1,8 @@
 #ifndef FM_V3_STEP_STREAM_AXIS_H
 #define FM_V3_STEP_STREAM_AXIS_H
 
+#include "motion/step_stream_brake.h"
+
 #include <stdint.h>
 
 typedef enum {
@@ -41,6 +43,9 @@ typedef struct {
     void (*on_half_released)(void);
     /* The axis has already stopped itself; the owner must stop the other axes and report the fault. */
     void (*on_fault)(StepStreamAxisFault_t fault);
+    /* The braking on a limit switch has begun, or the axis was stopped at once because it could not begin: stop feeding
+     * the ring. The axis finishes the stop on its own. */
+    void (*on_brake)(void);
 } StepStreamAxisListener_t;
 
 /* Pass NULL to remove the callbacks. Returns BUSY while the axis is STREAMING. */
@@ -80,5 +85,27 @@ uint32_t step_stream_axis_get_timer_clock_hz(void);
 void step_stream_axis_stop(void);
 uint32_t step_stream_axis_steps_done(void);
 StepStreamAxisState_t step_stream_axis_get_state(void);
+
+/* Braking on a limit switch (stream mode only). configure_brake builds the ramp once, while IDLE; without it a
+ * request stops the axis at once. */
+StepStreamAxisStatus_t step_stream_axis_configure_brake(const StepStreamBrakeConfig_t *config);
+/* Callable from any interrupt: the DMA interrupt runs the braking, after the half events it has pending, so the two
+ * never interleave. Ignored unless the axis is STREAMING. While braking, the ring is the interrupt's: acquire_half
+ * finds nothing to fill and commit_half is ignored (except a half the task held at the start, which gets the ramp).
+ * The axis goes IDLE once the ramp has been played. */
+void step_stream_axis_request_brake(void);
+/* 1 from the start of a braking until the axis is IDLE. */
+uint8_t step_stream_axis_is_braking(void);
+
+typedef struct {
+    uint32_t brakes_started;
+    uint32_t brakes_completed;
+    /* Requests that stopped the axis at once: it did not step there, was slower than the ramp, or the ring was not
+     * ready for the ramp. */
+    uint32_t stopped_at_once;
+    uint32_t retries;
+} StepStreamAxisBrakeStats_t;
+
+void step_stream_axis_get_brake_stats(StepStreamAxisBrakeStats_t *stats);
 
 #endif /* FM_V3_STEP_STREAM_AXIS_H */

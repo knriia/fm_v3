@@ -139,6 +139,9 @@ void MX_FREERTOS_Init(void)
 
   motion_task_get_step_timing(
       MOTION_AXIS_X, &step_generator_task_config.step_pulse_width_ns, &step_generator_task_config.step_low_time_ns);
+  /* 0 turns the braking ramp off: the stream stops at once on a limit switch. For the ramp, pass
+   * motion_task_get_limit_deceleration(MOTION_AXIS_X) here. */
+  step_generator_task_config.limit_deceleration_steps_per_s2 = 0U;
   step_generator_task_handle = osThreadNew(StepGeneratorTask, &step_generator_task_config, &step_generator_task_attr);
   if (step_generator_task_handle == NULL)
   {

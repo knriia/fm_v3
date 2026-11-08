@@ -1,5 +1,6 @@
 #include "step_stream_axis.h"
 
+#include "motion/step_stream_brake.h"
 #include "motion/step_stream_ring.h"
 #include "motion_axis_hardware.h"
 #include "step_stream_axis_logic.h"
@@ -28,6 +29,14 @@
 #define STEP_STREAM_AXIS_MAX_PERIOD_TICKS 65536U
 /* DMA disable takes a few AHB cycles; the bound only keeps a broken DMA from hanging the caller (or the ISR). */
 #define STEP_STREAM_AXIS_DMA_DISABLE_MAX_POLLS 10000U
+/* Entries of the braking ramp: (50000^2 - 4197^2) / (2 * deceleration), about 2070 at 600000 steps/s^2. 4096 is
+ * enough down to a deceleration of about 305000; a gentler one is refused and the axis then stops at once. */
+#define STEP_STREAM_AXIS_BRAKE_CAPACITY 4096U
+/* The ramp starts this many records after the DMA position: the interrupt must finish the first writes before the DMA
+ * arrives (8 records are 160 us at 50 kHz). Not measured on the hardware yet: check it with a GPIO and the scope. */
+#define STEP_STREAM_AXIS_BRAKE_MARGIN_RECORDS 8U
+/* A half event that is still unhandled when the braking tries to begin is handled by the retry; this bounds it. */
+#define STEP_STREAM_AXIS_BRAKE_MAX_RETRIES 4U
 
 static uint16_t step_stream_axis_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
@@ -41,6 +50,22 @@ static volatile StepStreamAxisFault_t step_stream_axis_fault = STEP_STREAM_AXIS_
 static volatile uint8_t step_stream_axis_auto_refill;
 static void (*volatile step_stream_axis_on_half_released)(void);
 static void (*volatile step_stream_axis_on_fault)(StepStreamAxisFault_t fault);
+static void (*volatile step_stream_axis_on_brake)(void);
+
+static uint16_t step_stream_axis_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
+static StepStreamBrake_t step_stream_axis_brake_table;
+static volatile uint8_t step_stream_axis_brake_ready;
+/* Written by the DMA interrupt and, under a critical section, by the task. Read through
+ * step_stream_axis_brake_active() wherever the other side may change it. */
+static StepStreamAxisBrake_t step_stream_axis_brake;
+/* Set by step_stream_axis_request_brake from any interrupt. Cleared by the DMA interrupt, and by launch and prepare
+ * while the axis is IDLE (no interrupt of the stream runs then). A lost update is harmless: a request is either already
+ * handled or pends the DMA interrupt once more. */
+static volatile uint8_t step_stream_axis_brake_requested;
+static uint8_t step_stream_axis_brake_attempt;
+/* The EMPTY half that the task acquired and has not committed yet, or NO_HALF. */
+static volatile uint8_t step_stream_axis_held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF;
+static volatile StepStreamAxisBrakeStats_t step_stream_axis_brake_stats;
 
 extern uint32_t SystemCoreClock;
 
@@ -118,6 +143,10 @@ static StepStreamAxisStatus_t step_stream_axis_calculate_ticks(
     *pulse_ticks = (uint32_t)pulse;
     return STEP_STREAM_AXIS_STATUS_OK;
 }
+
+static uint32_t step_stream_axis_enter_critical(void);
+
+static uint8_t step_stream_axis_brake_active(void) { return *(const volatile uint8_t *)&step_stream_axis_brake.active; }
 
 static uint32_t step_stream_axis_enter_critical(void) {
     const uint32_t primask = __get_PRIMASK();
@@ -260,6 +289,10 @@ static StepStreamAxisStatus_t step_stream_axis_launch(uint32_t period_ticks, uin
     step_stream_axis_last_stale_steps = 0U;
     step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
     step_stream_axis_auto_refill = stand;
+    step_stream_axis_logic_brake_reset(&step_stream_axis_brake);
+    step_stream_axis_brake_requested = 0U;
+    step_stream_axis_brake_attempt = 0U;
+    step_stream_axis_held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF;
     if (step_stream_axis_configure_dma() == 0U) {
         /* The ring was started above; return it to the start so that the next attempt begins clean. */
         step_stream_ring_init(&step_stream_axis_ring);
@@ -274,6 +307,10 @@ static StepStreamAxisStatus_t step_stream_axis_launch(uint32_t period_ticks, uin
     TIM4->CCER = TIM_CCER_CC1E;
     TIM4->CR1 |= TIM_CR1_CEN;
     step_stream_axis_exit_critical(primask);
+    if (stand == 0U) {
+        /* A switch edge that came between the direction output and this start was seen by nobody: look at the level. */
+        motion_axis_hardware_poll_stream_limit();
+    }
     return STEP_STREAM_AXIS_STATUS_OK;
 }
 
@@ -315,6 +352,9 @@ StepStreamAxisStatus_t step_stream_axis_prepare_stream(void) {
     }
     /* The DMA is stopped and the interrupt ignores events while IDLE, so nobody else touches the ring. */
     step_stream_ring_init(&step_stream_axis_ring);
+    step_stream_axis_logic_brake_reset(&step_stream_axis_brake);
+    step_stream_axis_brake_requested = 0U;
+    step_stream_axis_held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF;
     step_stream_axis_fault = STEP_STREAM_AXIS_FAULT_NONE;
     step_stream_axis_last_steps_done = 0U;
     step_stream_axis_last_stale_steps = 0U;
@@ -337,10 +377,17 @@ StepStreamAxisStatus_t step_stream_axis_acquire_half(uint8_t *half, uint16_t **r
     if (step_stream_axis_ring_needs_prepare() != 0U) {
         return STEP_STREAM_AXIS_STATUS_NOT_PREPARED;
     }
+    /* The braking must see the held half and the half itself in one piece, so it cannot start in between. */
+    const uint32_t primask = step_stream_axis_enter_critical();
     uint8_t candidate = 0U;
-    if (step_stream_ring_next_fill_request(&step_stream_axis_ring, &candidate) != STEP_STREAM_RING_STATUS_OK) {
+    /* While braking, the interrupt refills every released half itself. */
+    if (step_stream_axis_brake.active != 0U ||
+        step_stream_ring_next_fill_request(&step_stream_axis_ring, &candidate) != STEP_STREAM_RING_STATUS_OK) {
+        step_stream_axis_exit_critical(primask);
         return STEP_STREAM_AXIS_STATUS_NO_FILL_REQUEST;
     }
+    step_stream_axis_held_half = candidate;
+    step_stream_axis_exit_critical(primask);
     *half = candidate;
     *records = &step_stream_axis_dma_buffer
                    [(size_t)candidate * STEP_STREAM_AXIS_HALF_RECORD_COUNT * STEP_STREAM_FORMAT_DMA_BURST_LENGTH];
@@ -351,9 +398,25 @@ StepStreamAxisStatus_t step_stream_axis_commit_half(uint8_t half) {
     if (step_stream_axis_ring_needs_prepare() != 0U) {
         return STEP_STREAM_AXIS_STATUS_NOT_PREPARED;
     }
-    return step_stream_ring_mark_filled(&step_stream_axis_ring, half) == STEP_STREAM_RING_STATUS_OK
-               ? STEP_STREAM_AXIS_STATUS_OK
-               : STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    /* Release of the half and its announcement as FULL are one step: a braking that began in between would fill the
+     * half itself and the announcement would then fail. */
+    const uint32_t primask = step_stream_axis_enter_critical();
+    step_stream_axis_held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF;
+    StepStreamAxisStatus_t status = STEP_STREAM_AXIS_STATUS_OK;
+    if (step_stream_axis_brake.active != 0U) {
+        /* The braking began while the task wrote this half: the ramp replaces its records, any other commit is void. */
+        (void)step_stream_axis_logic_brake_commit(
+            &step_stream_axis_brake,
+            &step_stream_axis_ring,
+            step_stream_axis_dma_buffer,
+            STEP_STREAM_AXIS_RECORD_COUNT,
+            half
+        );
+    } else if (step_stream_ring_mark_filled(&step_stream_axis_ring, half) != STEP_STREAM_RING_STATUS_OK) {
+        status = STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    }
+    step_stream_axis_exit_critical(primask);
+    return status;
 }
 
 StepStreamAxisStatus_t step_stream_axis_start_stream(uint32_t startup_period_ns) {
@@ -409,6 +472,9 @@ static void step_stream_axis_halt(StepStreamAxisFault_t fault) {
     TIM4->CCER &= ~TIM_CCER_CC1E;
     TIM4->SR = 0U;
     step_stream_axis_state = STEP_STREAM_AXIS_STATE_IDLE;
+    /* A limit interrupt that preempted the halt may have asked for a braking meanwhile; nothing is left to brake. The
+     * DMA interrupt it pended is disabled, and the next launch clears that pending bit before it enables it. */
+    step_stream_axis_brake_requested = 0U;
 }
 
 void step_stream_axis_stop(void) {
@@ -427,6 +493,7 @@ StepStreamAxisStatus_t step_stream_axis_set_listener(const StepStreamAxisListene
     }
     step_stream_axis_on_half_released = listener != NULL ? listener->on_half_released : NULL;
     step_stream_axis_on_fault = listener != NULL ? listener->on_fault : NULL;
+    step_stream_axis_on_brake = listener != NULL ? listener->on_brake : NULL;
     step_stream_axis_exit_critical(primask);
     return STEP_STREAM_AXIS_STATUS_OK;
 }
@@ -452,12 +519,144 @@ static void step_stream_axis_fail(StepStreamAxisFault_t fault) {
     }
 }
 
+StepStreamAxisStatus_t step_stream_axis_configure_brake(const StepStreamBrakeConfig_t *config) {
+    const uint32_t primask = step_stream_axis_enter_critical();
+    const uint8_t streaming = step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING ? 1U : 0U;
+    /* Not ready from here on: a request that comes while the ramp is built stops the axis at once. */
+    step_stream_axis_brake_ready = 0U;
+    step_stream_axis_exit_critical(primask);
+    if (streaming != 0U) {
+        return STEP_STREAM_AXIS_STATUS_BUSY;
+    }
+    /* Building the ramp takes milliseconds, so it runs with the interrupts on. Only the task that starts the streams
+     * calls this, before the first start, so no stream begins meanwhile. */
+    const StepStreamBrakeStatus_t status = step_stream_brake_init(
+        &step_stream_axis_brake_table,
+        config,
+        step_stream_axis_brake_storage,
+        STEP_STREAM_AXIS_BRAKE_CAPACITY
+    );
+    step_stream_axis_brake_ready = status == STEP_STREAM_BRAKE_STATUS_OK ? 1U : 0U;
+    return status == STEP_STREAM_BRAKE_STATUS_OK ? STEP_STREAM_AXIS_STATUS_OK
+                                                 : STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+}
+
+void step_stream_axis_request_brake(void) {
+    if (step_stream_axis_state != STEP_STREAM_AXIS_STATE_STREAMING) {
+        return;
+    }
+    step_stream_axis_brake_requested = 1U;
+    __DMB();
+    NVIC_SetPendingIRQ(DMA1_Stream0_IRQn);
+}
+
+uint8_t step_stream_axis_is_braking(void) {
+    return (uint8_t)(step_stream_axis_state == STEP_STREAM_AXIS_STATE_STREAMING &&
+                     step_stream_axis_brake_active() != 0U);
+}
+
+void step_stream_axis_get_brake_stats(StepStreamAxisBrakeStats_t *stats) {
+    if (stats == NULL) {
+        return;
+    }
+    stats->brakes_started = step_stream_axis_brake_stats.brakes_started;
+    stats->brakes_completed = step_stream_axis_brake_stats.brakes_completed;
+    stats->stopped_at_once = step_stream_axis_brake_stats.stopped_at_once;
+    stats->retries = step_stream_axis_brake_stats.retries;
+}
+
+/* A brake that cannot be placed stops the axis at once; the feeder is told first so that it stops feeding. */
+static void step_stream_axis_brake_stop_now(void) {
+    step_stream_axis_brake_requested = 0U;
+    ++step_stream_axis_brake_stats.stopped_at_once;
+    /* The stand has no feeder to tell. */
+    if (step_stream_axis_on_brake != NULL && step_stream_axis_auto_refill == 0U) {
+        step_stream_axis_on_brake();
+    }
+    step_stream_axis_halt(STEP_STREAM_AXIS_FAULT_NONE);
+}
+
+/* DMA interrupt, STREAMING, the pending half events already handled. */
+static void step_stream_axis_run_brake(void) {
+    if (step_stream_axis_brake_active() != 0U) {
+        step_stream_axis_brake_requested = 0U;
+        return;
+    }
+    /* The stand pattern is not a plan, and without a ramp there is nothing to brake with. */
+    if (step_stream_axis_auto_refill != 0U || step_stream_axis_brake_ready == 0U) {
+        step_stream_axis_brake_stop_now();
+        return;
+    }
+
+    const StepStreamAxisBrakeBegin_t result = step_stream_axis_logic_brake_begin(
+        &step_stream_axis_brake,
+        &step_stream_axis_brake_table,
+        &step_stream_axis_ring,
+        step_stream_axis_dma_buffer,
+        STEP_STREAM_AXIS_RECORD_COUNT,
+        step_stream_axis_current_steps(),
+        STEP_STREAM_AXIS_BRAKE_MARGIN_RECORDS,
+        step_stream_axis_held_half
+    );
+    switch (result) {
+    case STEP_STREAM_AXIS_LOGIC_BRAKE_STARTED:
+        step_stream_axis_brake_requested = 0U;
+        step_stream_axis_brake_attempt = 0U;
+        ++step_stream_axis_brake_stats.brakes_started;
+        if (step_stream_axis_on_brake != NULL) {
+            step_stream_axis_on_brake();
+        }
+        break;
+    case STEP_STREAM_AXIS_LOGIC_BRAKE_RETRY:
+        ++step_stream_axis_brake_stats.retries;
+        if (step_stream_axis_brake_attempt >= STEP_STREAM_AXIS_BRAKE_MAX_RETRIES) {
+            step_stream_axis_brake_attempt = 0U;
+            step_stream_axis_brake_stop_now();
+        } else {
+            ++step_stream_axis_brake_attempt;
+            NVIC_SetPendingIRQ(DMA1_Stream0_IRQn);
+        }
+        break;
+    case STEP_STREAM_AXIS_LOGIC_BRAKE_STOP_NOW:
+        step_stream_axis_brake_stop_now();
+        break;
+    default:
+        step_stream_axis_brake_requested = 0U;
+        step_stream_axis_fail(STEP_STREAM_AXIS_FAULT_SEQUENCE);
+        break;
+    }
+}
+
 /* Returns 1 when the axis was stopped by a ring fault. The event's flag is already cleared and counted, so a flag
  * of the other half still pending is counted once more by the halt, and the step count stays exact. */
 static uint8_t step_stream_axis_handle_half_event(uint8_t half_transfer) {
-    const StepStreamAxisLogicAction_t action =
-        step_stream_axis_logic_half_event(&step_stream_axis_ring, half_transfer, step_stream_axis_auto_refill);
+    const uint8_t braking = step_stream_axis_brake_active();
+    const StepStreamAxisLogicAction_t action = step_stream_axis_logic_half_event(
+        &step_stream_axis_ring,
+        half_transfer,
+        braking != 0U ? 0U : step_stream_axis_auto_refill
+    );
     if (action == STEP_STREAM_AXIS_LOGIC_ACTION_RELEASED) {
+        if (braking != 0U) {
+            /* The played half is half 0 after HT and half 1 after TC. */
+            const StepStreamAxisBrakeEvent_t event = step_stream_axis_logic_brake_half_released(
+                &step_stream_axis_brake,
+                &step_stream_axis_ring,
+                step_stream_axis_dma_buffer,
+                STEP_STREAM_AXIS_RECORD_COUNT,
+                half_transfer != 0U ? 0U : 1U
+            );
+            if (event == STEP_STREAM_AXIS_LOGIC_BRAKE_EVENT_COMPLETE) {
+                ++step_stream_axis_brake_stats.brakes_completed;
+                step_stream_axis_halt(STEP_STREAM_AXIS_FAULT_NONE);
+                return 1U;
+            }
+            if (event == STEP_STREAM_AXIS_LOGIC_BRAKE_EVENT_FAULT) {
+                step_stream_axis_fail(STEP_STREAM_AXIS_FAULT_SEQUENCE);
+                return 1U;
+            }
+            return 0U;
+        }
         if (step_stream_axis_on_half_released != NULL) {
             step_stream_axis_on_half_released();
         }
@@ -474,6 +673,7 @@ static uint8_t step_stream_axis_handle_half_event(uint8_t half_transfer) {
 void DMA1_Stream0_IRQHandler(void) {
     if (step_stream_axis_state != STEP_STREAM_AXIS_STATE_STREAMING) {
         step_stream_axis_clear_dma_flags();
+        step_stream_axis_brake_requested = 0U;
         return;
     }
     const uint32_t status = DMA1->LISR;
@@ -491,6 +691,12 @@ void DMA1_Stream0_IRQHandler(void) {
     if ((status & DMA_LISR_TCIF0) != 0U) {
         ++step_stream_axis_completed_half_buffers;
         DMA1->LIFCR = DMA_LIFCR_CTCIF0;
-        (void)step_stream_axis_handle_half_event(0U);
+        if (step_stream_axis_handle_half_event(0U) != 0U) {
+            return;
+        }
+    }
+    /* After the half events: the ring state and the step count that the braking reads are then up to date. */
+    if (step_stream_axis_brake_requested != 0U) {
+        step_stream_axis_run_brake();
     }
 }

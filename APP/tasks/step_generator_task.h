@@ -24,6 +24,8 @@ typedef struct {
 typedef struct {
     uint32_t step_pulse_width_ns;
     uint32_t step_low_time_ns;
+    /* Deceleration of the braking on a limit switch; 0 leaves the axis without a ramp, so it stops at once. */
+    uint32_t limit_deceleration_steps_per_s2;
 } StepGeneratorTaskConfig_t;
 
 /* Turns plan blocks into ring records of the X stream axis, keeps its ring filled and starts and stops the stream.
@@ -38,6 +40,8 @@ void step_generator_task_halt(void);
 /* 1 from the moment a planned block is queued until its stream has ended (also after a fault, until STOP resets the
  * task). Homing and calibration use the same timer as the stream, so they must not start while this is set. */
 uint8_t step_generator_task_is_busy(void);
+/* 1 while the task does not feed the axis: after STOP, a stop on a limit switch or a fault, until the reset below. */
+uint8_t step_generator_task_is_halted(void);
 /* After STOP, once the axis no longer moves: drop the started block and the held one, then go on. */
 void step_generator_task_resume_after_stop(void);
 void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnostics);
