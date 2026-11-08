@@ -109,6 +109,14 @@ static MotionAxisHardwareConfig_t config_toward_end(uint8_t positive_moves_towar
     };
 }
 
+static AxisCalibrationRunResult_t begin_run(
+    AxisCalibrationRun_t *run,
+    MotionAxis_t axis,
+    const MotionAxisHardwareConfig_t *config
+) {
+    return axis_calibration_run_begin(run, axis, config, &test_settings, &axis_calibration_run_jog_mover);
+}
+
 static void reset_fakes(void) {
     fake_expected_axis = MOTION_AXIS_X;
     fake_status = MOTION_AXIS_HARDWARE_STATUS_READY;
@@ -129,7 +137,7 @@ static void reset_fakes(void) {
 static void reach_take_up(AxisCalibrationRun_t *calibration, const MotionAxisHardwareConfig_t *config, int32_t end_um) {
     AxisCalibration_t result = {0};
     expect_u32(
-        axis_calibration_run_begin(calibration, fake_expected_axis, config, &test_settings),
+        begin_run(calibration, fake_expected_axis, config),
         AXIS_CALIBRATION_RUN_RESULT_RUNNING,
         "seek starts"
     );
@@ -176,7 +184,7 @@ static void test_successful_calibration(void) {
         "idle poll"
     );
     expect_u32(
-        axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings),
+        begin_run(&calibration, fake_expected_axis, &config),
         AXIS_CALIBRATION_RUN_RESULT_RUNNING,
         "seek starts"
     );
@@ -288,14 +296,14 @@ static void test_failures_during_seek(void) {
     reset_fakes();
     fake_profile_result = AXIS_BENCH_STATUS_BUSY;
     expect_u32(
-        axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings),
+        begin_run(&calibration, fake_expected_axis, &config),
         AXIS_CALIBRATION_RUN_RESULT_MOVE_FAILED,
         "seek start fails"
     );
     expect_u32(axis_calibration_run_is_active(&calibration), 0U, "failed start leaves it idle");
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
+    (void)begin_run(&calibration, fake_expected_axis, &config);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_COMPLETE;
     expect_u32(
         axis_calibration_run_poll(&calibration, &config, &result),
@@ -304,7 +312,7 @@ static void test_failures_during_seek(void) {
     );
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
+    (void)begin_run(&calibration, fake_expected_axis, &config);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT;
     expect_u32(
@@ -314,7 +322,7 @@ static void test_failures_during_seek(void) {
     );
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
+    (void)begin_run(&calibration, fake_expected_axis, &config);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
     fake_limit_trigger_um = 0;
@@ -325,7 +333,7 @@ static void test_failures_during_seek(void) {
     );
 
     reset_fakes();
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
+    (void)begin_run(&calibration, fake_expected_axis, &config);
     fake_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     fake_stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
     fake_limit_trigger_um = 1000;
@@ -416,7 +424,7 @@ static void test_abort(void) {
     axis_calibration_run_abort(&calibration);
     expect_u32(fake_stop_requests, 0U, "idle abort does not stop the axis");
 
-    (void)axis_calibration_run_begin(&calibration, fake_expected_axis, &config, &test_settings);
+    (void)begin_run(&calibration, fake_expected_axis, &config);
     axis_calibration_run_abort(&calibration);
     expect_u32(fake_stop_requests, 1U, "active abort stops the axis");
     expect_u32(axis_calibration_run_is_active(&calibration), 0U, "aborted procedure is idle");
@@ -440,7 +448,7 @@ static void test_other_axis(void) {
     expect_u32(result.travel_um, 100000U, "Y travel comes from the Y switch point");
     expect_u32(calibration.axis, MOTION_AXIS_Y, "finished run stays bound to Y");
 
-    (void)axis_calibration_run_begin(&calibration, MOTION_AXIS_Y, &config, &test_settings);
+    (void)begin_run(&calibration, MOTION_AXIS_Y, &config);
     axis_calibration_run_abort(&calibration);
     expect_u32(calibration.axis, MOTION_AXIS_Y, "aborted run stays bound to Y");
     expect_u32(fake_wrong_axis_calls, 0U, "no call reaches another axis");
