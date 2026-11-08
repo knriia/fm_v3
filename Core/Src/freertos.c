@@ -86,6 +86,7 @@ static const osThreadAttr_t command_task_attr = {
 
 static osThreadId_t motion_task_handle;
 static MotionTaskContext_t motion_task_context;
+static StepGeneratorTaskConfig_t step_generator_task_config;
 static const osThreadAttr_t motion_task_attr = {
   .name = MOTION_TASK_NAME,
   .stack_size = MOTION_TASK_STACK_SIZE_BYTES,
@@ -136,7 +137,9 @@ void MX_FREERTOS_Init(void)
     Error_Handler();
   }
 
-  step_generator_task_handle = osThreadNew(StepGeneratorTask, NULL, &step_generator_task_attr);
+  motion_task_get_step_timing(
+      MOTION_AXIS_X, &step_generator_task_config.step_pulse_width_ns, &step_generator_task_config.step_low_time_ns);
+  step_generator_task_handle = osThreadNew(StepGeneratorTask, &step_generator_task_config, &step_generator_task_attr);
   if (step_generator_task_handle == NULL)
   {
     Error_Handler();

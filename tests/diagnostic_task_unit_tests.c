@@ -492,7 +492,7 @@ static void test_diagnostic_frame_contents(void) {
         .cancelled_blocks = 5U,
     };
     test_motion_task_diagnostics = (MotionTaskDiagnostics){.commands_dequeued = 14U, .last_sequence = 104U};
-    test_step_generator_diagnostics = (StepGeneratorTaskDiagnostics){.blocks_started = 8U, .buffer_full_waits = 9U};
+    test_step_generator_diagnostics = (StepGeneratorTaskDiagnostics){.blocks_started = 8U, .axis_errors = 9U};
     test_execution_buffer_level = 300U;
     test_underruns = 2U;
     test_ethernet_port_diagnostics = (EthernetPortDiagnostics){.link_up = 1U};
@@ -527,7 +527,7 @@ static void test_diagnostic_frame_contents(void) {
     expect_u32(payload->plan_buffer.rejected_operations, 1U, "plan buffer rejected operations");
     expect_u32(payload->plan_buffer.cancelled_blocks, 5U, "plan buffer cancelled blocks");
     expect_u32(payload->step_generator.blocks_started, 8U, "step generator counters");
-    expect_u32(payload->step_generator.buffer_full_waits, 9U, "step generator waits");
+    expect_u32(payload->step_generator.axis_errors, 9U, "step generator axis errors");
     expect_u32(payload->execution_buffer.level, 300U, "execution buffer level");
     expect_u32(payload->execution_buffer.underruns, 2U, "execution buffer underruns");
     expect_u32(payload->x_axis.travel_um, 301000U, "X axis");

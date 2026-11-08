@@ -97,6 +97,10 @@ MotionAxisHardwareStatus_t motion_axis_hardware_set_event_source(MotionAxis_t ax
 /* Runs the planned step stream of the axis event source. Without a valid source the axis ends in
  * MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT. */
 MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis);
+/* Planned DMA stream: enables the driver, waits its enable lead and sets DIR. Only while the axis is READY, COMPLETE
+ * or STOPPED; any other status is returned unchanged and nothing is written. The caller still has to wait the DIR
+ * setup time before the first STEP. */
+MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t axis, uint8_t positive_direction);
 MotionAxisHardwareStatus_t motion_axis_hardware_start_jog_profile(
     MotionAxis_t axis,
     int32_t signed_steps,

@@ -75,6 +75,8 @@ StepStreamAxisStatus_t step_stream_axis_commit_half(uint8_t half);
  * STEP_STREAM_AXIS_MIN_STARTUP_NS is a placeholder that has not been measured: check it on the scope. */
 #define STEP_STREAM_AXIS_MIN_STARTUP_NS 2000U
 StepStreamAxisStatus_t step_stream_axis_start_stream(uint32_t startup_period_ns);
+/* Kernel clock of the axis timer in Hz, 0 when the clock tree is not usable. */
+uint32_t step_stream_axis_get_timer_clock_hz(void);
 void step_stream_axis_stop(void);
 uint32_t step_stream_axis_steps_done(void);
 StepStreamAxisState_t step_stream_axis_get_state(void);
