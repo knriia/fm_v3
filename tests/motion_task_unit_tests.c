@@ -2,6 +2,7 @@
 #include "motion/axis_bench.h"
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
+#include "motion/home_block.h"
 #include "motion/plan_buffer.h"
 #include "motion/step_executor.h"
 #include "motion_axis_hardware.h"
@@ -23,6 +24,12 @@ static jmp_buf test_jump_buffer;
 static uint8_t test_jump_active;
 static uint8_t test_jump_on_delay;
 static uint8_t test_block_when_empty;
+static uint8_t test_generator_busy;
+static uint8_t test_generator_halted;
+/* While set, the reset of the generator leaves it busy; it becomes idle after the given number of 1 ms waits, and
+ * never with 0. */
+static uint8_t test_generator_reset_keeps_busy;
+static uint32_t test_generator_idle_after_delays;
 static uint32_t test_delay_calls;
 static uint32_t test_last_delay_ms;
 static uint32_t test_receive_calls;
@@ -76,6 +83,8 @@ typedef struct {
     uint32_t bench_last_target_rate_hz;
     uint32_t bench_last_acceleration;
     uint32_t release_stop_arms;
+    uint32_t release_stop_disarms;
+    uint32_t stop_reason_clears;
     /* 1-based index of the profile start that fails, leaving the hardware in failed_start_status. */
     uint32_t failing_start;
     MotionAxisHardwareStatus_t failed_start_status;
@@ -99,6 +108,7 @@ static FakeAxis_t fake_axes[MOTION_AXIS_HARDWARE_COUNT];
 #define fake_x_ready_after_home_calls fake_axes[MOTION_AXIS_X].ready_after_home_calls
 #define fake_x_bench_starts fake_axes[MOTION_AXIS_X].bench_starts
 #define fake_x_bench_last_signed_steps fake_axes[MOTION_AXIS_X].bench_last_signed_steps
+#define fake_x_stop_reason_clears fake_axes[MOTION_AXIS_X].stop_reason_clears
 #define fake_x_release_stop_arms fake_axes[MOTION_AXIS_X].release_stop_arms
 #define fake_x_failing_start fake_axes[MOTION_AXIS_X].failing_start
 #define fake_x_failed_start_status fake_axes[MOTION_AXIS_X].failed_start_status
@@ -140,6 +150,14 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
             fake->status = state->status;
             fake->stop_reason = state->stop_reason;
             fake->start_limit_active = state->start_limit_active;
+            if (axis == (uint32_t)MOTION_AXIS_X) {
+                /* A homing stream plays while X is active and is over once X is not. */
+                test_generator_busy = (state->status == MOTION_AXIS_HARDWARE_STATUS_STARTING ||
+                                       state->status == MOTION_AXIS_HARDWARE_STATUS_WAITING ||
+                                       state->status == MOTION_AXIS_HARDWARE_STATUS_RUNNING)
+                                          ? 1U
+                                          : 0U;
+            }
         }
     }
     ++test_receive_calls;
@@ -189,7 +207,11 @@ CalibrationStoreStatus_t calibration_store_load(MachineCalibration_t *calibratio
     return test_calibration_load_status;
 }
 
-void step_generator_task_notify_block_ready(void) { ++test_block_ready_notifications; }
+/* A queued block makes the real generator busy until its stream has ended or STOP has reset it. */
+void step_generator_task_notify_block_ready(void) {
+    ++test_block_ready_notifications;
+    test_generator_busy = 1U;
+}
 
 static uint32_t test_generator_halts;
 static uint32_t test_generator_resumes;
@@ -197,13 +219,20 @@ static uint32_t test_queue_discards;
 /* After this many 1 ms waits the X axis reports READY; 0 keeps it moving. */
 static uint32_t test_axis_settles_after_delays;
 
-static uint8_t test_generator_busy;
-
 uint8_t step_generator_task_is_busy(void) { return test_generator_busy; }
+
+uint8_t step_generator_task_is_halted(void) { return test_generator_halted; }
 
 void step_generator_task_halt(void) { ++test_generator_halts; }
 
-void step_generator_task_resume_after_stop(void) { ++test_generator_resumes; }
+/* The reset of the real task leaves the generator idle. */
+void step_generator_task_resume_after_stop(void) {
+    ++test_generator_resumes;
+    if (test_generator_reset_keeps_busy == 0U) {
+        test_generator_busy = 0U;
+    }
+    test_generator_halted = 0U;
+}
 
 void command_queue_discard_all(void) { ++test_queue_discards; }
 
@@ -212,6 +241,9 @@ uint32_t osDelay(uint32_t milliseconds) {
     test_last_delay_ms = milliseconds;
     if (test_axis_settles_after_delays != 0U && test_delay_calls == test_axis_settles_after_delays) {
         fake_x_status = MOTION_AXIS_HARDWARE_STATUS_READY;
+    }
+    if (test_generator_idle_after_delays != 0U && test_delay_calls == test_generator_idle_after_delays) {
+        test_generator_busy = 0U;
     }
     if (test_jump_active != 0U && test_jump_on_delay != 0U) {
         longjmp(test_jump_buffer, 3);
@@ -281,7 +313,7 @@ uint8_t motion_axis_hardware_end_limit_is_active(MotionAxis_t axis) { return fak
 
 void motion_axis_hardware_arm_start_limit_release_stop(MotionAxis_t axis) { ++fake_axes[axis].release_stop_arms; }
 
-void motion_axis_hardware_disarm_start_limit_release_stop(MotionAxis_t axis) { (void)axis; }
+void motion_axis_hardware_disarm_start_limit_release_stop(MotionAxis_t axis) { ++fake_axes[axis].release_stop_disarms; }
 
 void motion_axis_hardware_arm_start_limit_hook(MotionAxis_t axis, MotionAxisHardwareStartLimitHook_t hook) {
     fake_axes[axis].start_limit_hook = hook;
@@ -388,8 +420,39 @@ AxisBenchStatus_t axis_bench_start_profile(
     return AXIS_BENCH_STATUS_STARTED;
 }
 
+void motion_axis_hardware_clear_stop_reason(MotionAxis_t axis) {
+    ++fake_axes[axis].stop_reason_clears;
+    fake_axes[axis].stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+}
+
+/* X homes through the stream, so a homing move of X shows up here instead of in axis_bench_start_profile. Both axes
+ * are configured with positive motion toward the end switch. A move counts as one start; the failing one builds no
+ * block. */
+uint8_t home_block_make(
+    const MotionAxisHardwareConfig_t *hardware_config,
+    AxisBenchDirection_t direction,
+    uint32_t steps,
+    uint32_t step_rate_hz,
+    MotionPlanBlock_t *block
+) {
+    (void)hardware_config;
+    FakeAxis_t *fake = &fake_axes[MOTION_AXIS_X];
+    ++fake->bench_starts;
+    fake->bench_last_target_rate_hz = step_rate_hz;
+    fake->bench_last_signed_steps = direction == AXIS_BENCH_TOWARD_END ? (int32_t)steps : -(int32_t)steps;
+    if (fake->bench_starts == fake->failing_start) {
+        return 0U;
+    }
+    *block = (MotionPlanBlock_t){.master_step_count = steps, .moving_axes_mask = MOTION_PLANNER_AXIS_X_MASK};
+    return 1U;
+}
+
 static void reset_receive_script(void) {
     (void)memset(fake_axes, 0, sizeof(fake_axes));
+    test_generator_busy = 0U;
+    test_generator_halted = 0U;
+    test_generator_reset_keeps_busy = 0U;
+    test_generator_idle_after_delays = 0U;
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         fake_axes[axis].init_receive_calls = UINT32_MAX;
     }
@@ -1414,22 +1477,11 @@ static void test_home_phase_outcomes(void) {
 static void test_home_start_failures(void) {
     MotionTaskContext_t context;
 
-    /* Already on PF10: the seek reports STOPPED immediately, which still counts as a started seek. */
+    /* A seek that starts on a pressed PF10 is stopped by the stream like any other seek; that is the first
+     * scenario of test_home_fast_seek_moves_toward_start_and_backs_off_on_pf10. */
     reset_receive_script();
     context = valid_motion_context();
     fake_x_failing_start = 1U;
-    fake_x_failed_start_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
-    /* The hardware refuses to move into a pressed PF10 and records it as the stop reason. */
-    script_x_state(0U, MOTION_AXIS_HARDWARE_STATUS_READY, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
-    script_home_polls(0U);
-    (void)run_motion_task_until_scripted_stop(&context);
-    expect_u32(fake_x_bench_starts, 2U, "seek blocked by a pressed PF10 continues with the backoff");
-    expect_u32(test_last_receive_timeout, 1U, "homing stays active after a blocked seek");
-
-    reset_receive_script();
-    context = valid_motion_context();
-    fake_x_failing_start = 1U;
-    fake_x_failed_start_status = MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING;
     script_home_polls(0U);
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_stop_requests, 1U, "failed seek start aborts homing");
@@ -1438,13 +1490,79 @@ static void test_home_start_failures(void) {
     reset_receive_script();
     context = valid_motion_context();
     fake_x_failing_start = 2U;
-    fake_x_failed_start_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_STOPPED, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
     script_home_polls(2U);
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 2U, "backoff start is attempted");
-    expect_u32(fake_x_stop_requests, 1U, "a backoff blocked at its start aborts homing on the next poll");
+    expect_u32(fake_x_stop_requests, 1U, "a backoff that cannot start aborts homing");
     expect_u32(test_last_receive_timeout, osWaitForever, "failed backoff start ends homing");
+
+    /* The plan buffer refuses the block (here: it is not initialized): homing aborts. */
+    reset_receive_script();
+    plan_buffer_test_reset();
+    context = valid_motion_context();
+    script_home_polls(0U);
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_stop_requests, 1U, "a refused block aborts homing");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a refused block ends homing");
+}
+
+/* The homing of X plays through the step stream; these are the cases that only the stream has. */
+static void test_x_homing_through_the_stream(void) {
+    MotionTaskContext_t context;
+
+    /* A complete homing clears the old stop reason before each move and frees the generator after each stop. */
+    run_home_to_approach_result(&context, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
+    expect_u32(
+        fake_axes[MOTION_AXIS_X].stop_reason_clears,
+        4U,
+        "each homing move starts with no stop reason and the finished homing leaves none behind"
+    );
+    expect_u32(fake_axes[MOTION_AXIS_X].release_stop_disarms, 1U, "the release stop is disarmed before the approach");
+    expect_u32(test_generator_halts, 3U, "each stop of the homing stream halts the generator");
+    expect_u32(test_generator_resumes, 3U, "each stop of the homing stream resets the generator");
+    expect_u32(test_block_ready_notifications, 3U, "each homing move is one block for the generator");
+    expect_u32(fake_axes[MOTION_AXIS_X].bench_last_target_rate_hz, 100U, "the approach plays at the approach rate");
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "X is homed");
+
+    /* The generator resets only after a few waits: homing goes on with the backoff. */
+    reset_receive_script();
+    context = valid_motion_context();
+    test_generator_reset_keeps_busy = 1U;
+    test_generator_idle_after_delays = 3U;
+    script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
+    script_home_polls(1U);
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(test_delay_calls, 3U, "the stop waits for the generator reset");
+    expect_u32(fake_x_bench_starts, 2U, "a reset that takes a few waits does not stop the homing");
+    expect_u32(test_last_receive_timeout, 1U, "homing goes on after the wait");
+
+    /* The generator never resets: the homing is aborted. */
+    reset_receive_script();
+    context = valid_motion_context();
+    test_generator_reset_keeps_busy = 1U;
+    script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT, 1U);
+    script_home_polls(1U);
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(test_delay_calls, 2U * MOTION_TASK_STOP_SETTLE_TIMEOUT_MS, "the wait for the reset is bounded");
+    expect_u32(fake_x_bench_starts, 1U, "no backoff starts without a reset generator");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a generator that does not reset ends the homing");
+    expect_u32(
+        context.machine_state.homed_axes_mask,
+        MOTION_PLANNER_ALL_AXES_MASK & (uint8_t)~MOTION_PLANNER_AXIS_X_MASK,
+        "X stays unhomed"
+    );
+
+    /* The generator halts itself without a switch (a fault): the homing is aborted and the generator is reset. */
+    reset_receive_script();
+    context = valid_motion_context();
+    test_generator_halted = 1U;
+    script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    script_home_polls(1U);
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 1U, "a fault of the generator does not start a backoff");
+    expect_u32(test_generator_resumes, 1U, "an aborted homing resets the generator");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a fault of the generator ends the homing");
 }
 
 static const CommandDTO_t test_x_jog_command = {
@@ -1497,6 +1615,8 @@ static void test_commands_during_home(void) {
     run_command_during_home(&context, &test_stop_command);
     expect_u32(fake_x_stop_requests, 1U, "STOP aborts active homing");
     expect_u32(test_last_receive_timeout, osWaitForever, "STOP ends homing");
+    expect_u32(test_generator_resumes, 0U, "STOP leaves the generator halted until every axis is at rest");
+    expect_u32(fake_x_stop_reason_clears, 2U, "STOP clears the stop reason once more after the one of the move start");
 
     reset_receive_script();
     context = valid_motion_context();
@@ -1538,6 +1658,7 @@ static void test_home_and_calibrate_wait_for_the_planned_stream(void) {
     expect_u32(fake_x_bench_starts, 0U, "HOME is ignored while the planned stream is busy");
 
     reset_receive_script();
+    test_generator_busy = 1U;
     script_read(0U, osOK, &test_calibrate_x_command);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
@@ -1560,6 +1681,11 @@ static void test_step_timing_comes_from_the_axis_config(void) {
     motion_task_get_step_timing(MOTION_AXIS_X, &pulse_ns, NULL);
     expect_u32(pulse_ns, 1U, "unknown axis leaves the pulse width");
     expect_u32(low_ns, 2U, "unknown axis leaves the low time");
+}
+
+static void test_limit_deceleration_comes_from_the_axis_config(void) {
+    expect_u32(motion_task_get_limit_deceleration(MOTION_AXIS_X), 600000U, "X limit deceleration");
+    expect_u32(motion_task_get_limit_deceleration(MOTION_AXIS_HARDWARE_COUNT), 0U, "unknown axis has none");
 }
 
 static void run_x_jog(MotionTaskContext_t *context, int32_t delta_um) {
@@ -1728,6 +1854,56 @@ static void run_command_with_polls(MotionTaskContext_t *context, const CommandDT
     }
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(context);
+}
+
+/* Y still homes through the axis driver with ramped moves; X, which homes through the stream, does not reach these
+ * paths. */
+static void test_y_homing_through_the_axis_driver(void) {
+    MotionTaskContext_t context;
+
+    reset_receive_script();
+    context = valid_motion_context();
+    script_axis_state(MOTION_AXIS_Y, 0U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_y_command, 0U);
+    expect_u32(fake_y.bench_starts, 0U, "HOME is ignored while Y is moving");
+
+    /* The driver refuses to move into a pressed switch and leaves the axis STOPPED: the seek counts as started. */
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_y.failing_start = 1U;
+    fake_y.failed_start_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
+    /* The driver records the pressed switch as the stop reason. */
+    script_axis_state(
+        MOTION_AXIS_Y,
+        0U,
+        MOTION_AXIS_HARDWARE_STATUS_READY,
+        MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT,
+        1U
+    );
+    run_command_with_polls(&context, &test_home_y_command, 0U);
+    expect_u32(fake_y.bench_starts, 2U, "a seek blocked by the start switch continues with the backoff");
+    expect_u32(test_last_receive_timeout, 1U, "homing stays active after a blocked seek");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_y.failing_start = 1U;
+    fake_y.failed_start_status = MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING;
+    run_command_with_polls(&context, &test_home_y_command, 0U);
+    expect_u32(fake_y.stop_requests, 1U, "a seek that cannot start aborts homing");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a seek that cannot start ends homing");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    script_axis_state(MOTION_AXIS_Y, 1U, MOTION_AXIS_HARDWARE_STATUS_WAITING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_y_command, 1U);
+    expect_u32(test_last_receive_timeout, 1U, "a seek waiting for its first step keeps homing active");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    script_axis_state(MOTION_AXIS_Y, 1U, MOTION_AXIS_HARDWARE_STATUS_COMPLETE, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_y_command, 1U);
+    expect_u32(fake_y.stop_requests, 1U, "a seek that runs out of steps aborts homing");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a seek that runs out of steps ends homing");
 }
 
 static void test_y_home_runs_on_its_own_hardware(void) {
@@ -1991,10 +2167,12 @@ int main(void) {
     test_stream_event_source_is_registered_for_stream_axes_only();
     test_home_phase_outcomes();
     test_home_start_failures();
+    test_x_homing_through_the_stream();
     test_commands_during_home();
     test_home_is_refused_when_it_cannot_start();
     test_home_and_calibrate_wait_for_the_planned_stream();
     test_step_timing_comes_from_the_axis_config();
+    test_limit_deceleration_comes_from_the_axis_config();
     test_x_jog_is_a_relative_planned_move();
     test_stop_fault_acknowledgement_edges();
     test_stop_clears_runtime_fault_and_x_homing();
@@ -2016,6 +2194,7 @@ int main(void) {
     test_xyz_command_with_null_context_reaches_planner_as_invalid_input();
     test_motion_operation_without_xyz_flag_does_not_call_planner();
     test_y_home_runs_on_its_own_hardware();
+    test_y_homing_through_the_axis_driver();
     test_x_and_y_home_together();
     test_home_and_calibrate_masks();
     test_y_calibration_reports_on_y();

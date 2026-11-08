@@ -20,6 +20,8 @@
 /* Filler record of an empty stretch. A half of them takes about 14 ms, which is how long a new block can wait behind
  * an idle half; shorter records would only load the DMA interrupt more. */
 #define STEP_GENERATOR_TASK_IDLE_RECORD_NS 10000U
+/* The braking ramp starts at this step rate: the fast seek of homing. A faster axis is brought down to it at once. */
+#define STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ 50000U
 /* DIR setup before the first STEP is at least this long; the shortest RTOS delay covers it. */
 #define STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS 1U
 
@@ -39,6 +41,8 @@ static osThreadId_t volatile step_generator_task_thread_id;
 static volatile uint8_t step_generator_task_stream_busy;
 /* Set by STOP in another task or by a ring fault in the DMA interrupt; cleared by this task once it is reset. */
 static volatile uint8_t step_generator_task_halted;
+/* Set once at start when the axis refused the braking ramp; counted into generator_errors with the feeder's errors. */
+static volatile uint8_t step_generator_task_brake_setup_failed;
 
 static void step_generator_counter_increment(volatile uint32_t *counter) {
     if (*counter != UINT32_MAX) {
@@ -73,6 +77,8 @@ uint8_t step_generator_task_is_busy(void) {
     (void)plan_buffer_get_diagnostics(&plan);
     return (uint8_t)(step_generator_task_stream_busy != 0U || plan.queued != 0U);
 }
+
+uint8_t step_generator_task_is_halted(void) { return step_generator_task_halted; }
 
 void step_generator_task_resume_after_stop(void) { step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_STOP_RESET); }
 
@@ -142,16 +148,48 @@ static void step_generator_task_stream_fault(StepStreamAxisFault_t fault) {
     step_generator_task_halted = 1U;
 }
 
+/* DMA interrupt: the axis brakes on a limit switch and refills its ring itself, so the feeder must not write. */
+static void step_generator_task_stop_feeding_for_brake(void) { step_generator_task_halted = 1U; }
+
 static void step_generator_task_publish_diagnostics(void) {
     StepStreamFeederDiagnostics_t feeder_diagnostics;
     step_stream_feeder_get_diagnostics(&step_generator_task_feeder, &feeder_diagnostics);
     step_generator_task_diagnostics.blocks_started = feeder_diagnostics.blocks_started;
     step_generator_task_diagnostics.blocks_completed = feeder_diagnostics.blocks_completed;
     step_generator_task_diagnostics.halves_filled = feeder_diagnostics.halves_filled;
-    step_generator_task_diagnostics.generator_errors = feeder_diagnostics.generator_errors;
+    step_generator_task_diagnostics.generator_errors =
+        step_generator_task_brake_setup_failed != 0U && feeder_diagnostics.generator_errors != UINT32_MAX
+            ? feeder_diagnostics.generator_errors + 1U
+            : feeder_diagnostics.generator_errors;
     step_generator_task_diagnostics.axis_errors = feeder_diagnostics.axis_errors;
     step_generator_task_diagnostics.streams_started = feeder_diagnostics.streams_started;
     step_generator_task_diagnostics.streams_stopped = feeder_diagnostics.streams_stopped;
+}
+
+/* Builds the braking ramp of the axis from the same timing as the feeder. Without a deceleration setting, or with
+ * one the ramp cannot be built from, the axis keeps no ramp and stops at once on a limit switch; the latter is counted
+ * in generator_errors. */
+static void step_generator_task_setup_brake(
+    const StepGeneratorTaskConfig_t *task_config,
+    const StepStreamFeederConfig_t *feeder_config
+) {
+    if (task_config->limit_deceleration_steps_per_s2 == 0U) {
+        return;
+    }
+    const uint64_t pulse_and_low = (uint64_t)feeder_config->generator.pulse_ticks + feeder_config->generator.low_ticks;
+    const StepStreamBrakeConfig_t brake = {
+        .timer_clock_hz = feeder_config->generator.timer_clock_hz,
+        .pulse_ticks = feeder_config->generator.pulse_ticks,
+        .min_period_ticks = feeder_config->generator.min_record_ticks > pulse_and_low
+                                ? feeder_config->generator.min_record_ticks
+                                : (uint32_t)pulse_and_low,
+        .idle_record_ticks = feeder_config->idle_record_ticks,
+        .deceleration_steps_per_s2 = task_config->limit_deceleration_steps_per_s2,
+        .max_step_rate_hz = STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ,
+    };
+    if (step_stream_axis_configure_brake(&brake) != STEP_STREAM_AXIS_STATUS_OK) {
+        step_generator_task_brake_setup_failed = 1U;
+    }
 }
 
 /* Builds the feeder from the driver timing. Returns 0 when the clock or the timing cannot be used. */
@@ -182,6 +220,8 @@ static uint8_t step_generator_task_setup_feeder(const StepGeneratorTaskConfig_t 
         step_generator_task_port_stop,
         step_generator_task_port_pop_block,
     };
+    /* The ramp depends on the config only, so it is set up whether or not the feeder takes it. */
+    step_generator_task_setup_brake(task_config, &config);
     return (uint8_t)(step_stream_feeder_init(&step_generator_task_feeder, &config, &ports) ==
                      STEP_STREAM_FEEDER_STATUS_OK);
 }
@@ -197,6 +237,7 @@ void StepGeneratorTask(void *argument) {
     static const StepStreamAxisListener_t stream_listener = {
         step_generator_task_notify_ring_half_released,
         step_generator_task_stream_fault,
+        step_generator_task_stop_feeding_for_brake,
     };
     (void)step_stream_axis_set_listener(&stream_listener);
 

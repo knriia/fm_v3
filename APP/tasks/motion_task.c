@@ -5,6 +5,7 @@
 #include "motion/axis_bench.h"
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
+#include "motion/home_block.h"
 #include "motion/plan_buffer.h"
 #include "motion/step_executor.h"
 #include "step_generator_task.h"
@@ -309,20 +310,84 @@ static uint8_t motion_task_limits_conflict(MotionAxis_t axis) {
                : 0U;
 }
 
-static void motion_task_home_abort(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
+static uint8_t motion_task_axis_is_streamed(MotionAxis_t axis) {
+    return (motion_task_axis_mask(axis) & MOTION_TASK_STREAM_AXES_MASK) != 0U ? 1U : 0U;
+}
+
+/* Returns the step generator to its idle state: stops the stream, drops the queued blocks and waits until the task
+ * has reset. Returns 0 when it does not reset in time; the generator then stays halted until the next STOP. */
+static uint8_t motion_task_stream_flush(void) {
+    step_generator_task_halt();
+    (void)plan_buffer_clear();
+    step_generator_task_resume_after_stop();
+    for (uint32_t waited_ms = 0U; step_generator_task_is_busy() != 0U; ++waited_ms) {
+        if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
+            return 0U;
+        }
+        (void)osDelay(1U);
+    }
+    return 1U;
+}
+
+/* The stop reason of a stream is only meant for the homing that waits for it; it is not left behind for later moves. */
+static void motion_task_home_forget_stream_stop(MotionAxis_t axis) {
+    if (motion_task_axis_is_streamed(axis) != 0U) {
+        motion_axis_hardware_clear_stop_reason(axis);
+    }
+}
+
+/* Ends the homing of the axis without touching the step generator; STOP leaves its reset to motion_task_finish_stop,
+ * which waits until every axis is at rest. */
+static void motion_task_home_cancel(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
     motion_axis_hardware_request_stop(state->axis);
     motion_axis_hardware_disarm_start_limit_release_stop(state->axis);
     motion_axis_hardware_arm_start_limit_hook(state->axis, NULL);
+    motion_task_home_forget_stream_stop(state->axis);
     context->machine_state.homed_axes_mask &= (uint8_t)~motion_task_axis_mask(state->axis);
     state->home_phase = MOTION_TASK_HOME_IDLE;
 }
 
+static void motion_task_home_abort(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
+    if (motion_task_axis_is_streamed(state->axis) != 0U) {
+        /* A move still in the stream would run on without anyone watching its switches. */
+        (void)motion_task_stream_flush();
+    }
+    motion_task_home_cancel(state, context);
+}
+
 static void motion_task_home_complete(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
+    motion_task_home_forget_stream_stop(state->axis);
     /* The start-switch interrupt that stopped the approach has already zeroed the scale at the switch edge. */
     context->machine_state.position_um[state->axis] = 0;
     context->machine_state.homed_axes_mask |= motion_task_axis_mask(state->axis);
     (void)motion_axis_hardware_ready_after_home(state->axis);
     state->home_phase = MOTION_TASK_HOME_IDLE;
+}
+
+/* A streamed axis homes with one plan block at the constant target rate of the profile, with no ramp. The stream, idle
+ * at this point, plays it; a switch ends it. A switch that blocks the move at once ends it just the same. */
+static uint8_t motion_task_home_start_stream_move(
+    const MotionTaskAxisState_t *state,
+    AxisBenchDirection_t direction,
+    const AxisBenchProfile_t *profile
+) {
+    MotionPlanBlock_t block;
+    if (home_block_make(
+            motion_task_hardware_config(state->axis),
+            direction,
+            MOTION_TASK_HOME_MOVE_STEPS,
+            profile->target_step_rate_hz,
+            &block
+        ) == 0U) {
+        return 0U;
+    }
+    /* The stop of the previous move is still recorded; the next poll must wait for the stop of this one. */
+    motion_axis_hardware_clear_stop_reason(state->axis);
+    if (plan_buffer_try_push(&block) != PLAN_BUFFER_STATUS_OK) {
+        return 0U;
+    }
+    step_generator_task_notify_block_ready();
+    return 1U;
 }
 
 /* A move that a switch blocks at once leaves the hardware STOPPED with that switch as the reason; the next poll
@@ -334,6 +399,14 @@ static void motion_task_home_start_move(
     const AxisBenchProfile_t *profile,
     MotionTaskHomePhase_t phase
 ) {
+    if (motion_task_axis_is_streamed(state->axis) != 0U) {
+        if (motion_task_home_start_stream_move(state, direction, profile) == 0U) {
+            motion_task_home_abort(state, context);
+            return;
+        }
+        state->home_phase = phase;
+        return;
+    }
     MotionAxisHardwareStatus_t hardware_status = MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
     const AxisBenchStatus_t start_status = axis_bench_start_profile(
         state->axis,
@@ -366,6 +439,8 @@ static void motion_task_home_start_backoff(MotionTaskAxisState_t *state, MotionT
 }
 
 static void motion_task_home_start_approach(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
+    /* The backoff is over; a later move toward the end switch must not stop when the start switch turns off. */
+    motion_axis_hardware_disarm_start_limit_release_stop(state->axis);
     /* The start-switch interrupt that stops the approach zeroes the scale in the same interrupt. */
     motion_axis_hardware_arm_start_limit_hook(state->axis, motion_task_axis_configs[state->axis].zero_scale);
     motion_task_home_start_move(
@@ -405,19 +480,42 @@ static void motion_task_home_begin(MotionTaskAxisState_t *state, MotionTaskConte
     );
 }
 
+/* 1 once the homing move of the axis has ended. The reason is NONE when it ended without a switch: it ran out of steps,
+ * the generator stopped on a fault, or the stream did not reset. A streamed axis is also made ready for the next move
+ * here, because a stop on a switch leaves its generator halted. A stream that does not reset blocks MotionTask for the
+ * settle timeout here and for another one in the abort that follows. */
+static uint8_t
+motion_task_home_move_has_ended(const MotionTaskAxisState_t *state, MotionAxisHardwareStopReason_t *stop_reason) {
+    if (motion_task_axis_is_streamed(state->axis) != 0U) {
+        *stop_reason = motion_axis_hardware_get_last_stop_reason(state->axis);
+        if (*stop_reason != MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
+            if (motion_task_stream_flush() == 0U) {
+                *stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+            }
+            return 1U;
+        }
+        return step_generator_task_is_halted() != 0U || step_generator_task_is_busy() == 0U ? 1U : 0U;
+    }
+    const MotionAxisHardwareStatus_t hardware_status = motion_axis_hardware_get_status(state->axis);
+    if (motion_task_hardware_is_active(hardware_status) != 0U) {
+        return 0U;
+    }
+    *stop_reason = hardware_status == MOTION_AXIS_HARDWARE_STATUS_STOPPED
+                       ? motion_axis_hardware_get_last_stop_reason(state->axis)
+                       : MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+    return 1U;
+}
+
 static void motion_task_home_poll(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
     if (motion_task_home_is_active(state) == 0U) {
         return;
     }
-    const MotionAxisHardwareStatus_t hardware_status = motion_axis_hardware_get_status(state->axis);
-    if (motion_task_hardware_is_active(hardware_status) != 0U) {
-        return;
-    }
     /* Every homing move is meant to end on the start switch; running out of steps or any other stop is a
      * failure. */
-    const MotionAxisHardwareStopReason_t stop_reason = hardware_status == MOTION_AXIS_HARDWARE_STATUS_STOPPED
-                                                           ? motion_axis_hardware_get_last_stop_reason(state->axis)
-                                                           : MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+    MotionAxisHardwareStopReason_t stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+    if (motion_task_home_move_has_ended(state, &stop_reason) == 0U) {
+        return;
+    }
 
     switch (state->home_phase) {
     case MOTION_TASK_HOME_FAST_SEEK:
@@ -620,7 +718,7 @@ static void motion_task_finish_stop(MotionTaskContext_t *context) {
 
 static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
     if (motion_task_home_is_active(state) != 0U) {
-        motion_task_home_abort(state, context);
+        motion_task_home_cancel(state, context);
     } else {
         motion_axis_hardware_request_stop(state->axis);
     }
@@ -747,6 +845,13 @@ void motion_task_get_step_timing(MotionAxis_t axis, uint32_t *step_pulse_width_n
     }
     *step_pulse_width_ns = motion_task_axis_configs[axis].hardware.step_pulse_width_ns;
     *step_low_time_ns = motion_task_axis_configs[axis].hardware.step_low_time_ns;
+}
+
+uint32_t motion_task_get_limit_deceleration(MotionAxis_t axis) {
+    if ((uint32_t)axis >= (uint32_t)MOTION_AXIS_HARDWARE_COUNT) {
+        return 0U;
+    }
+    return motion_task_axis_configs[axis].hardware.limit_deceleration_steps_per_s2;
 }
 
 uint32_t motion_task_get_stream_underrun_count(void) {

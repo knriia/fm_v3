@@ -1,6 +1,7 @@
 #include "motion_axis_hardware.h"
 
 #include "motion/motion_event_source.h"
+#include "step_stream_axis.h"
 
 #include "stm32h723xx.h"
 #include "system_stm32h7xx.h"
@@ -974,6 +975,8 @@ MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t 
     motion_axis_set_enabled(c, 1U);
     motion_axis_wait_ns(c->config.enable_setup_ns);
     motion_axis_set_direction(c, positive_direction != 0U ? 1U : 0U);
+    /* A new planned move: the switch point of an earlier one is stale. */
+    c->limit_latched = 0U;
     return c->status;
 }
 
@@ -1054,6 +1057,16 @@ void motion_axis_hardware_request_stop(MotionAxis_t axis) {
 MotionAxisHardwareStopReason_t motion_axis_hardware_get_last_stop_reason(MotionAxis_t axis) {
     const Ctx_t *c = motion_axis_context(axis);
     return c != NULL ? c->stop_reason : MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+}
+
+void motion_axis_hardware_clear_stop_reason(MotionAxis_t axis) {
+    Ctx_t *c = motion_axis_context(axis);
+    if (c == NULL) {
+        return;
+    }
+    const uint32_t primask = motion_axis_enter_critical();
+    c->stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+    motion_axis_exit_critical(primask);
 }
 
 MotionAxisHardwareStatus_t motion_axis_hardware_clear_fault(MotionAxis_t axis) {
@@ -1400,8 +1413,53 @@ void motion_axis_hardware_reset_timing_peaks(MotionAxis_t axis) {
     motion_axis_exit_critical(primask);
 }
 
+/* The switch that stops a move in the given direction, if it is pending and active. */
+static MotionAxisHardwareStopReason_t
+motion_axis_pending_limit_reason(const Ctx_t *c, uint32_t pending_lines, uint8_t toward_end) {
+    const uint8_t start_active = (pending_lines & motion_axis_pin_mask(c->board->start_limit_pin)) != 0U &&
+                                 motion_axis_start_limit_active(c) != 0U;
+    const uint8_t end_active =
+        (pending_lines & motion_axis_pin_mask(c->board->end_limit_pin)) != 0U && motion_axis_end_limit_active(c) != 0U;
+    if (start_active != 0U && toward_end == 0U) {
+        return MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT;
+    }
+    if (end_active != 0U && toward_end != 0U) {
+        return MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
+    }
+    return MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+}
+
+/* A planned stream drives the X timer without a hardware status of its own. A switch that it moves toward records the
+ * switch point and starts the braking, which the stream axis runs in its DMA interrupt. The start switch turning off
+ * while the release stop is armed and the stream moves toward the end switch stops it the same way. The first reason
+ * stays in stop_reason until MotionTask clears it. A repeated edge before the axis has stopped (a bouncing switch)
+ * changes nothing: the switch point is latched once, the hook runs once, and the brake request is ignored once
+ * the axis has left STREAMING. Re-check this when the braking ramp is switched on. */
+static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
+    if (c != &motion_axis_contexts[MOTION_AXIS_X] || step_stream_axis_get_state() != STEP_STREAM_AXIS_STATE_STREAMING) {
+        return;
+    }
+    const uint8_t toward_end = motion_axis_direction_toward_end(c, c->current_direction_positive);
+    MotionAxisHardwareStopReason_t reason = motion_axis_pending_limit_reason(c, pending_lines, toward_end);
+    if (reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
+        const uint8_t start_released = (pending_lines & motion_axis_pin_mask(c->board->start_limit_pin)) != 0U &&
+                                       motion_axis_start_limit_active(c) == 0U;
+        if (start_released == 0U || c->start_limit_release_stop_armed == 0U || toward_end == 0U) {
+            return;
+        }
+        reason = MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE;
+    } else {
+        motion_axis_latch_limit(c, reason);
+    }
+    if (c->stop_reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
+        c->stop_reason = reason;
+    }
+    step_stream_axis_request_brake();
+}
+
 static void motion_axis_limit_irq_for(Ctx_t *c, uint32_t pending_lines) {
     if (motion_axis_status_is_active(c->status) == 0) {
+        motion_axis_stream_limit_irq(c, pending_lines);
         return;
     }
 
@@ -1414,15 +1472,7 @@ static void motion_axis_limit_irq_for(Ctx_t *c, uint32_t pending_lines) {
         c->stop_requested = 1U;
         __DMB();
     }
-    const uint8_t end_active =
-        (pending_lines & motion_axis_pin_mask(c->board->end_limit_pin)) != 0U && motion_axis_end_limit_active(c) != 0U;
-
-    MotionAxisHardwareStopReason_t reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
-    if (start_active != 0U && toward_end == 0U) {
-        reason = MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT;
-    } else if (end_active != 0U && toward_end != 0U) {
-        reason = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
-    }
+    const MotionAxisHardwareStopReason_t reason = motion_axis_pending_limit_reason(c, pending_lines, toward_end);
     if (reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
         return;
     }
@@ -1435,6 +1485,11 @@ static void motion_axis_limit_irq_for(Ctx_t *c, uint32_t pending_lines) {
         return;
     }
     motion_axis_stop_with_reason(c, reason);
+}
+
+void motion_axis_hardware_poll_stream_limit(void) {
+    Ctx_t *c = &motion_axis_contexts[MOTION_AXIS_X];
+    motion_axis_stream_limit_irq(c, motion_axis_limit_lines(c->board));
 }
 
 void motion_axis_hardware_limit_irq(uint32_t pending_lines) {

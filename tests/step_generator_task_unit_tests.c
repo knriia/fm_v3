@@ -57,6 +57,9 @@ static uint8_t test_fail_acquire;
 static uint8_t test_fail_commit;
 static uint8_t test_fail_start;
 static uint32_t test_other_axis_calls;
+static uint32_t test_configure_brake_calls;
+static StepStreamBrakeConfig_t test_brake_config;
+static StepStreamAxisStatus_t test_configure_brake_result;
 
 static void expect_u32(uint32_t actual, uint32_t expected, const char *message) {
     if (actual != expected) {
@@ -221,6 +224,12 @@ StepStreamAxisStatus_t step_stream_axis_start_stream(uint32_t startup_period_ns)
 
 void step_stream_axis_stop(void) { ++test_stop_calls; }
 
+StepStreamAxisStatus_t step_stream_axis_configure_brake(const StepStreamBrakeConfig_t *config) {
+    ++test_configure_brake_calls;
+    test_brake_config = *config;
+    return test_configure_brake_result;
+}
+
 MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t axis, uint8_t positive_direction) {
     if (axis != MOTION_AXIS_X) {
         ++test_other_axis_calls;
@@ -243,6 +252,7 @@ static void reset_fixture(void) {
     memset(&step_generator_task_feeder, 0, sizeof(step_generator_task_feeder));
     step_generator_task_thread_id = NULL;
     step_generator_task_halted = 0U;
+    step_generator_task_brake_setup_failed = 0U;
     test_error_handler_calls = 0U;
     test_jump_active = 0U;
     test_flags_set_calls = 0U;
@@ -269,7 +279,14 @@ static void reset_fixture(void) {
     test_fail_acquire = 0U;
     test_fail_commit = 0U;
     test_fail_start = 0U;
-    test_task_config = (StepGeneratorTaskConfig_t){.step_pulse_width_ns = 5000U, .step_low_time_ns = 2500U};
+    test_configure_brake_calls = 0U;
+    test_brake_config = (StepStreamBrakeConfig_t){0};
+    test_configure_brake_result = STEP_STREAM_AXIS_STATUS_OK;
+    test_task_config = (StepGeneratorTaskConfig_t){
+        .step_pulse_width_ns = 5000U,
+        .step_low_time_ns = 2500U,
+        .limit_deceleration_steps_per_s2 = 600000U,
+    };
     for (uint32_t index = 0U; index < TEST_WAIT_SCRIPT_LENGTH; ++index) {
         test_wait_results[index] = 0U;
         test_wait_actions[index] = TEST_ACTION_NONE;
@@ -397,9 +414,11 @@ static void test_unusable_timing_disables_feeding(void) {
 static void test_stop_halts_and_resets(void) {
     reset_fixture();
     push_block(5U, 3);
+    expect_u32(step_generator_task_is_halted(), 0U, "a fresh task is not halted");
     step_generator_task_halt();
     expect_u32(test_stop_calls, 1U, "STOP stops the stream axis at once");
     expect_u32(step_generator_task_halted, 1U, "STOP halts feeding");
+    expect_u32(step_generator_task_is_halted(), 1U, "the halt is visible to MotionTask");
     test_wait_script_count = 1U;
     test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
     expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "halted task only waits");
@@ -561,6 +580,10 @@ static void test_listener_and_notifications(void) {
     test_stream_listener.on_fault(STEP_STREAM_AXIS_FAULT_UNDERRUN);
     expect_u32(step_generator_task_halted, 1U, "a stream fault halts feeding");
 
+    step_generator_task_halted = 0U;
+    test_stream_listener.on_brake();
+    expect_u32(step_generator_task_halted, 1U, "braking on a limit halts feeding");
+
     reset_fixture();
     step_generator_task_notify_block_ready();
     step_generator_task_notify_ring_half_released();
@@ -576,6 +599,59 @@ static void test_listener_and_notifications(void) {
     expect_u32(counter, UINT32_MAX, "diagnostic counter saturates");
 }
 
+static void test_brake_ramp_is_built_from_the_driver_timing(void) {
+    reset_fixture();
+    test_wait_script_count = 1U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_configure_brake_calls, 1U, "the braking ramp is configured once");
+    expect_u32(test_brake_config.timer_clock_hz, TEST_TIMER_CLOCK_HZ, "ramp uses the timer clock");
+    expect_u32(test_brake_config.pulse_ticks, 1375U, "ramp uses the STEP pulse of the driver");
+    expect_u32(test_brake_config.min_period_ticks, 2063U, "ramp keeps pulse and low time");
+    expect_u32(test_brake_config.idle_record_ticks, 2750U, "ramp uses the filler record of the feeder");
+    expect_u32(test_brake_config.deceleration_steps_per_s2, 600000U, "ramp uses the limit deceleration");
+    expect_u32(test_brake_config.max_step_rate_hz, STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ, "ramp starts at the seek rate");
+    expect_u32(step_generator_task_diagnostics.generator_errors, 0U, "a good ramp is no error");
+
+    /* A longer shortest record than pulse plus low time wins. */
+    reset_fixture();
+    test_task_config.step_pulse_width_ns = 400U;
+    test_task_config.step_low_time_ns = 400U;
+    test_wait_script_count = 1U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_brake_config.min_period_ticks, 550U, "the shortest record sets the ramp period");
+    expect_u32(test_brake_config.pulse_ticks, 110U, "ramp pulse follows the driver");
+}
+
+static void test_brake_is_skipped_or_counted(void) {
+    reset_fixture();
+    test_task_config.limit_deceleration_steps_per_s2 = 0U;
+    test_wait_script_count = 1U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_configure_brake_calls, 0U, "no deceleration setting, no ramp");
+    expect_u32(step_generator_task_diagnostics.generator_errors, 0U, "a missing ramp is not an error here");
+
+    reset_fixture();
+    test_configure_brake_result = STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    test_wait_script_count = 1U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_task_diagnostics.generator_errors, 1U, "a ramp the axis refuses is counted");
+    expect_u32(step_generator_task_halted, 0U, "feeding goes on without a ramp");
+
+    /* The error count adds to the feeder's own and saturates with it. */
+    step_generator_task_feeder.diagnostics.generator_errors = 4U;
+    step_generator_task_publish_diagnostics();
+    expect_u32(step_generator_task_diagnostics.generator_errors, 5U, "ramp error adds to the feeder errors");
+    step_generator_task_feeder.diagnostics.generator_errors = UINT32_MAX;
+    step_generator_task_publish_diagnostics();
+    expect_u32(step_generator_task_diagnostics.generator_errors, UINT32_MAX, "the sum saturates");
+
+    /* An unusable timing builds no feeder, so no ramp either. */
+    reset_fixture();
+    test_timer_clock_hz = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_configure_brake_calls, 0U, "no feeder, no ramp");
+}
+
 int main(void) {
     test_task_streams_a_block();
     test_idle_stream_stops();
@@ -586,6 +662,8 @@ int main(void) {
     test_busy_covers_queue_and_stream();
     test_faults_halt_the_task();
     test_listener_and_notifications();
+    test_brake_ramp_is_built_from_the_driver_timing();
+    test_brake_is_skipped_or_counted();
     expect_u32(test_other_axis_calls, 0U, "the generator drives only X");
 
     if (test_failures != 0U) {

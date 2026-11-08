@@ -59,6 +59,8 @@ MotionPlannerStatus_t motion_task_get_last_planner_status(void);
 /* STEP pulse width and minimum low time of an axis driver, the timing the planned stream is built from. An axis
  * outside MotionAxis_t leaves both values untouched. */
 void motion_task_get_step_timing(MotionAxis_t axis, uint32_t *step_pulse_width_ns, uint32_t *step_low_time_ns);
+/* Deceleration of an axis when a limit switch stops it, in steps/s^2; 0 for an axis outside MotionAxis_t. */
+uint32_t motion_task_get_limit_deceleration(MotionAxis_t axis);
 /* Times a planned step stream ran dry in the middle of a motion since start, summed over all axes. */
 uint32_t motion_task_get_stream_underrun_count(void);
 
