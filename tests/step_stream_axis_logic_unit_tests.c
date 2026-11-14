@@ -217,6 +217,51 @@ static void test_poll(void) {
     assert(poll_wrong_context_calls == 0U);
 }
 
+static void test_timer_clock_hz(void) {
+    /* The project clock tree: HCLK 275 MHz (HPRE /2), APB 137.5 MHz (PPRE /2), the timers run at 2 x APB. */
+    assert(step_stream_axis_logic_timer_clock_hz(550000000U, 8U, 4U, 0U) == 275000000U);
+    /* TIMPRE = 1 with an APB divider up to 4: the timers run at HCLK. */
+    assert(step_stream_axis_logic_timer_clock_hz(550000000U, 8U, 4U, 1U) == 275000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(400000000U, 8U, 5U, 1U) == 200000000U);
+    /* APB not divided: the timers run at PCLK without the doubling. */
+    assert(step_stream_axis_logic_timer_clock_hz(275000000U, 0U, 0U, 0U) == 275000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(275000000U, 0U, 3U, 0U) == 275000000U);
+    /* APB divided by 4, 8, 16 without TIMPRE: 2 x PCLK. */
+    assert(step_stream_axis_logic_timer_clock_hz(400000000U, 8U, 5U, 0U) == 100000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(400000000U, 8U, 6U, 0U) == 50000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(400000000U, 8U, 7U, 0U) == 25000000U);
+    /* TIMPRE = 1 with an APB divider above 4: 4 x PCLK. */
+    assert(step_stream_axis_logic_timer_clock_hz(400000000U, 8U, 6U, 1U) == 100000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(400000000U, 8U, 7U, 1U) == 50000000U);
+    /* HPRE codes: 0xxx not divided, 1000..1011 divide by 2..16, 1100..1111 by 64..512. */
+    assert(step_stream_axis_logic_timer_clock_hz(100000000U, 7U, 0U, 0U) == 100000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(100000000U, 9U, 0U, 0U) == 25000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(640000000U, 12U, 0U, 0U) == 10000000U);
+    assert(step_stream_axis_logic_timer_clock_hz(512000000U, 15U, 0U, 0U) == 1000000U);
+    /* Every HPRE code against the divider of RM0468 (RCC_D1CFGR), the core clock 1024 MHz, the APB not divided. */
+    static const uint32_t expected_ahb_dividers[16] = {1U, 1U, 1U, 1U, 1U, 1U, 1U, 1U, 2U, 4U, 8U, 16U, 64U, 128U, 256U, 512U};
+    for (uint32_t hpre = 0U; hpre < 16U; ++hpre) {
+        assert(
+            step_stream_axis_logic_timer_clock_hz(1024000000U, hpre, 0U, 0U) ==
+            1024000000U / expected_ahb_dividers[hpre]
+        );
+    }
+    /* Every PPRE code at TIMPRE 0 and 1, HCLK 160 MHz: dividers 1,1,1,1,2,4,8,16 give PCLK 160,160,160,160,80,40,20,10;
+     * TIMPRE 0 doubles it (except /1), TIMPRE 1 gives HCLK up to /4 and 4 x PCLK above. */
+    static const uint32_t expected_timer_clock_timpre0[8] = {160000000U, 160000000U, 160000000U, 160000000U,
+                                                             160000000U, 80000000U,  40000000U,  20000000U};
+    static const uint32_t expected_timer_clock_timpre1[8] = {160000000U, 160000000U, 160000000U, 160000000U,
+                                                             160000000U, 160000000U, 80000000U,  40000000U};
+    for (uint32_t ppre = 0U; ppre < 8U; ++ppre) {
+        assert(step_stream_axis_logic_timer_clock_hz(160000000U, 0U, ppre, 0U) == expected_timer_clock_timpre0[ppre]);
+        assert(step_stream_axis_logic_timer_clock_hz(160000000U, 0U, ppre, 1U) == expected_timer_clock_timpre1[ppre]);
+    }
+    /* Unusable clock tree. */
+    assert(step_stream_axis_logic_timer_clock_hz(0U, 8U, 4U, 0U) == 0U);
+    assert(step_stream_axis_logic_timer_clock_hz(550000000U, 16U, 4U, 0U) == 0U);
+    assert(step_stream_axis_logic_timer_clock_hz(550000000U, 8U, 8U, 0U) == 0U);
+}
+
 /* ---- Braking on a limit switch ---- */
 
 #define BRAKE_RECORD_COUNT 40U
@@ -561,6 +606,7 @@ int main(void) {
     test_boundary_steps();
     test_stale_steps();
     test_poll();
+    test_timer_clock_hz();
     test_brake_reset();
     test_brake_in_the_playing_half();
     test_brake_ramp_longer_than_one_refill();
