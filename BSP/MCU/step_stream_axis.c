@@ -49,6 +49,10 @@ typedef struct {
     TIM_TypeDef *timer;
     volatile uint32_t *timer_rcc_enable_register;
     uint32_t timer_rcc_enable_bit;
+    /* 1: the timer sits on APB2 (its kernel clock follows D2PPRE2, not D2PPRE1). */
+    uint8_t timer_on_apb2;
+    /* 1: advanced timer (TIM1, TIM8), its outputs also need BDTR.MOE. */
+    uint8_t advanced_timer;
     GPIO_TypeDef *step_port;
     uint32_t step_gpio_rcc_enable_bit;
     uint8_t step_pin;
@@ -100,6 +104,8 @@ static const StepStreamAxisHardware_t step_stream_axis_x_hardware = {
     .timer = TIM4,
     .timer_rcc_enable_register = &RCC->APB1LENR,
     .timer_rcc_enable_bit = RCC_APB1LENR_TIM4EN,
+    .timer_on_apb2 = 0U,
+    .advanced_timer = 0U,
     .step_port = GPIOB,
     .step_gpio_rcc_enable_bit = RCC_AHB4ENR_GPIOBEN,
     .step_pin = 6U,
@@ -115,9 +121,35 @@ static const StepStreamAxisHardware_t step_stream_axis_x_hardware = {
     .dma_flags_in_high_register = STEP_STREAM_AXIS_DMA_FLAGS_IN_HIGH_REGISTER(0U),
 };
 
+/* Y: TIM1 CH1 on PA8. DIR (PA10) and ENA (PA11) belong to motion_axis_hardware, the channel drives STEP only. */
+static const StepStreamAxisHardware_t step_stream_axis_y_hardware = {
+    .motion_axis = MOTION_AXIS_Y,
+    .timer = TIM1,
+    .timer_rcc_enable_register = &RCC->APB2ENR,
+    .timer_rcc_enable_bit = RCC_APB2ENR_TIM1EN,
+    .timer_on_apb2 = 1U,
+    .advanced_timer = 1U,
+    .step_port = GPIOA,
+    .step_gpio_rcc_enable_bit = RCC_AHB4ENR_GPIOAEN,
+    .step_pin = 8U,
+    .step_alternate_function = 1U,
+    .dma = DMA1,
+    .dma_rcc_enable_bit = RCC_AHB1ENR_DMA1EN,
+    .dma_stream = DMA1_Stream1,
+    .dma_mux_channel = DMAMUX1_Channel1,
+    /* TIM1_UP. */
+    .dma_request = 15U,
+    .dma_irq = DMA1_Stream1_IRQn,
+    .dma_flag_shift = STEP_STREAM_AXIS_DMA_FLAG_SHIFT(1U),
+    .dma_flags_in_high_register = STEP_STREAM_AXIS_DMA_FLAGS_IN_HIGH_REGISTER(1U),
+};
+
 static uint16_t step_stream_axis_x_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
 static uint16_t step_stream_axis_x_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
+static uint16_t step_stream_axis_y_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
+    __attribute__((section(".stepper_dma_buffers"), aligned(64)));
+static uint16_t step_stream_axis_y_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
 
 /* Indexed by MotionAxis_t; an axis without a stream channel has no hardware. */
 static StepStreamAxis_t step_stream_axis_instances[MOTION_AXIS_HARDWARE_COUNT] = {
@@ -126,6 +158,13 @@ static StepStreamAxis_t step_stream_axis_instances[MOTION_AXIS_HARDWARE_COUNT] =
             .hardware = &step_stream_axis_x_hardware,
             .dma_buffer = step_stream_axis_x_dma_buffer,
             .brake_storage = step_stream_axis_x_brake_storage,
+            .held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF,
+        },
+    [MOTION_AXIS_Y] =
+        {
+            .hardware = &step_stream_axis_y_hardware,
+            .dma_buffer = step_stream_axis_y_dma_buffer,
+            .brake_storage = step_stream_axis_y_brake_storage,
             .held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF,
         },
 };
@@ -139,48 +178,16 @@ StepStreamAxis_t *step_stream_axis_get(MotionAxis_t axis) {
 
 extern uint32_t SystemCoreClock;
 
-static uint32_t step_stream_axis_apb_divider(uint32_t prescaler) {
-    switch (prescaler) {
-    case 0U:
-    case 1U:
-    case 2U:
-    case 3U:
-        return 1U;
-    case 4U:
-        return 2U;
-    case 5U:
-        return 4U;
-    case 6U:
-        return 8U;
-    case 7U:
-        return 16U;
-    default:
-        return 0U;
-    }
-}
-
-static uint32_t step_stream_axis_ahb_divider(void) {
-    static const uint16_t ahb_dividers[16] = {1U, 1U, 1U, 1U, 2U, 4U, 8U, 16U, 2U, 4U, 8U, 16U, 64U, 128U, 256U, 512U};
-    const uint32_t prescaler = (RCC->D1CFGR & RCC_D1CFGR_HPRE_Msk) >> RCC_D1CFGR_HPRE_Pos;
-    return ahb_dividers[prescaler];
-}
-
-/* Kernel clock of the APB1 timers (TIM4 today); keep this calculation identical to motion_axis_hardware.c. It does not
- * depend on the axis yet: a channel on another bus needs the bus in its hardware table first. */
-static uint32_t step_stream_axis_timer_clock_hz(void) {
-    const uint32_t prescaler = (RCC->D2CFGR & RCC_D2CFGR_D2PPRE1_Msk) >> RCC_D2CFGR_D2PPRE1_Pos;
-    const uint32_t ahb_divider = step_stream_axis_ahb_divider();
-    const uint32_t apb_divider = step_stream_axis_apb_divider(prescaler);
-    if (SystemCoreClock == 0U || ahb_divider == 0U || apb_divider == 0U) {
-        return 0U;
-    }
-
-    const uint32_t hclk = SystemCoreClock / ahb_divider;
-    const uint32_t pclk = hclk / apb_divider;
-    if ((RCC->CFGR & RCC_CFGR_TIMPRE) != 0U) {
-        return apb_divider <= 4U ? hclk : pclk * 4U;
-    }
-    return apb_divider == 1U ? pclk : pclk * 2U;
+/* Kernel clock of the axis timer: the prescaler is the one of the timer's bus. The HPRE table follows RM0468; the
+ * legacy motion_axis_hardware.c has its own copy, which differs at HPRE codes 4..7 only. */
+static uint32_t step_stream_axis_timer_clock_hz(const StepStreamAxis_t *axis) {
+    const StepStreamAxisHardware_t *hardware = axis->hardware;
+    const uint32_t hpre = (RCC->D1CFGR & RCC_D1CFGR_HPRE_Msk) >> RCC_D1CFGR_HPRE_Pos;
+    const uint32_t ppre = hardware->timer_on_apb2 != 0U
+                              ? (RCC->D2CFGR & RCC_D2CFGR_D2PPRE2_Msk) >> RCC_D2CFGR_D2PPRE2_Pos
+                              : (RCC->D2CFGR & RCC_D2CFGR_D2PPRE1_Msk) >> RCC_D2CFGR_D2PPRE1_Pos;
+    const uint8_t timpre = (RCC->CFGR & RCC_CFGR_TIMPRE) != 0U ? 1U : 0U;
+    return step_stream_axis_logic_timer_clock_hz(SystemCoreClock, hpre, ppre, timpre);
 }
 
 static uint64_t step_stream_axis_ceil_div_u64(uint64_t numerator, uint64_t denominator) {
@@ -302,6 +309,11 @@ step_stream_axis_configure_timer(const StepStreamAxis_t *axis, uint32_t period_t
     timer->DIER = 0U;
     timer->CCMR1 = TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1PE;
     timer->CCER = 0U;
+    /* Advanced timer only (a basic timer has no BDTR): MOE lets CC1E reach the pin. OSSI/OSSR/BKE/AOE stay 0 (no break
+     * input, idle level not forced). */
+    if (axis->hardware->advanced_timer != 0U) {
+        timer->BDTR = TIM_BDTR_MOE;
+    }
     timer->PSC = 0U;
     timer->DCR = (STEP_STREAM_AXIS_TIMER_DBA_ARR << TIM_DCR_DBA_Pos) | (STEP_STREAM_AXIS_TIMER_DBL << TIM_DCR_DBL_Pos);
     timer->CNT = 0U;
@@ -431,7 +443,7 @@ StepStreamAxisStatus_t step_stream_axis_start(StepStreamAxis_t *axis, uint32_t f
         return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
     }
 
-    const uint32_t timer_clock_hz = step_stream_axis_timer_clock_hz();
+    const uint32_t timer_clock_hz = step_stream_axis_timer_clock_hz(axis);
     uint32_t period_ticks = 0U;
     uint32_t pulse_ticks = 0U;
     const StepStreamAxisStatus_t tick_status =
@@ -448,7 +460,7 @@ StepStreamAxisStatus_t step_stream_axis_start(StepStreamAxis_t *axis, uint32_t f
 }
 
 uint32_t step_stream_axis_get_timer_clock_hz(const StepStreamAxis_t *axis) {
-    return axis != NULL ? step_stream_axis_timer_clock_hz() : 0U;
+    return axis != NULL ? step_stream_axis_timer_clock_hz(axis) : 0U;
 }
 
 StepStreamAxisStatus_t step_stream_axis_prepare_stream(StepStreamAxis_t *axis) {
@@ -539,7 +551,7 @@ StepStreamAxisStatus_t step_stream_axis_arm_stream(StepStreamAxis_t *axis, uint3
     if (axis->state == STEP_STREAM_AXIS_STATE_STREAMING) {
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
-    const uint32_t timer_clock_hz = step_stream_axis_timer_clock_hz();
+    const uint32_t timer_clock_hz = step_stream_axis_timer_clock_hz(axis);
     if (timer_clock_hz == 0U) {
         return STEP_STREAM_AXIS_STATUS_CLOCK_ERROR;
     }
@@ -854,3 +866,5 @@ static void step_stream_axis_dma_irq(StepStreamAxis_t *axis) {
 }
 
 void DMA1_Stream0_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_X]); }
+
+void DMA1_Stream1_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_Y]); }

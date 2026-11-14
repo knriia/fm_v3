@@ -40,6 +40,9 @@ uint32_t step_stream_axis_logic_read_steps(
 uint32_t step_stream_axis_logic_boundary_steps(uint32_t completed_half_buffers, uint32_t record_count);
 /* Steps played from stale records after a fault: raw minus valid, never negative. */
 uint32_t step_stream_axis_logic_stale_steps(uint32_t raw_steps, uint32_t valid_steps);
+/* Kernel clock of a timer in Hz from the clock tree: core_clock_hz is SystemCoreClock, hpre the RCC D1CFGR.HPRE code,
+ * ppre the D2PPRE1/D2PPRE2 code of the timer's bus, timpre the RCC CFGR.TIMPRE bit. 0 when an argument is unusable. */
+uint32_t step_stream_axis_logic_timer_clock_hz(uint32_t core_clock_hz, uint32_t hpre, uint32_t ppre, uint8_t timpre);
 /* Polls until is_done(context) returns non-zero; 1 if it did within max_polls, 0 on timeout. */
 uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(const void *context), const void *context, uint32_t max_polls);
 

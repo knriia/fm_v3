@@ -60,6 +60,34 @@ uint32_t step_stream_axis_logic_stale_steps(uint32_t raw_steps, uint32_t valid_s
     return raw_steps > valid_steps ? raw_steps - valid_steps : 0U;
 }
 
+static uint32_t step_stream_axis_logic_ahb_divider(uint32_t hpre) {
+    static const uint16_t ahb_dividers[16] = {1U, 1U, 1U, 1U, 1U, 1U, 1U, 1U, 2U, 4U, 8U, 16U, 64U, 128U, 256U, 512U};
+    return hpre < 16U ? ahb_dividers[hpre] : 0U;
+}
+
+static uint32_t step_stream_axis_logic_apb_divider(uint32_t ppre) {
+    /* Codes 0..3 (0xx) mean no division; 4..7 (1xx) divide by 2, 4, 8, 16. */
+    if (ppre > 7U) {
+        return 0U;
+    }
+    return ppre < 4U ? 1U : (1U << (ppre - 3U));
+}
+
+uint32_t step_stream_axis_logic_timer_clock_hz(uint32_t core_clock_hz, uint32_t hpre, uint32_t ppre, uint8_t timpre) {
+    const uint32_t ahb_divider = step_stream_axis_logic_ahb_divider(hpre);
+    const uint32_t apb_divider = step_stream_axis_logic_apb_divider(ppre);
+    if (core_clock_hz == 0U || ahb_divider == 0U || apb_divider == 0U) {
+        return 0U;
+    }
+
+    const uint32_t hclk = core_clock_hz / ahb_divider;
+    const uint32_t pclk = hclk / apb_divider;
+    if (timpre != 0U) {
+        return apb_divider <= 4U ? hclk : pclk * 4U;
+    }
+    return apb_divider == 1U ? pclk : pclk * 2U;
+}
+
 uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(const void *context), const void *context, uint32_t max_polls) {
     for (uint32_t poll = 0U; poll < max_polls; ++poll) {
         if (is_done(context) != 0U) {
