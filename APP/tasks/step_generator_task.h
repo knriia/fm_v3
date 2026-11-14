@@ -20,8 +20,8 @@ typedef struct {
     uint32_t stop_resets;
 } StepGeneratorTaskDiagnostics;
 
-/* Number of channels that stream together (X, Y); the diagnostic frame carries one entry per channel. */
-#define STEP_GENERATOR_TASK_STREAM_MEMBERS 2U
+/* Number of channels that stream together (X, Y, Z); the diagnostic frame carries one entry per channel. */
+#define STEP_GENERATOR_TASK_STREAM_MEMBERS 3U
 /* Who stopped the feeding the last time; 0 until the first halt. */
 #define STEP_GENERATOR_TASK_HALT_CAUSE_NONE 0U
 /* step_generator_task_halt: STOP, or MotionTask ending a move or an abort. */
@@ -59,7 +59,7 @@ typedef struct {
     /* STEP_GENERATOR_TASK_HALT_CAUSE_* of the first halt since the last reset: a later halt, e.g. MotionTask ending the
      * move after a switch stopped it, does not overwrite it. It stays after the reset, so with halted 0 it is old. */
     uint32_t halt_cause;
-    /* Member (0 = X, 1 = Y) that reported the latest limit or fault, or STEP_GENERATOR_TASK_NO_MEMBER. */
+    /* Member (0 = X, 1 = Y, 2 = Z) that reported the latest limit or fault, or STEP_GENERATOR_TASK_NO_MEMBER. */
     uint32_t halt_member;
     /* StepStreamAxisFault_t of the latest group fault. */
     uint32_t halt_fault;

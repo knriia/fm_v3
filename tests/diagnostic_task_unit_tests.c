@@ -150,6 +150,8 @@ void step_generator_task_get_stream_diagnostics(StepGeneratorTaskStreamDiagnosti
                  .limit_trips = 5U},
                 {.channel_state = 6U, .channel_fault = 7U, .hardware_status = 8U, .hardware_stop_reason = 9U,
                  .limit_trips = 10U},
+                {.channel_state = 11U, .channel_fault = 12U, .hardware_status = 13U, .hardware_stop_reason = 14U,
+                 .limit_trips = 15U},
             },
     };
 }
@@ -580,6 +582,11 @@ static void test_diagnostic_frame_contents(void) {
     expect_u32(payload->stream.members[1].hardware_status, 8U, "stream Y hardware status");
     expect_u32(payload->stream.members[1].hardware_stop_reason, 9U, "stream Y stop reason");
     expect_u32(payload->stream.members[1].limit_trips, 10U, "stream Y limit trips");
+    expect_u32(payload->stream.members[2].channel_state, 11U, "stream Z channel state");
+    expect_u32(payload->stream.members[2].channel_fault, 12U, "stream Z channel fault");
+    expect_u32(payload->stream.members[2].hardware_status, 13U, "stream Z hardware status");
+    expect_u32(payload->stream.members[2].hardware_stop_reason, 14U, "stream Z stop reason");
+    expect_u32(payload->stream.members[2].limit_trips, 15U, "stream Z limit trips");
 }
 
 static void test_diagnostic_task_network_paths(void) {

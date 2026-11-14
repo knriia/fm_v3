@@ -144,12 +144,39 @@ static const StepStreamAxisHardware_t step_stream_axis_y_hardware = {
     .dma_flags_in_high_register = STEP_STREAM_AXIS_DMA_FLAGS_IN_HIGH_REGISTER(1U),
 };
 
+/* Z: TIM3 CH1 on PB4 (16-bit timer: a half-word DMAR write duplicates into a 32-bit register, so TIM5 was dropped).
+ * DIR (PC8) and ENA (PC9) belong to motion_axis_hardware, the channel drives STEP only. TIM3 sits on APB1 like X. */
+static const StepStreamAxisHardware_t step_stream_axis_z_hardware = {
+    .motion_axis = MOTION_AXIS_Z,
+    .timer = TIM3,
+    .timer_rcc_enable_register = &RCC->APB1LENR,
+    .timer_rcc_enable_bit = RCC_APB1LENR_TIM3EN,
+    .timer_on_apb2 = 0U,
+    .advanced_timer = 0U,
+    .step_port = GPIOB,
+    .step_gpio_rcc_enable_bit = RCC_AHB4ENR_GPIOBEN,
+    .step_pin = 4U,
+    .step_alternate_function = 2U,
+    .dma = DMA1,
+    .dma_rcc_enable_bit = RCC_AHB1ENR_DMA1EN,
+    .dma_stream = DMA1_Stream2,
+    .dma_mux_channel = DMAMUX1_Channel2,
+    /* TIM3_UP. */
+    .dma_request = 27U,
+    .dma_irq = DMA1_Stream2_IRQn,
+    .dma_flag_shift = STEP_STREAM_AXIS_DMA_FLAG_SHIFT(2U),
+    .dma_flags_in_high_register = STEP_STREAM_AXIS_DMA_FLAGS_IN_HIGH_REGISTER(2U),
+};
+
 static uint16_t step_stream_axis_x_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
 static uint16_t step_stream_axis_x_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
 static uint16_t step_stream_axis_y_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
 static uint16_t step_stream_axis_y_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
+static uint16_t step_stream_axis_z_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
+    __attribute__((section(".stepper_dma_buffers"), aligned(64)));
+static uint16_t step_stream_axis_z_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
 
 /* Indexed by MotionAxis_t; an axis without a stream channel has no hardware. */
 static StepStreamAxis_t step_stream_axis_instances[MOTION_AXIS_HARDWARE_COUNT] = {
@@ -165,6 +192,13 @@ static StepStreamAxis_t step_stream_axis_instances[MOTION_AXIS_HARDWARE_COUNT] =
             .hardware = &step_stream_axis_y_hardware,
             .dma_buffer = step_stream_axis_y_dma_buffer,
             .brake_storage = step_stream_axis_y_brake_storage,
+            .held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF,
+        },
+    [MOTION_AXIS_Z] =
+        {
+            .hardware = &step_stream_axis_z_hardware,
+            .dma_buffer = step_stream_axis_z_dma_buffer,
+            .brake_storage = step_stream_axis_z_brake_storage,
             .held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF,
         },
 };
@@ -868,3 +902,5 @@ static void step_stream_axis_dma_irq(StepStreamAxis_t *axis) {
 void DMA1_Stream0_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_X]); }
 
 void DMA1_Stream1_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_Y]); }
+
+void DMA1_Stream2_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_Z]); }

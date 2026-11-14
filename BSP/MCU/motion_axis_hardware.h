@@ -13,7 +13,7 @@
 /* One STEP/DIR/ENA output with its own timer, two switches and a scale. The value is the planner axis index.
  *   X: TIM4 CH1 STEP PB6, DIR PB7, ENA PB8; start switch PF10, end switch PF9.
  *   Y: TIM1 CH1 STEP PA8, DIR PA10, ENA PA11; start switch PE5, end switch PE4.
- *   Z: TIM3 CH3 STEP PC8, DIR PC9, ENA PA8; start switch PE6 (min), end switch PF7 (max). */
+ *   Z: TIM3 CH1 STEP PB4, DIR PC8, ENA PC9; start switch PE6 (min), end switch PF7 (max). */
 typedef enum { MOTION_AXIS_X = 0, MOTION_AXIS_Y, MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_COUNT } MotionAxis_t;
 
 typedef enum {

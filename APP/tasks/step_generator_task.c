@@ -11,8 +11,8 @@
 
 #include <stddef.h>
 
-/* X (TIM4 CH1, DMA1 stream 0) and Y (TIM1 CH1, DMA1 stream 1) have a planned stream in step_stream_axis. X is the
- * master of the group and the reference of the timing. */
+/* X (TIM4 CH1, DMA1 stream 0), Y (TIM1 CH1, DMA1 stream 1) and Z (TIM3 CH1, DMA1 stream 2) have a planned stream in
+ * step_stream_axis. X is the reference of the timing: the members must share its timer kernel clock. */
 #define STEP_GENERATOR_TASK_AXIS MOTION_AXIS_X
 /* The timer idles this long before the DMA delivers the first record of a stream. */
 #define STEP_GENERATOR_TASK_STARTUP_PERIOD_NS STEP_STREAM_AXIS_MIN_STARTUP_NS
@@ -23,7 +23,7 @@
 #define STEP_GENERATOR_TASK_IDLE_RECORD_NS 10000U
 /* Longest record of a wait; 0 is the format maximum (238 us). With several axes it must be short enough that a ring
  * half of an axis that mostly waits spans about the time of a half of an axis that steps: the plan has to hold the
- * blocks of the longest half. Set it when a second axis streams. */
+ * blocks of the longest half. Still 0 with three axes: it is tuned on the hardware (kanban card 4e.3). */
 #define STEP_GENERATOR_TASK_MAX_WAIT_RECORD_NS 0U
 /* The braking ramp starts at this step rate: the fast seek of homing. A faster axis is brought down to it at once. */
 #define STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ 50000U
@@ -55,18 +55,19 @@ static volatile uint8_t step_generator_task_brake_setup_failed;
 /* The stream channel of the axis; the instance lives for the whole run, so this is a lookup and no state. */
 static StepStreamAxis_t *step_generator_task_axis(void) { return step_stream_axis_get(STEP_GENERATOR_TASK_AXIS); }
 
-/* The channels that move together: member 0 is X, member 1 is Y. The group is defined with its initializer below, so
- * it exists before the task starts and a STOP that comes earlier still reaches the axes. */
-#define STEP_GENERATOR_TASK_MEMBER_COUNT 2U
+/* The channels that move together: member 0 is X, member 1 is Y, member 2 is Z. The group is defined with its
+ * initializer below, so it exists before the task starts and a STOP that comes earlier still reaches the axes. */
+#define STEP_GENERATOR_TASK_MEMBER_COUNT 3U
 static StepStreamGroup_t step_generator_task_group;
 /* The member index that each channel reports with; the listener context of a channel points at its entry. */
-static const uint32_t step_generator_task_member_ids[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U};
+static const uint32_t step_generator_task_member_ids[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U, 2U};
 static const MotionAxis_t step_generator_task_member_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
     MOTION_AXIS_X,
     MOTION_AXIS_Y,
+    MOTION_AXIS_Z,
 };
 /* The planner axis behind each member, in the order of the members. */
-static const uint32_t step_generator_task_member_planner_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U};
+static const uint32_t step_generator_task_member_planner_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U, 2U};
 
 /* The group passes only members below its count, so the index is always inside the table. */
 static StepStreamAxis_t *step_generator_task_member_axis(uint32_t member) {
@@ -468,6 +469,12 @@ void StepGeneratorTask(void *argument) {
             step_generator_task_channel_fault,
             step_generator_task_channel_braking,
             (void *)&step_generator_task_member_ids[1],
+        },
+        {
+            step_generator_task_notify_from_ring,
+            step_generator_task_channel_fault,
+            step_generator_task_channel_braking,
+            (void *)&step_generator_task_member_ids[2],
         },
     };
     for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
