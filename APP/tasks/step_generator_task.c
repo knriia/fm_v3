@@ -11,9 +11,9 @@
 
 #include <stddef.h>
 
-/* X is the only axis with a planned stream so far (TIM4 CH1 and DMA1 stream 0 in step_stream_axis). */
+/* X (TIM4 CH1, DMA1 stream 0) and Y (TIM1 CH1, DMA1 stream 1) have a planned stream in step_stream_axis. X is the
+ * master of the group and the reference of the timing. */
 #define STEP_GENERATOR_TASK_AXIS MOTION_AXIS_X
-#define STEP_GENERATOR_TASK_PLANNER_AXIS_INDEX 0U
 /* The timer idles this long before the DMA delivers the first record of a stream. */
 #define STEP_GENERATOR_TASK_STARTUP_PERIOD_NS STEP_STREAM_AXIS_MIN_STARTUP_NS
 /* A record is never shorter than this: the DMA must finish a burst before the next timer update. */
@@ -29,6 +29,9 @@
 #define STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ 50000U
 /* DIR setup before the first STEP is at least this long; the shortest RTOS delay covers it. */
 #define STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS 1U
+
+/* Axes mask of motion_axis_hardware_set_stream_watched_axes that watches every axis. */
+#define STEP_GENERATOR_TASK_ALL_AXES_WATCHED 0xFFU
 
 #define STEP_GENERATOR_TASK_FLAG_BLOCK_READY (1UL << 0)
 #define STEP_GENERATOR_TASK_FLAG_STOP_RESET (1UL << 1)
@@ -52,19 +55,18 @@ static volatile uint8_t step_generator_task_brake_setup_failed;
 /* The stream channel of the axis; the instance lives for the whole run, so this is a lookup and no state. */
 static StepStreamAxis_t *step_generator_task_axis(void) { return step_stream_axis_get(STEP_GENERATOR_TASK_AXIS); }
 
-/* The channels that move together. X alone so far: member 0 is X. The group is defined with its initializer below, so
- * it exists before the task starts and a STOP that comes earlier still reaches the axis. */
-#define STEP_GENERATOR_TASK_MEMBER_COUNT 1U
+/* The channels that move together: member 0 is X, member 1 is Y. The group is defined with its initializer below, so
+ * it exists before the task starts and a STOP that comes earlier still reaches the axes. */
+#define STEP_GENERATOR_TASK_MEMBER_COUNT 2U
 static StepStreamGroup_t step_generator_task_group;
 /* The member index that each channel reports with; the listener context of a channel points at its entry. */
-static const uint32_t step_generator_task_member_ids[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U};
+static const uint32_t step_generator_task_member_ids[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U};
 static const MotionAxis_t step_generator_task_member_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
-    STEP_GENERATOR_TASK_AXIS,
+    MOTION_AXIS_X,
+    MOTION_AXIS_Y,
 };
 /* The planner axis behind each member, in the order of the members. */
-static const uint32_t step_generator_task_member_planner_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
-    STEP_GENERATOR_TASK_PLANNER_AXIS_INDEX,
-};
+static const uint32_t step_generator_task_member_planner_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U};
 
 /* The group passes only members below its count, so the index is always inside the table. */
 static StepStreamAxis_t *step_generator_task_member_axis(uint32_t member) {
@@ -75,6 +77,35 @@ static void step_generator_counter_increment(volatile uint32_t *counter) {
     if (*counter != UINT32_MAX) {
         ++(*counter);
     }
+}
+
+_Static_assert(STEP_GENERATOR_TASK_MEMBER_COUNT == STEP_GENERATOR_TASK_STREAM_MEMBERS, "diagnostics list every member");
+/* Why the feeding stopped: the first cause of the latest halt, kept after the reset that lifts it. Written inside a
+ * critical section where halted is set, read only for diagnostics. */
+static volatile uint32_t step_generator_task_halt_cause;
+static volatile uint32_t step_generator_task_halt_member = STEP_GENERATOR_TASK_NO_MEMBER;
+static volatile uint32_t step_generator_task_halt_fault;
+static volatile uint32_t step_generator_task_halts_total;
+/* Written by the generator task only. */
+static volatile uint32_t step_generator_task_feeder_status;
+/* Resets after STOP that left a channel running; counted into axis_errors with the feeder's errors. */
+static volatile uint32_t step_generator_task_reset_failures;
+/* Counted inside a critical section: the switch interrupt and the poll at the stream start both report. */
+static volatile uint32_t step_generator_task_limit_trips[STEP_GENERATOR_TASK_MEMBER_COUNT];
+
+/* The only place that sets halted, so every halt leaves its cause behind. Callable from tasks and interrupts. Only the
+ * first halt since the last reset records its cause: a later one (MotionTask ending the move after a switch stopped it)
+ * would hide what stopped the stream. Every halt is counted. */
+static void step_generator_task_set_halted(uint32_t cause, uint32_t member, uint32_t fault) {
+    const uint32_t primask = step_stream_axis_enter_critical();
+    if (step_generator_task_halted == 0U) {
+        step_generator_task_halt_cause = cause;
+        step_generator_task_halt_member = member;
+        step_generator_task_halt_fault = fault;
+    }
+    step_generator_counter_increment(&step_generator_task_halts_total);
+    step_generator_task_halted = 1U;
+    step_stream_axis_exit_critical(primask);
 }
 
 static void step_generator_task_signal(uint32_t flags) {
@@ -92,7 +123,7 @@ void step_generator_task_notify_ring_half_released(void) {
 }
 
 void step_generator_task_halt(void) {
-    step_generator_task_halted = 1U;
+    step_generator_task_set_halted(STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, STEP_GENERATOR_TASK_NO_MEMBER, 0U);
     /* The axes stop themselves even if the task is in the middle of a fill: the start port checks the flag with task
      * switching paused, so a stream cannot begin after this stop. */
     step_stream_group_stop(&step_generator_task_group);
@@ -119,7 +150,21 @@ static StepStreamFeederAxisResult_t step_generator_task_group_result(StepStreamG
     return status == STEP_STREAM_GROUP_STATUS_OK ? STEP_STREAM_FEEDER_AXIS_OK : STEP_STREAM_FEEDER_AXIS_ERROR;
 }
 
+/* Called while the feeder opens a stream, after it has decided which axes the blocks move. An axis that only idles in
+ * the stream may stand on its switch; its limit must not stop the axes that move. */
+static void step_generator_task_watch_moving_axes(void) {
+    const uint8_t moving_planner_axes = step_stream_feeder_get_moving_axes(&step_generator_task_feeder);
+    uint8_t watched = 0U;
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        if (((moving_planner_axes >> step_generator_task_member_planner_axes[member]) & 1U) != 0U) {
+            watched = (uint8_t)(watched | (1U << (uint32_t)step_generator_task_member_axes[member]));
+        }
+    }
+    motion_axis_hardware_set_stream_watched_axes(watched);
+}
+
 static StepStreamFeederAxisResult_t step_generator_task_port_prepare(void) {
+    step_generator_task_watch_moving_axes();
     return step_generator_task_group_result(step_stream_group_prepare(&step_generator_task_group));
 }
 
@@ -214,6 +259,9 @@ static void step_generator_task_limit_reached(void *context, MotionAxis_t axis) 
     (void)context;
     for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
         if (step_generator_task_member_axes[member] == axis) {
+            const uint32_t primask = step_stream_axis_enter_critical();
+            step_generator_counter_increment(&step_generator_task_limit_trips[member]);
+            step_stream_axis_exit_critical(primask);
             step_stream_group_on_limit(&step_generator_task_group, step_generator_task_member_ids[member]);
             return;
         }
@@ -223,15 +271,12 @@ static void step_generator_task_limit_reached(void *context, MotionAxis_t axis) 
 /* Group, in an interrupt: the stream stopped for a limit switch or a fault, so stop feeding until STOP resets us. */
 static void step_generator_task_group_member_stopping(void *context, uint32_t member) {
     (void)context;
-    (void)member;
-    step_generator_task_halted = 1U;
+    step_generator_task_set_halted(STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, member, 0U);
 }
 
 static void step_generator_task_group_fault(void *context, uint32_t member, uint32_t fault) {
     (void)context;
-    (void)member;
-    (void)fault;
-    step_generator_task_halted = 1U;
+    step_generator_task_set_halted(STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, member, fault);
 }
 
 /* The group reaches the channels only through these. */
@@ -319,7 +364,8 @@ static void step_generator_task_publish_diagnostics(void) {
         step_generator_task_brake_setup_failed != 0U && feeder_diagnostics.generator_errors != UINT32_MAX
             ? feeder_diagnostics.generator_errors + 1U
             : feeder_diagnostics.generator_errors;
-    step_generator_task_diagnostics.axis_errors = feeder_diagnostics.axis_errors;
+    const uint64_t axis_errors = (uint64_t)feeder_diagnostics.axis_errors + step_generator_task_reset_failures;
+    step_generator_task_diagnostics.axis_errors = axis_errors > UINT32_MAX ? UINT32_MAX : (uint32_t)axis_errors;
     step_generator_task_diagnostics.streams_started = feeder_diagnostics.streams_started;
     step_generator_task_diagnostics.streams_stopped = feeder_diagnostics.streams_stopped;
 }
@@ -345,14 +391,28 @@ static void step_generator_task_setup_brake(
         .deceleration_steps_per_s2 = task_config->limit_deceleration_steps_per_s2,
         .max_step_rate_hz = STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ,
     };
-    if (step_stream_axis_configure_brake(step_generator_task_axis(), &brake) != STEP_STREAM_AXIS_STATUS_OK) {
-        step_generator_task_brake_setup_failed = 1U;
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        if (step_stream_axis_configure_brake(step_generator_task_member_axis(member), &brake) !=
+            STEP_STREAM_AXIS_STATUS_OK) {
+            step_generator_task_brake_setup_failed = 1U;
+        }
     }
+}
+
+/* The feeder counts every record in the ticks of one clock, so the members must share the timer kernel clock. */
+static uint8_t step_generator_task_member_clocks_match(void) {
+    const uint32_t reference_hz = step_stream_axis_get_timer_clock_hz(step_generator_task_axis());
+    for (uint32_t member = 1U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        if (step_stream_axis_get_timer_clock_hz(step_generator_task_member_axis(member)) != reference_hz) {
+            return 0U;
+        }
+    }
+    return 1U;
 }
 
 /* Builds the feeder from the driver timing. Returns 0 when the clock or the timing cannot be used. */
 static uint8_t step_generator_task_setup_feeder(const StepGeneratorTaskConfig_t *task_config) {
-    if (task_config == NULL) {
+    if (task_config == NULL || step_generator_task_member_clocks_match() == 0U) {
         return 0U;
     }
     StepStreamFeederConfig_t config;
@@ -394,15 +454,25 @@ void StepGeneratorTask(void *argument) {
     if (feeder_ready == 0U) {
         /* No usable timing: the task cannot feed the axis, so it refuses all work instead of guessing. */
         step_generator_counter_increment(&step_generator_task_diagnostics.generator_errors);
-        step_generator_task_halted = 1U;
+        step_generator_task_set_halted(STEP_GENERATOR_TASK_HALT_CAUSE_SETUP_FAILED, STEP_GENERATOR_TASK_NO_MEMBER, 0U);
     }
-    static const StepStreamAxisListener_t stream_listener = {
-        step_generator_task_notify_from_ring,
-        step_generator_task_channel_fault,
-        step_generator_task_channel_braking,
-        (void *)&step_generator_task_member_ids[0],
+    static const StepStreamAxisListener_t stream_listeners[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
+        {
+            step_generator_task_notify_from_ring,
+            step_generator_task_channel_fault,
+            step_generator_task_channel_braking,
+            (void *)&step_generator_task_member_ids[0],
+        },
+        {
+            step_generator_task_notify_from_ring,
+            step_generator_task_channel_fault,
+            step_generator_task_channel_braking,
+            (void *)&step_generator_task_member_ids[1],
+        },
     };
-    (void)step_stream_axis_set_listener(step_generator_task_axis(), &stream_listener);
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        (void)step_stream_axis_set_listener(step_generator_task_member_axis(member), &stream_listeners[member]);
+    }
     motion_axis_hardware_set_stream_limit_listener(step_generator_task_limit_reached, NULL);
 
     uint32_t flags = 0U;
@@ -411,25 +481,40 @@ void StepGeneratorTask(void *argument) {
             /* The axis has stopped and this task is not filling, so the feeder owns no running stream. */
             /* Lift the halt first: a STOP that arrives during the reset then stays in force. */
             step_generator_task_halted = 0U;
+            /* No stream runs: watch every axis again until the next one narrows it to the axes it moves. */
+            motion_axis_hardware_set_stream_watched_axes(STEP_GENERATOR_TASK_ALL_AXES_WATCHED);
             step_stream_feeder_reset(&step_generator_task_feeder);
             if (step_stream_group_reset(&step_generator_task_group) != STEP_STREAM_GROUP_STATUS_OK) {
                 /* A channel still runs after STOP: nothing may be fed until the next STOP. */
-                step_generator_counter_increment(&step_generator_task_diagnostics.axis_errors);
-                step_generator_task_halted = 1U;
+                step_generator_counter_increment(&step_generator_task_reset_failures);
+                step_generator_task_set_halted(
+                    STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED,
+                    STEP_GENERATOR_TASK_NO_MEMBER,
+                    0U
+                );
             }
             step_generator_task_stream_busy = 0U;
             step_generator_counter_increment(&step_generator_task_diagnostics.stop_resets);
         }
         if (feeder_ready != 0U && step_generator_task_halted == 0U) {
-            if (step_stream_feeder_service(&step_generator_task_feeder) != STEP_STREAM_FEEDER_STATUS_OK) {
+            const StepStreamFeederStatus_t feeder_status = step_stream_feeder_service(&step_generator_task_feeder);
+            if (feeder_status != STEP_STREAM_FEEDER_STATUS_OK) {
                 /* The feeder has stopped the axis; the plan is untrustworthy until STOP. */
-                step_generator_task_halted = 1U;
+                step_generator_task_feeder_status = (uint32_t)feeder_status;
+                step_generator_task_set_halted(
+                    STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+                    STEP_GENERATOR_TASK_NO_MEMBER,
+                    0U
+                );
             }
             (void)step_stream_group_service(&step_generator_task_group);
-            step_generator_task_publish_diagnostics();
             if (step_stream_feeder_get_phase(&step_generator_task_feeder) == STEP_STREAM_FEEDER_PHASE_IDLE) {
                 step_generator_task_stream_busy = 0U;
             }
+        }
+        /* Also while halted: the counters of the stream that was cut off must reach the diagnostics. */
+        if (feeder_ready != 0U) {
+            step_generator_task_publish_diagnostics();
         }
         /* Flags set while filling stay pending, so a block or a released half that arrives meanwhile is not missed. */
         flags = osThreadFlagsWait(STEP_GENERATOR_TASK_FLAGS_ALL, osFlagsWaitAny, osWaitForever);
@@ -449,4 +534,28 @@ void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnosti
     diagnostics->streams_started = step_generator_task_diagnostics.streams_started;
     diagnostics->streams_stopped = step_generator_task_diagnostics.streams_stopped;
     diagnostics->stop_resets = step_generator_task_diagnostics.stop_resets;
+}
+
+void step_generator_task_get_stream_diagnostics(StepGeneratorTaskStreamDiagnostics_t *diagnostics) {
+    if (diagnostics == NULL) {
+        return;
+    }
+    diagnostics->halted = step_generator_task_halted;
+    diagnostics->halt_cause = step_generator_task_halt_cause;
+    diagnostics->halt_member = step_generator_task_halt_member;
+    diagnostics->halt_fault = step_generator_task_halt_fault;
+    diagnostics->halts_total = step_generator_task_halts_total;
+    diagnostics->feeder_status = step_generator_task_feeder_status;
+    diagnostics->feeder_phase = (uint32_t)step_stream_feeder_get_phase(&step_generator_task_feeder);
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        const StepStreamAxis_t *channel = step_generator_task_member_axis(member);
+        const MotionAxis_t axis = step_generator_task_member_axes[member];
+        diagnostics->members[member] = (StepGeneratorTaskMemberDiagnostics_t){
+            .channel_state = (uint32_t)step_stream_axis_get_state(channel),
+            .channel_fault = (uint32_t)step_stream_axis_get_fault(channel),
+            .hardware_status = (uint32_t)motion_axis_hardware_get_status(axis),
+            .hardware_stop_reason = (uint32_t)motion_axis_hardware_get_last_stop_reason(axis),
+            .limit_trips = step_generator_task_limit_trips[member],
+        };
+    }
 }

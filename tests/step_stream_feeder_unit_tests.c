@@ -600,6 +600,8 @@ static void test_init_validation(void) {
 
     expect_u32(step_stream_feeder_service(NULL), STEP_STREAM_FEEDER_STATUS_INVALID_ARGUMENT, "service null");
     expect_u32(step_stream_feeder_get_phase(NULL), STEP_STREAM_FEEDER_PHASE_IDLE, "phase null");
+    expect_u32(step_stream_feeder_get_moving_axes(NULL), 0U, "moving axes null");
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 0U, "a feeder that has not started moves no axis");
     step_stream_feeder_reset(NULL);
     StepStreamFeederDiagnostics_t diagnostics = {0};
     step_stream_feeder_get_diagnostics(NULL, &diagnostics);
@@ -625,6 +627,7 @@ static void test_short_block_stream_lifecycle(void) {
     expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start service");
     expect_u32(step_stream_feeder_get_phase(&feeder), STEP_STREAM_FEEDER_PHASE_STREAMING, "streaming");
     expect_u32(fake_prepare_calls, 1U, "prepared once");
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 1U, "a block of X only moves X");
     expect_u32(fake_direction_calls, 1U, "direction set once");
     expect_u32(fake_direction_value[0], 1U, "positive direction");
     expect_u32(fake_start_calls, 1U, "started once");
@@ -789,6 +792,7 @@ static void test_lanes_stay_in_step(void) {
     expect_u32(fake_direction_set[1], 1U, "Y DIR set");
     expect_u32(fake_direction_value[1], 1U, "Y positive");
     expect_u32(fake_start_calls, 1U, "one start for both lanes");
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 3U, "the blocks of X and Y move both axes");
 
     expect_u32(count_step_records_of(0U, 0U), 2U, "X steps only in its own block");
     expect_u32(count_step_records_of(1U, 0U), 5U, "Y steps of the first two blocks");
@@ -801,6 +805,19 @@ static void test_lanes_stay_in_step(void) {
     step_stream_feeder_get_diagnostics(&feeder, &diagnostics);
     expect_u32(diagnostics.blocks_started, 3U, "blocks are counted once, not once per lane");
     expect_u32(diagnostics.blocks_completed, 3U, "blocks completed once, not once per lane");
+}
+
+/* The limit interrupt watches the moving axes only: a stream of Y must not name X, which may stand on its switch. */
+static void test_moving_axes_are_those_of_the_blocks(void) {
+    StepStreamFeeder_t feeder;
+    setup_lanes(&feeder, 2U);
+    const MotionPlanBlock_t y_only = make_block(0, 3);
+    queue_block(&y_only);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 2U, "a block of Y moves Y only");
+
+    step_stream_feeder_reset(&feeder);
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 0U, "a reset forgets the axes");
 }
 
 /* A lane with few steps reaches many blocks ahead; the blocks stay queued until the slowest lane has started them. */
@@ -1378,6 +1395,7 @@ int main(void) {
     test_block_fills_half_exactly();
     test_direction_change_stops_and_restarts();
     test_lanes_stay_in_step();
+    test_moving_axes_are_those_of_the_blocks();
     test_lookahead_retention();
     test_multi_lane_stream_closes_at_the_end_of_the_plan();
     test_stream_stops_only_when_every_lane_is_idle();

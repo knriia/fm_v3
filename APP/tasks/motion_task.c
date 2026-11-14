@@ -18,7 +18,7 @@
 #define MOTION_TASK_HOME_AXES_MASK MOTION_PLANNER_ALL_AXES_MASK
 /* Axes the planned step stream can drive. Until each axis has its own stream, a planned move of any other axis is
  * refused as NOT_HOMED; homing and calibration move those axes directly. */
-#define MOTION_TASK_STREAM_AXES_MASK MOTION_PLANNER_AXIS_X_MASK
+#define MOTION_TASK_STREAM_AXES_MASK (MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK)
 #define MOTION_TASK_HOME_POLL_INTERVAL_MS 1U
 /* Lets the belt come to rest between the backoff and the approach. */
 #define MOTION_TASK_HOME_SETTLE_MS 10U
@@ -373,8 +373,14 @@ static uint8_t motion_task_stream_start_move(
     const AxisBenchProfile_t *profile
 ) {
     MotionPlanBlock_t block;
-    if (home_block_make(motion_task_hardware_config(axis), direction, steps, profile->target_step_rate_hz, &block) ==
-        0U) {
+    if (home_block_make(
+            axis,
+            motion_task_hardware_config(axis),
+            direction,
+            steps,
+            profile->target_step_rate_hz,
+            &block
+        ) == 0U) {
         return 0U;
     }
     /* The stop of the previous move is still recorded; the next poll must wait for the stop of this one. */
@@ -720,9 +726,17 @@ static uint8_t motion_task_busy_axes(const MotionTaskAxisState_t *states) {
     return busy_mask;
 }
 
+/* The streamed axes share one plan buffer and one generator, so only one of them can home or calibrate at a time until
+ * the group runs its axes independently. */
+static uint8_t motion_task_streamed_axes_are_single(uint8_t axes_mask) {
+    const uint8_t streamed = (uint8_t)(axes_mask & MOTION_TASK_STREAM_AXES_MASK);
+    return (streamed & (uint8_t)(streamed - 1U)) == 0U ? 1U : 0U;
+}
+
 /* HOME and CALIBRATE name axes that can home and are idle; anything else refuses the whole command. */
 static uint8_t motion_task_axes_can_start(uint8_t axes_mask, uint8_t busy_mask) {
-    return axes_mask != 0U && (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) == 0U && (axes_mask & busy_mask) == 0U
+    return axes_mask != 0U && (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) == 0U &&
+                   (axes_mask & busy_mask) == 0U && motion_task_streamed_axes_are_single(axes_mask) != 0U
                ? 1U
                : 0U;
 }
@@ -868,10 +882,12 @@ void MotionTask(void *argument) {
             continue;
         }
 
-        /* The planned stream owns X's timer from the first queued block to its end, so HOME and CALIBRATE are refused
-         * meanwhile like any other command that finds the axis busy. */
+        /* The planned stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE
+         * are refused meanwhile like any other command that finds the axis busy. */
+        const uint8_t stream_in_use =
+            (uint8_t)(step_generator_task_is_busy() != 0U || (busy_mask & MOTION_TASK_STREAM_AXES_MASK) != 0U);
         const uint8_t start_busy_mask =
-            (uint8_t)(busy_mask | (step_generator_task_is_busy() != 0U ? MOTION_PLANNER_AXIS_X_MASK : 0U));
+            (uint8_t)(busy_mask | (stream_in_use != 0U ? MOTION_TASK_STREAM_AXES_MASK : 0U));
         if (command.code == COMMAND_CODE_HOME) {
             if (motion_task_axes_can_start(command.parameters.home.axes, start_busy_mask) != 0U) {
                 motion_task_start_axes(axes, context, command.parameters.home.axes, 0U);

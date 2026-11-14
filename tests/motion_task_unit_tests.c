@@ -150,8 +150,8 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
             fake->status = state->status;
             fake->stop_reason = state->stop_reason;
             fake->start_limit_active = state->start_limit_active;
-            if (axis == (uint32_t)MOTION_AXIS_X) {
-                /* A homing stream plays while X is active and is over once X is not. */
+            if (axis != (uint32_t)MOTION_AXIS_Z) {
+                /* A homing stream plays while its axis (X or Y) is active and is over once it is not. */
                 test_generator_busy = (state->status == MOTION_AXIS_HARDWARE_STATUS_STARTING ||
                                        state->status == MOTION_AXIS_HARDWARE_STATUS_WAITING ||
                                        state->status == MOTION_AXIS_HARDWARE_STATUS_RUNNING)
@@ -436,10 +436,11 @@ void motion_axis_hardware_clear_stop_reason(MotionAxis_t axis) {
     fake_axes[axis].stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
 }
 
-/* X homes through the stream, so a homing move of X shows up here instead of in axis_bench_start_profile. Both axes
- * are configured with positive motion toward the end switch. A move counts as one start; the failing one builds no
- * block. */
+/* X and Y home through the stream, so a homing move of them shows up here instead of in axis_bench_start_profile. All
+ * axes are configured with positive motion toward the end switch. A move counts as one start; the failing one builds
+ * no block. */
 uint8_t home_block_make(
+    MotionAxis_t axis,
     const MotionAxisHardwareConfig_t *hardware_config,
     AxisBenchDirection_t direction,
     uint32_t steps,
@@ -447,14 +448,14 @@ uint8_t home_block_make(
     MotionPlanBlock_t *block
 ) {
     (void)hardware_config;
-    FakeAxis_t *fake = &fake_axes[MOTION_AXIS_X];
+    FakeAxis_t *fake = &fake_axes[axis];
     ++fake->bench_starts;
     fake->bench_last_target_rate_hz = step_rate_hz;
     fake->bench_last_signed_steps = direction == AXIS_BENCH_TOWARD_END ? (int32_t)steps : -(int32_t)steps;
     if (fake->bench_starts == fake->failing_start) {
         return 0U;
     }
-    *block = (MotionPlanBlock_t){.master_step_count = steps, .moving_axes_mask = MOTION_PLANNER_AXIS_X_MASK};
+    *block = (MotionPlanBlock_t){.master_step_count = steps, .moving_axes_mask = (uint8_t)(1U << (uint32_t)axis)};
     return 1U;
 }
 
@@ -942,7 +943,7 @@ static void test_stream_event_source_is_registered_for_stream_axes_only(void) {
 
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(test_event_source_registrations[MOTION_AXIS_X], 1U, "X gets an event source");
-    expect_u32(test_event_source_registrations[MOTION_AXIS_Y], 0U, "Y has no planned stream yet");
+    expect_u32(test_event_source_registrations[MOTION_AXIS_Y], 1U, "Y gets an event source");
     expect_u32(test_event_source_registrations[MOTION_AXIS_Z], 0U, "Z has no planned stream yet");
     expect_u32(test_event_source_contexts[MOTION_AXIS_X] != NULL, 1U, "the source is bound to an executor instance");
 
@@ -967,6 +968,18 @@ static const CommandDTO_t test_home_x_command = {
     .sequence = 130U,
     .code = COMMAND_CODE_HOME,
     .parameters.home.axes = MOTION_PLANNER_AXIS_X_MASK,
+};
+
+static const CommandDTO_t test_home_y_command = {
+    .sequence = 150U,
+    .code = COMMAND_CODE_HOME,
+    .parameters.home.axes = MOTION_PLANNER_AXIS_Y_MASK,
+};
+
+static const CommandDTO_t test_home_z_command = {
+    .sequence = 158U,
+    .code = COMMAND_CODE_HOME,
+    .parameters.home.axes = MOTION_PLANNER_AXIS_Z_MASK,
 };
 
 /* Read 0 delivers HOME; every later read is a 1 ms poll timeout preceded by the scripted hardware state. */
@@ -1147,6 +1160,12 @@ static const CommandDTO_t test_calibrate_y_command = {
     .parameters.calibrate.axes = MOTION_PLANNER_AXIS_Y_MASK,
 };
 
+static const CommandDTO_t test_calibrate_z_command = {
+    .sequence = 144U,
+    .code = COMMAND_CODE_CALIBRATE,
+    .parameters.calibrate.axes = MOTION_PLANNER_AXIS_Z_MASK,
+};
+
 /* CALIBRATE of `command`'s axis, homing on reads 1..3; the procedure starts on read 3. A final read 4 follows when
  * `final_command` is given or `final_status` is not osOK. */
 static void run_calibration_until_start(
@@ -1183,16 +1202,29 @@ static void test_calibration_moves_follow_the_axis_kind(void) {
     const MotionAxisHardwareConfig_t hardware = {0};
     const AxisBenchProfile_t profile = {1000U, 2000U, 2000U};
 
+    run_calibration_until_start(&context, MOTION_AXIS_Z, &test_calibrate_z_command, osOK, NULL);
+    expect_u32(fake_calibration_begin_calls, 1U, "Z calibration starts after its homing");
+    expect_u32(fake_calibration_last_mover == &axis_calibration_run_jog_mover, 1U, "Z moves by its own jog");
+
     run_calibration_until_start(&context, MOTION_AXIS_Y, &test_calibrate_y_command, osOK, NULL);
     expect_u32(fake_calibration_begin_calls, 1U, "Y calibration starts after its homing");
-    expect_u32(fake_calibration_last_mover == &axis_calibration_run_jog_mover, 1U, "Y moves by its own jog");
+    const AxisCalibrationRunMover_t *y_mover = fake_calibration_last_mover;
+    expect_u32(y_mover != NULL && y_mover != &axis_calibration_run_jog_mover, 1U, "Y moves by the planned stream");
 
     run_calibration_until_start(&context, MOTION_AXIS_X, &test_calibrate_x_command, osOK, NULL);
     const AxisCalibrationRunMover_t *mover = fake_calibration_last_mover;
     expect_u32(mover != NULL && mover != &axis_calibration_run_jog_mover, 1U, "X moves by the planned stream");
+    expect_u32(mover == y_mover, 1U, "X and Y share the mover of the planned stream");
     if (mover == NULL || mover == &axis_calibration_run_jog_mover) {
         return;
     }
+
+    /* The move of Y is its own block: the length and the rate belong to the axis that is asked to move. */
+    fake_y.failing_start = 0U;
+    expect_u32(mover->start(MOTION_AXIS_Y, &hardware, AXIS_BENCH_TOWARD_END, 777U, &profile), 1U, "Y move starts");
+    expect_i64(fake_y.bench_last_signed_steps, 777, "the move of Y has the requested length");
+    expect_u32(fake_y.bench_last_target_rate_hz, 2000U, "the move of Y runs at the target rate");
+    (void)plan_buffer_clear();
 
     /* A block that cannot be built does not start. */
     fake_x_failing_start = fake_x_bench_starts + 1U;
@@ -1258,8 +1290,22 @@ static void test_calibration_abort_follows_the_axis_kind(void) {
     expect_u32(test_generator_halts, base_halts + 2U, "a queue failure halts the stream and flushes it");
     expect_u32(test_generator_resumes, base_resumes + 1U, "a queue failure resets the generator, no STOP follows");
 
+    /* Y plays through the same stream as X, so it is flushed and reset the same way. */
+    run_calibration_until_start(&context, MOTION_AXIS_Y, &test_calibrate_y_command, osOK, &stop);
+    expect_u32(fake_calibration_abort_calls, 1U, "STOP aborts the Y calibration");
+    expect_u32(test_generator_halts, base_halts + 1U, "STOP halts the stream of the Y calibration move");
+    expect_u32(test_generator_resumes, base_resumes + 1U, "STOP resets the generator once for Y too");
+
     run_calibration_until_start(&context, MOTION_AXIS_Y, &test_calibrate_y_command, osErrorParameter, NULL);
     expect_u32(fake_calibration_abort_calls, 1U, "a queue failure aborts the Y calibration");
+    expect_u32(test_generator_halts, base_halts + 2U, "a queue failure flushes the stream of Y");
+    expect_u32(test_generator_resumes, base_resumes + 1U, "a queue failure resets the generator for Y too");
+
+    /* Z moves by its own jog and never touches the generator. */
+    run_calibration_until_start(&context, MOTION_AXIS_Z, &test_calibrate_z_command, osErrorParameter, NULL);
+    expect_u32(fake_calibration_abort_calls, 1U, "a queue failure aborts the Z calibration");
+    expect_u32(test_generator_halts, 0U, "the Z calibration never halts the generator");
+    expect_u32(test_generator_resumes, 0U, "the Z calibration never resets the generator");
 }
 
 static void test_calibration_failures(void) {
@@ -1797,6 +1843,23 @@ static void test_home_and_calibrate_wait_for_the_planned_stream(void) {
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 0U, "CALIBRATE is ignored while the planned stream is busy");
 
+    /* Y plays through the same stream, so it waits as well. */
+    reset_receive_script();
+    test_generator_busy = 1U;
+    script_read(0U, osOK, &test_home_y_command);
+    script_read(1U, osOK, &test_calibrate_y_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_y.bench_starts, 0U, "HOME and CALIBRATE of Y are ignored while the planned stream is busy");
+
+    /* Z has its own driver and does not wait for the stream. */
+    reset_receive_script();
+    test_generator_busy = 1U;
+    script_read(0U, osOK, &test_home_z_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_z.bench_starts, 1U, "HOME of Z does not wait for the planned stream");
+
     test_generator_busy = 0U;
 }
 
@@ -1948,12 +2011,6 @@ static void test_stored_calibration_sets_planner_limits(void) {
     expect_u32(context.planner_config.axis[0].steps_per_um_numerator, 80U, "missing calibration keeps defaults");
 }
 
-static const CommandDTO_t test_home_y_command = {
-    .sequence = 150U,
-    .code = COMMAND_CODE_HOME,
-    .parameters.home.axes = MOTION_PLANNER_AXIS_Y_MASK,
-};
-
 /* The three hardware states of a successful homing of `axis`, applied on reads first..first+2. */
 static void script_axis_home_success(MotionAxis_t axis, uint32_t first) {
     script_axis_state(
@@ -1989,81 +2046,83 @@ static void run_command_with_polls(MotionTaskContext_t *context, const CommandDT
     (void)run_motion_task_until_scripted_stop(context);
 }
 
-/* Y still homes through the axis driver with ramped moves; X, which homes through the stream, does not reach these
+/* Z still homes through the axis driver with ramped moves; X and Y, which home through the stream, do not reach these
  * paths. */
-static void test_y_homing_through_the_axis_driver(void) {
+static void test_z_homing_through_the_axis_driver(void) {
     MotionTaskContext_t context;
 
     reset_receive_script();
     context = valid_motion_context();
-    script_axis_state(MOTION_AXIS_Y, 0U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
-    run_command_with_polls(&context, &test_home_y_command, 0U);
-    expect_u32(fake_y.bench_starts, 0U, "HOME is ignored while Y is moving");
+    script_axis_state(MOTION_AXIS_Z, 0U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_z_command, 0U);
+    expect_u32(fake_z.bench_starts, 0U, "HOME is ignored while Z is moving");
 
     /* The driver refuses to move into a pressed switch and leaves the axis STOPPED: the seek counts as started. */
     reset_receive_script();
     context = valid_motion_context();
-    fake_y.failing_start = 1U;
-    fake_y.failed_start_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
+    fake_z.failing_start = 1U;
+    fake_z.failed_start_status = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
     /* The driver records the pressed switch as the stop reason. */
     script_axis_state(
-        MOTION_AXIS_Y,
+        MOTION_AXIS_Z,
         0U,
         MOTION_AXIS_HARDWARE_STATUS_READY,
         MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT,
         1U
     );
-    run_command_with_polls(&context, &test_home_y_command, 0U);
-    expect_u32(fake_y.bench_starts, 2U, "a seek blocked by the start switch continues with the backoff");
+    run_command_with_polls(&context, &test_home_z_command, 0U);
+    expect_u32(fake_z.bench_starts, 2U, "a seek blocked by the start switch continues with the backoff");
     expect_u32(test_last_receive_timeout, 1U, "homing stays active after a blocked seek");
 
     reset_receive_script();
     context = valid_motion_context();
-    fake_y.failing_start = 1U;
-    fake_y.failed_start_status = MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING;
-    run_command_with_polls(&context, &test_home_y_command, 0U);
-    expect_u32(fake_y.stop_requests, 1U, "a seek that cannot start aborts homing");
+    fake_z.failing_start = 1U;
+    fake_z.failed_start_status = MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING;
+    run_command_with_polls(&context, &test_home_z_command, 0U);
+    expect_u32(fake_z.stop_requests, 1U, "a seek that cannot start aborts homing");
     expect_u32(test_last_receive_timeout, osWaitForever, "a seek that cannot start ends homing");
 
     reset_receive_script();
     context = valid_motion_context();
-    script_axis_state(MOTION_AXIS_Y, 1U, MOTION_AXIS_HARDWARE_STATUS_WAITING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
-    run_command_with_polls(&context, &test_home_y_command, 1U);
+    script_axis_state(MOTION_AXIS_Z, 1U, MOTION_AXIS_HARDWARE_STATUS_WAITING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_z_command, 1U);
     expect_u32(test_last_receive_timeout, 1U, "a seek waiting for its first step keeps homing active");
 
     reset_receive_script();
     context = valid_motion_context();
-    script_axis_state(MOTION_AXIS_Y, 1U, MOTION_AXIS_HARDWARE_STATUS_COMPLETE, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
-    run_command_with_polls(&context, &test_home_y_command, 1U);
-    expect_u32(fake_y.stop_requests, 1U, "a seek that runs out of steps aborts homing");
+    script_axis_state(MOTION_AXIS_Z, 1U, MOTION_AXIS_HARDWARE_STATUS_COMPLETE, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_z_command, 1U);
+    expect_u32(fake_z.stop_requests, 1U, "a seek that runs out of steps aborts homing");
     expect_u32(test_last_receive_timeout, osWaitForever, "a seek that runs out of steps ends homing");
 }
 
-static void test_y_home_runs_on_its_own_hardware(void) {
+/* Y homes through the step stream like X, with its own block, its own switches and its own scale. */
+static void test_y_homing_through_the_stream(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
     context.machine_state.position_um[1] = 4321;
-    const MotionPlanBlock_t planned_x_move = {.sequence = 93U};
-    expect_u32(plan_buffer_try_push(&planned_x_move), PLAN_BUFFER_STATUS_OK, "an X move is queued before HOME Y");
     script_axis_home_success(MOTION_AXIS_Y, 1U);
     run_command_with_polls(&context, &test_home_y_command, 3U);
 
     expect_u32(fake_axes[MOTION_AXIS_Y].init_calls, 1U, "Y hardware is initialized at task start");
-    expect_u32(fake_y.bench_starts, 3U, "Y runs fast seek, backoff and approach");
+    expect_u32(fake_y.bench_starts, 3U, "Y plays fast seek, backoff and approach as three blocks");
     expect_u32(fake_x_bench_starts, 0U, "HOME Y does not move X");
     expect_u32(fake_y.release_stop_arms, 1U, "the Y backoff arms the Y release stop");
+    expect_u32(fake_y.release_stop_disarms, 1U, "the Y release stop is disarmed before the approach");
     expect_i64(fake_y.bench_last_signed_steps, -1000000, "the Y approach heads toward the Y start switch");
+    expect_u32(fake_y.bench_last_target_rate_hz, 100U, "the Y approach plays at the belt approach rate");
     expect_u32(
         fake_y.start_limit_hook == encoder_oy_reset_coordinate ? 1U : 0U,
         1U,
         "the Y approach zeroes the Y scale"
     );
     expect_u32(fake_y.ready_after_home_calls, 1U, "successful homing readies the Y hardware");
+    expect_u32(fake_y.stop_reason_clears, 4U, "each Y move starts with no stop reason and none is left behind");
+    expect_u32(test_block_ready_notifications, 3U, "each homing move of Y is one block for the generator");
+    expect_u32(test_generator_halts, 3U, "each stop of the Y stream halts the generator");
+    expect_u32(test_generator_resumes, 3U, "each stop of the Y stream resets the generator");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "Y is homed");
     expect_i64(context.machine_state.position_um[1], 0, "Y is at zero");
-    PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
-    expect_u32(plan_buffer_diagnostics.queued, 1U, "Y homing keeps the planned X moves");
     expect_u32(test_last_receive_timeout, osWaitForever, "finished homing stops polling");
 
     /* A failed Y homing leaves only Y unhomed. */
@@ -2083,9 +2142,28 @@ static void test_y_home_runs_on_its_own_hardware(void) {
         MOTION_PLANNER_ALL_AXES_MASK & (uint8_t)~MOTION_PLANNER_AXIS_Y_MASK,
         "aborted Y homing leaves only Y unhomed"
     );
+
+    /* A block that cannot be built aborts the Y homing. */
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_y.failing_start = 1U;
+    run_command_with_polls(&context, &test_home_y_command, 0U);
+    expect_u32(fake_y.stop_requests, 1U, "a Y seek that cannot be built aborts homing");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a Y seek that cannot be built ends homing");
+
+    /* A generator that halts itself without a switch aborts the Y homing and is reset. */
+    reset_receive_script();
+    context = valid_motion_context();
+    test_generator_halted = 1U;
+    script_axis_state(MOTION_AXIS_Y, 1U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_command_with_polls(&context, &test_home_y_command, 1U);
+    expect_u32(fake_y.bench_starts, 1U, "a fault of the generator does not start a Y backoff");
+    expect_u32(test_generator_resumes, 1U, "an aborted Y homing resets the generator");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a fault of the generator ends the Y homing");
 }
 
-static void test_x_and_y_home_together(void) {
+/* The streamed axes share one plan buffer and one generator: one command cannot home or calibrate two of them. */
+static void test_x_and_y_cannot_home_together(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
     context.machine_state.homed_axes_mask = 0U;
@@ -2094,19 +2172,21 @@ static void test_x_and_y_home_together(void) {
         .code = COMMAND_CODE_HOME,
         .parameters.home.axes = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK,
     };
-    script_axis_home_success(MOTION_AXIS_X, 1U);
-    script_axis_home_success(MOTION_AXIS_Y, 1U);
-    run_command_with_polls(&context, &home_xy, 3U);
+    const CommandDTO_t calibrate_xy = {
+        .sequence = 159U,
+        .code = COMMAND_CODE_CALIBRATE,
+        .parameters.calibrate.axes = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK,
+    };
+    script_read(0U, osOK, &home_xy);
+    script_read(1U, osOK, &calibrate_xy);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
 
-    expect_u32(fake_x_bench_starts, 3U, "X homes");
-    expect_u32(fake_y.bench_starts, 3U, "Y homes at the same time");
-    expect_u32(fake_y.bench_last_target_rate_hz, 100U, "the belt approach tops out at 100 Hz");
-    expect_u32(
-        context.machine_state.homed_axes_mask,
-        MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK,
-        "both axes are homed"
-    );
-    expect_u32(test_last_receive_timeout, osWaitForever, "polling ends once both are home");
+    expect_u32(fake_x_bench_starts, 0U, "X does not start with a command that names Y too");
+    expect_u32(fake_y.bench_starts, 0U, "Y does not start with a command that names X too");
+    expect_u32(fake_calibration_begin_calls, 0U, "CALIBRATE of X and Y is refused as a whole");
+    expect_u32(context.machine_state.homed_axes_mask, 0U, "a refused command homes nothing");
+    expect_u32(test_last_receive_timeout, osWaitForever, "a refused command leaves nothing to poll");
 }
 
 static void test_home_and_calibrate_masks(void) {
@@ -2131,15 +2211,38 @@ static void test_home_and_calibrate_masks(void) {
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts + fake_y.bench_starts, 0U, "HOME and CALIBRATE without axes move nothing");
 
-    /* An idle axis can home while another one is busy... */
+    /* The streamed axes share one plan buffer and one generator: while X homes, Y is refused even in a moment when the
+     * generator itself is idle, e.g. between two homing moves. The state of X at read 1 makes the generator idle. */
     reset_receive_script();
     context = valid_motion_context();
+    script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_READY, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
     script_read(0U, osOK, &test_home_x_command);
     script_read(1U, osOK, &test_home_y_command);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_bench_starts, 1U, "X starts homing");
-    expect_u32(fake_y.bench_starts, 1U, "Y starts homing while X homes");
+    expect_u32(fake_y.bench_starts, 0U, "Y does not start homing while X homes");
+
+    /* The same holds for a calibration: Y waits while X calibrates, though the generator is idle during its homing. */
+    reset_receive_script();
+    context = valid_motion_context();
+    script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_READY, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    script_read(0U, osOK, &test_calibrate_x_command);
+    script_read(1U, osOK, &test_calibrate_y_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 1U, "X starts its calibration homing");
+    expect_u32(fake_y.bench_starts, 0U, "Y does not start calibrating while X calibrates");
+
+    /* Z moves by its own driver, so it can home while the stream axis X is busy. */
+    reset_receive_script();
+    context = valid_motion_context();
+    script_read(0U, osOK, &test_home_x_command);
+    script_read(1U, osOK, &test_home_z_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(fake_x_bench_starts, 1U, "X starts homing");
+    expect_u32(fake_z.bench_starts, 1U, "Z starts homing while X homes");
 
     /* ...but a command naming a busy axis is refused as a whole. */
     reset_receive_script();
@@ -2168,6 +2271,11 @@ static void test_y_calibration_reports_on_y(void) {
     run_command_with_polls(&context, &calibrate_y, 7U);
 
     expect_u32(fake_calibration_last_axis, MOTION_AXIS_Y, "the procedure runs on Y");
+    expect_u32(
+        fake_calibration_last_mover != NULL && fake_calibration_last_mover != &axis_calibration_run_jog_mover,
+        1U,
+        "the procedure moves Y through the planned stream"
+    );
     expect_u32(fake_x_bench_starts, 0U, "CALIBRATE Y does not move X");
     expect_u32(fake_y.bench_starts, 6U, "Y is homed before and after the measurement");
     expect_u32(context.calibration.calibrated_axes_mask, MOTION_PLANNER_AXIS_Y_MASK, "Y is marked calibrated");
@@ -2196,17 +2304,36 @@ static void test_z_home_and_calibration(void) {
         .code = COMMAND_CODE_HOME,
         .parameters.home.axes = MOTION_PLANNER_ALL_AXES_MASK,
     };
+    /* X and Y share the step stream, so a command for all three axes is refused as a whole. */
+    run_command_with_polls(&context, &home_all, 0U);
+    expect_u32(fake_x_bench_starts + fake_y.bench_starts + fake_z.bench_starts, 0U, "HOME of all axes starts nothing");
+    expect_u32(context.machine_state.homed_axes_mask, 0U, "HOME of all axes homes nothing");
+
+    /* Z has its own driver, so it homes together with one streamed axis. */
+    reset_receive_script();
+    context = valid_motion_context();
+    context.machine_state.homed_axes_mask = 0U;
+    const CommandDTO_t home_xz = {
+        .sequence = 160U,
+        .code = COMMAND_CODE_HOME,
+        .parameters.home.axes = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK,
+    };
     script_axis_home_success(MOTION_AXIS_X, 1U);
-    script_axis_home_success(MOTION_AXIS_Y, 1U);
     script_axis_home_success(MOTION_AXIS_Z, 1U);
-    run_command_with_polls(&context, &home_all, 3U);
-    expect_u32(fake_z.bench_starts, 3U, "Z homes together with X and Y");
+    run_command_with_polls(&context, &home_xz, 3U);
+    expect_u32(fake_x_bench_starts, 3U, "X homes together with Z");
+    expect_u32(fake_z.bench_starts, 3U, "Z homes together with X");
+    expect_u32(fake_y.bench_starts, 0U, "Y is not part of the command");
     expect_u32(
         fake_z.start_limit_hook == encoder_oz_reset_coordinate ? 1U : 0U,
         1U,
         "the Z approach zeroes the Z scale"
     );
-    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "all three axes are homed");
+    expect_u32(
+        context.machine_state.homed_axes_mask,
+        MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK,
+        "X and Z are homed"
+    );
 
     reset_receive_script();
     context = valid_motion_context();
@@ -2244,21 +2371,53 @@ static void test_axis_diagnostics_edges(void) {
     expect_u32(axis.travel_um, 77U, "an unknown axis leaves the result untouched");
 }
 
-static void test_planned_moves_of_other_axes_are_refused(void) {
+static void test_planned_moves_of_axes_without_a_stream_are_refused(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
     CommandDTO_t move = test_xyz_move_command;
-    move.parameters.motion_operation.y = 1000;
+    move.parameters.motion_operation.z = 1000;
     script_read(0U, osOK, &move);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(
         motion_task_get_last_planner_status(),
         MOTION_PLANNER_STATUS_NOT_HOMED,
-        "a homed Y is still refused until it has its own step stream"
+        "a homed Z is still refused until it has its own step stream"
     );
     expect_u32(test_block_ready_notifications, 0U, "nothing is queued");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "the refusal unhomes nothing");
+}
+
+static void test_planned_move_of_y_is_queued(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    CommandDTO_t move = test_xyz_move_command;
+    move.parameters.motion_operation.x = 0;
+    move.parameters.motion_operation.y = 1000;
+    script_read(0U, osOK, &move);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+
+    const MotionPlannerResult_t result = motion_task_test_get_last_planner_result();
+    expect_u32(result.status, MOTION_PLANNER_STATUS_OK, "a homed Y is planned like X");
+    /* 1000 um at 80 steps per 1000 um. */
+    expect_i64(result.block.step_delta[1], 80, "the move of Y has the steps of Y");
+    expect_i64(result.block.step_delta[0], 0, "the move of Y leaves X in place");
+    expect_u32(result.block.moving_axes_mask, MOTION_PLANNER_AXIS_Y_MASK, "only Y moves");
+    expect_u32(test_block_ready_notifications, 1U, "the generator is told about the Y block");
+    expect_i64(context.machine_state.position_um[1], 1000, "the next move starts at the Y target");
+    expect_i64(context.machine_state.position_um[0], 0, "X keeps its position");
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "planning unhomes nothing");
+
+    /* An unhomed Y is refused. */
+    reset_receive_script();
+    context = valid_motion_context();
+    context.machine_state.homed_axes_mask = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK;
+    script_read(0U, osOK, &move);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+    expect_u32(motion_task_get_last_planner_status(), MOTION_PLANNER_STATUS_NOT_HOMED, "an unhomed Y is refused");
+    expect_u32(test_block_ready_notifications, 0U, "nothing is queued for an unhomed Y");
 }
 
 static void test_stop_reaches_every_axis(void) {
@@ -2328,14 +2487,15 @@ int main(void) {
     test_full_plan_buffer_rejects_new_block_without_losing_existing_plans();
     test_xyz_command_with_null_context_reaches_planner_as_invalid_input();
     test_motion_operation_without_xyz_flag_does_not_call_planner();
-    test_y_home_runs_on_its_own_hardware();
-    test_y_homing_through_the_axis_driver();
-    test_x_and_y_home_together();
+    test_y_homing_through_the_stream();
+    test_z_homing_through_the_axis_driver();
+    test_x_and_y_cannot_home_together();
     test_home_and_calibrate_masks();
     test_y_calibration_reports_on_y();
     test_axis_diagnostics_edges();
     test_z_home_and_calibration();
-    test_planned_moves_of_other_axes_are_refused();
+    test_planned_moves_of_axes_without_a_stream_are_refused();
+    test_planned_move_of_y_is_queued();
     test_stop_reaches_every_axis();
 
     if (test_failures != 0U) {

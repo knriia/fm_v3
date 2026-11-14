@@ -419,11 +419,79 @@ static int test_carry_and_overflow(void) {
     CHECK(step_stream_generator_fill(&generator, records, 1U, &written) ==
           STEP_STREAM_GENERATOR_STATUS_DONE);
 
+    /* A stepping lane has no chunking: one step interval that is too long for the conversion overflows. */
     config.timer_clock_hz = UINT32_MAX;
-    CHECK(step_stream_generator_init(&generator, &config, 0U, UINT64_MAX, NULL) ==
+    CHECK(step_stream_generator_init(&generator, &config, 1U, UINT64_MAX, NULL) ==
           STEP_STREAM_GENERATOR_STATUS_OK);
     CHECK(step_stream_generator_fill(&generator, records, 1U, &written) ==
           STEP_STREAM_GENERATOR_STATUS_ARITHMETIC_OVERFLOW);
+    return 1;
+}
+
+/* Plays a whole lane in small fills; returns 0 unless it ends with DONE. */
+static int play_idle_lane(
+    StepStreamGenerator_t *generator,
+    uint64_t *total_ticks,
+    size_t *record_count,
+    size_t *pulse_count
+) {
+    uint16_t records[64 * STEP_STREAM_GENERATOR_RECORD_WORDS] = {0};
+    StepStreamGeneratorStatus_t status = STEP_STREAM_GENERATOR_STATUS_OK;
+    *total_ticks = 0U;
+    *record_count = 0U;
+    *pulse_count = 0U;
+    while (status != STEP_STREAM_GENERATOR_STATUS_DONE) {
+        size_t written = 0U;
+        status = step_stream_generator_fill(generator, records, 64U, &written);
+        if (status != STEP_STREAM_GENERATOR_STATUS_OK && status != STEP_STREAM_GENERATOR_STATUS_DONE) {
+            return 0;
+        }
+        for (size_t index = 0U; index < written; ++index) {
+            *total_ticks += record_period(records, index);
+        }
+        *record_count += written;
+        *pulse_count += count_pulses(records, written);
+    }
+    return 1;
+}
+
+/* The lane of an axis that does not move in a long homing block waits it out; the wait must not overflow. */
+static int test_long_idle_is_chunked(void) {
+    StepStreamGeneratorConfig_t config = {
+        .timer_clock_hz = 275000000U,
+        .pulse_ticks = 1000U,
+        .low_ticks = 500U,
+        .min_record_ticks = 100U,
+    };
+    StepStreamGenerator_t generator;
+    StepStreamGeneratorCarry_t carry = {0};
+    uint64_t total_ticks = 0U;
+    size_t record_count = 0U;
+    size_t pulse_count = 0U;
+
+    /* 500 s, the backoff of homing: 1000000 steps at 2 kHz. */
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 500000000000ULL, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(play_idle_lane(&generator, &total_ticks, &record_count, &pulse_count) == 1);
+    CHECK(total_ticks == 137500000000ULL);
+    CHECK(pulse_count == 0U);
+    CHECK(record_count >= 137500000000ULL / STEP_STREAM_GENERATOR_MAX_RECORD_TICKS);
+
+    /* A duration that is no whole number of chunks: the last chunk takes the rest, and no tick is lost. */
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 2500000123ULL, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(play_idle_lane(&generator, &total_ticks, &record_count, &pulse_count) == 1);
+    CHECK(total_ticks == 687500033ULL);
+    CHECK(step_stream_generator_get_carry(&generator, &carry) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(carry.ns_to_ticks_remainder == 825000000U);
+
+    /* Just under two chunks stays one interval, exactly as a short wait does. */
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 1999999999ULL, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(play_idle_lane(&generator, &total_ticks, &record_count, &pulse_count) == 1);
+    CHECK(total_ticks == 549999999ULL);
+    CHECK(step_stream_generator_get_carry(&generator, &carry) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(carry.ns_to_ticks_remainder == 725000000U);
     return 1;
 }
 
@@ -572,7 +640,7 @@ static int test_max_record_ticks(void) {
 int main(void) {
     if (!test_invalid_arguments() || !test_block_wrapper_and_duration() || !test_idle_and_split_boundaries() ||
         !test_resume_and_exact_sums() || !test_carry_and_overflow() || !test_speed_profiles() ||
-        !test_max_record_ticks()) {
+        !test_max_record_ticks() || !test_long_idle_is_chunked()) {
         return 1;
     }
     puts("step_stream_generator_unit_tests: PASS");

@@ -101,6 +101,9 @@ typedef struct {
     LwipDiagnostics lwip;
     /* Step-timer health in MotionAxis_t order (X, Y, Z). Kept last so the earlier offsets did not move. */
     MotionAxisHardwareTiming_t step_timing[MOTION_AXIS_HARDWARE_COUNT];
+    /* Why the stream halts and the state of each stream channel (X, Y). Kept last so the earlier offsets did not move.
+     */
+    StepGeneratorTaskStreamDiagnostics_t stream;
 } DiagnosticPayloadDTO_t;
 
 typedef struct {
@@ -121,7 +124,8 @@ _Static_assert(sizeof(EthernetDiagnosticsDTO_t) == 60U, "Invalid Ethernet diagno
 _Static_assert(sizeof(LwipDiagnostics) == 100U, "Invalid LwIP diagnostics size");
 _Static_assert(sizeof(MotionAxisHardwareTiming_t) == 16U, "Invalid step timing diagnostics size");
 _Static_assert(MOTION_AXIS_HARDWARE_COUNT == 3, "The frame carries step timing for X, Y and Z");
-_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 752U, "Invalid diagnostic payload size");
-_Static_assert(sizeof(DiagnosticFrameDTO_t) == 760U, "Invalid diagnostic frame size");
+_Static_assert(sizeof(StepGeneratorTaskStreamDiagnostics_t) == 68U, "Invalid stream diagnostics size");
+_Static_assert(sizeof(DiagnosticPayloadDTO_t) == 820U, "Invalid diagnostic payload size");
+_Static_assert(sizeof(DiagnosticFrameDTO_t) == 828U, "Invalid diagnostic frame size");
 
 #endif /* FM_V3_DIAGNOSTIC_DTO_H */

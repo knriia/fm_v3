@@ -14,8 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 752U
-#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 760U
+#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 820U
+#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 828U
 
 struct netif gnetif;
 struct stats lwip_stats;
@@ -131,6 +131,17 @@ static void test_payload_layout(void) {
     expect_u32(offsetof(DiagnosticPayloadDTO_t, ethernet), 544U, "Ethernet offset");
     expect_u32(offsetof(DiagnosticPayloadDTO_t, lwip), 604U, "LwIP offset");
     expect_u32(offsetof(DiagnosticPayloadDTO_t, step_timing), 704U, "step timing offset");
+    expect_u32(offsetof(DiagnosticPayloadDTO_t, stream), 752U, "stream offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, halted), 0U, "stream halted offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, halt_cause), 4U, "stream halt cause offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, halt_member), 8U, "stream halt member offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, halt_fault), 12U, "stream halt fault offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, halts_total), 16U, "stream halts total offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, feeder_status), 20U, "stream feeder status offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, feeder_phase), 24U, "stream feeder phase offset");
+    expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, members), 28U, "stream members offset");
+    expect_u32(sizeof(StepGeneratorTaskMemberDiagnostics_t), 20U, "stream member size");
+    expect_u32(offsetof(StepGeneratorTaskMemberDiagnostics_t, limit_trips), 16U, "stream member limit trips offset");
     expect_u32(offsetof(MotionAxisHardwareTiming_t, status), 0U, "step timing status offset");
     expect_u32(offsetof(MotionAxisHardwareTiming_t, timing_faults), 4U, "step timing faults offset");
     expect_u32(offsetof(MotionAxisHardwareTiming_t, isr_max_ns), 8U, "step timing ISR maximum offset");

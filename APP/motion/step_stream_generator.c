@@ -3,6 +3,10 @@
 #include <limits.h>
 #include <stddef.h>
 
+/* A lane without steps waits out the whole block as idle intervals of this length (the last one takes the rest, up to
+ * twice as long). One interval for a block of minutes would overflow the nanoseconds-to-ticks conversion. */
+#define STEP_STREAM_GENERATOR_IDLE_CHUNK_NS STEP_STREAM_GENERATOR_NANOSECONDS_PER_SECOND
+
 static uint64_t step_stream_generator_abs_i64(int64_t value) {
     return value < 0 ? (uint64_t)(-(value + 1)) + 1U : (uint64_t)value;
 }
@@ -82,7 +86,10 @@ static StepStreamGeneratorStatus_t step_stream_generator_prepare_interval(StepSt
     uint64_t next_grid_remainder = generator->grid_remainder_ns;
 
     if (generator->step_count == 0U) {
-        interval_ns = generator->duration_ns;
+        const uint8_t last_chunk = generator->next_interval + 1U == generator->total_intervals ? 1U : 0U;
+        interval_ns = last_chunk != 0U
+                          ? generator->duration_ns - generator->next_interval * STEP_STREAM_GENERATOR_IDLE_CHUNK_NS
+                          : STEP_STREAM_GENERATOR_IDLE_CHUNK_NS;
     } else {
         interval_ns = generator->step_base_ns;
         if (generator->step_remainder_ns != 0U) {
@@ -171,7 +178,10 @@ StepStreamGeneratorStatus_t step_stream_generator_init(
     next_generator.duration_ns = duration_ns;
     next_generator.step_base_ns = step_count == 0U ? 0U : duration_ns / step_count;
     next_generator.step_remainder_ns = step_count == 0U ? 0U : duration_ns % step_count;
-    next_generator.total_intervals = step_count == 0U ? 1U : step_count;
+    next_generator.total_intervals = step_count != 0U ? step_count
+                                     : duration_ns >= 2U * STEP_STREAM_GENERATOR_IDLE_CHUNK_NS
+                                         ? duration_ns / STEP_STREAM_GENERATOR_IDLE_CHUNK_NS
+                                         : 1U;
     next_generator.tick_remainder = input_carry == NULL ? 0U : input_carry->ns_to_ticks_remainder;
     next_generator.initialized = 1U;
     *generator = next_generator;
