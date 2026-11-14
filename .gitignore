@@ -29,3 +29,6 @@ logs/
 # Временные файлы ОС
 .DS_Store
 Thumbs.db
+
+# Локальные настройки Claude Code
+.claude/settings.local.json
