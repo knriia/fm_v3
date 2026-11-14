@@ -40,9 +40,9 @@ uint32_t step_stream_axis_logic_read_steps(
     uint32_t pending = 0U;
     uint32_t ndtr = 0U;
     for (uint32_t attempt = 0U; attempt < STEP_STREAM_AXIS_LOGIC_SNAPSHOT_ATTEMPTS; ++attempt) {
-        const uint32_t pending_before = source->pending_half_buffers();
-        ndtr = source->ndtr();
-        pending = source->pending_half_buffers();
+        const uint32_t pending_before = source->pending_half_buffers(source->context);
+        ndtr = source->ndtr(source->context);
+        pending = source->pending_half_buffers(source->context);
         if (pending == pending_before) {
             break;
         }
@@ -60,9 +60,9 @@ uint32_t step_stream_axis_logic_stale_steps(uint32_t raw_steps, uint32_t valid_s
     return raw_steps > valid_steps ? raw_steps - valid_steps : 0U;
 }
 
-uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(void), uint32_t max_polls) {
+uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(const void *context), const void *context, uint32_t max_polls) {
     for (uint32_t poll = 0U; poll < max_polls; ++poll) {
-        if (is_done() != 0U) {
+        if (is_done(context) != 0U) {
             return 1U;
         }
     }

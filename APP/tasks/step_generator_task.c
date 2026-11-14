@@ -44,6 +44,9 @@ static volatile uint8_t step_generator_task_halted;
 /* Set once at start when the axis refused the braking ramp; counted into generator_errors with the feeder's errors. */
 static volatile uint8_t step_generator_task_brake_setup_failed;
 
+/* The stream channel of the axis; the instance lives for the whole run, so this is a lookup and no state. */
+static StepStreamAxis_t *step_generator_task_axis(void) { return step_stream_axis_get(STEP_GENERATOR_TASK_AXIS); }
+
 static void step_generator_counter_increment(volatile uint32_t *counter) {
     if (*counter != UINT32_MAX) {
         ++(*counter);
@@ -68,7 +71,7 @@ void step_generator_task_halt(void) {
     step_generator_task_halted = 1U;
     /* The axis stops itself even if the task is in the middle of a fill: the start port checks the flag with task
      * switching paused, so a stream cannot begin after this stop. */
-    step_stream_axis_stop();
+    step_stream_axis_stop(step_generator_task_axis());
 }
 
 uint8_t step_generator_task_is_busy(void) {
@@ -89,11 +92,11 @@ static StepStreamFeederAxisResult_t step_generator_task_port_result(StepStreamAx
 }
 
 static StepStreamFeederAxisResult_t step_generator_task_port_prepare(void) {
-    return step_generator_task_port_result(step_stream_axis_prepare_stream());
+    return step_generator_task_port_result(step_stream_axis_prepare_stream(step_generator_task_axis()));
 }
 
 static StepStreamFeederAxisResult_t step_generator_task_port_acquire_half(uint8_t *half, uint16_t **records) {
-    const StepStreamAxisStatus_t status = step_stream_axis_acquire_half(half, records);
+    const StepStreamAxisStatus_t status = step_stream_axis_acquire_half(step_generator_task_axis(), half, records);
     if (status == STEP_STREAM_AXIS_STATUS_NO_FILL_REQUEST) {
         return STEP_STREAM_FEEDER_AXIS_NO_REQUEST;
     }
@@ -101,7 +104,7 @@ static StepStreamFeederAxisResult_t step_generator_task_port_acquire_half(uint8_
 }
 
 static StepStreamFeederAxisResult_t step_generator_task_port_commit_half(uint8_t half) {
-    return step_generator_task_port_result(step_stream_axis_commit_half(half));
+    return step_generator_task_port_result(step_stream_axis_commit_half(step_generator_task_axis(), half));
 }
 
 static StepStreamFeederAxisResult_t step_generator_task_port_set_direction(uint8_t positive) {
@@ -125,13 +128,13 @@ static StepStreamFeederAxisResult_t step_generator_task_port_start(uint32_t star
     StepStreamAxisStatus_t status = STEP_STREAM_AXIS_STATUS_BUSY;
     (void)osKernelLock();
     if (step_generator_task_halted == 0U) {
-        status = step_stream_axis_start_stream(startup_period_ns);
+        status = step_stream_axis_start_stream(step_generator_task_axis(), startup_period_ns);
     }
     (void)osKernelUnlock();
     return step_generator_task_port_result(status);
 }
 
-static void step_generator_task_port_stop(void) { step_stream_axis_stop(); }
+static void step_generator_task_port_stop(void) { step_stream_axis_stop(step_generator_task_axis()); }
 
 static uint8_t step_generator_task_port_pop_block(MotionPlanBlock_t *block) {
     if (plan_buffer_try_pop(block) != PLAN_BUFFER_STATUS_OK) {
@@ -142,14 +145,24 @@ static uint8_t step_generator_task_port_pop_block(MotionPlanBlock_t *block) {
     return 1U;
 }
 
+/* DMA interrupt: a half of the ring has been played. */
+static void step_generator_task_notify_from_ring(void *context) {
+    (void)context;
+    step_generator_task_notify_ring_half_released();
+}
+
 /* DMA interrupt: the stream axis has stopped itself after a ring fault, so stop feeding until STOP resets us. */
-static void step_generator_task_stream_fault(StepStreamAxisFault_t fault) {
+static void step_generator_task_stream_fault(void *context, StepStreamAxisFault_t fault) {
+    (void)context;
     (void)fault;
     step_generator_task_halted = 1U;
 }
 
 /* DMA interrupt: the axis brakes on a limit switch and refills its ring itself, so the feeder must not write. */
-static void step_generator_task_stop_feeding_for_brake(void) { step_generator_task_halted = 1U; }
+static void step_generator_task_stop_feeding_for_brake(void *context) {
+    (void)context;
+    step_generator_task_halted = 1U;
+}
 
 static void step_generator_task_publish_diagnostics(void) {
     StepStreamFeederDiagnostics_t feeder_diagnostics;
@@ -187,7 +200,7 @@ static void step_generator_task_setup_brake(
         .deceleration_steps_per_s2 = task_config->limit_deceleration_steps_per_s2,
         .max_step_rate_hz = STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ,
     };
-    if (step_stream_axis_configure_brake(&brake) != STEP_STREAM_AXIS_STATUS_OK) {
+    if (step_stream_axis_configure_brake(step_generator_task_axis(), &brake) != STEP_STREAM_AXIS_STATUS_OK) {
         step_generator_task_brake_setup_failed = 1U;
     }
 }
@@ -199,7 +212,7 @@ static uint8_t step_generator_task_setup_feeder(const StepGeneratorTaskConfig_t 
     }
     StepStreamFeederConfig_t config;
     if (step_stream_feeder_make_config(
-            step_stream_axis_get_timer_clock_hz(),
+            step_stream_axis_get_timer_clock_hz(step_generator_task_axis()),
             task_config->step_pulse_width_ns,
             task_config->step_low_time_ns,
             STEP_GENERATOR_TASK_MIN_RECORD_NS,
@@ -235,11 +248,12 @@ void StepGeneratorTask(void *argument) {
         step_generator_task_halted = 1U;
     }
     static const StepStreamAxisListener_t stream_listener = {
-        step_generator_task_notify_ring_half_released,
+        step_generator_task_notify_from_ring,
         step_generator_task_stream_fault,
         step_generator_task_stop_feeding_for_brake,
+        NULL,
     };
-    (void)step_stream_axis_set_listener(&stream_listener);
+    (void)step_stream_axis_set_listener(step_generator_task_axis(), &stream_listener);
 
     uint32_t flags = 0U;
     for (;;) {

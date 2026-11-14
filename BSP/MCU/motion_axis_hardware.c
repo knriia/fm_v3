@@ -1436,7 +1436,9 @@ motion_axis_pending_limit_reason(const Ctx_t *c, uint32_t pending_lines, uint8_t
  * changes nothing: the switch point is latched once, the hook runs once, and the brake request is ignored once
  * the axis has left STREAMING. Re-check this when the braking ramp is switched on. */
 static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
-    if (c != &motion_axis_contexts[MOTION_AXIS_X] || step_stream_axis_get_state() != STEP_STREAM_AXIS_STATE_STREAMING) {
+    StepStreamAxis_t *stream_axis =
+        c == &motion_axis_contexts[MOTION_AXIS_X] ? step_stream_axis_get(MOTION_AXIS_X) : NULL;
+    if (stream_axis == NULL || step_stream_axis_get_state(stream_axis) != STEP_STREAM_AXIS_STATE_STREAMING) {
         return;
     }
     const uint8_t toward_end = motion_axis_direction_toward_end(c, c->current_direction_positive);
@@ -1454,7 +1456,7 @@ static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
     if (c->stop_reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
         c->stop_reason = reason;
     }
-    step_stream_axis_request_brake();
+    step_stream_axis_request_brake(stream_axis);
 }
 
 static void motion_axis_limit_irq_for(Ctx_t *c, uint32_t pending_lines) {
