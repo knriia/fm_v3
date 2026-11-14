@@ -12,7 +12,7 @@
 
 /* One STEP/DIR/ENA output with its own timer, two switches and a scale. The value is the planner axis index.
  *   X: TIM4 CH1 STEP PB6, DIR PB7, ENA PB8; start switch PF10, end switch PF9.
- *   Y: TIM1 CH2 STEP PA9, DIR PA10, ENA PA11; start switch PE5, end switch PE4.
+ *   Y: TIM1 CH1 STEP PA8, DIR PA10, ENA PA11; start switch PE5, end switch PE4.
  *   Z: TIM3 CH3 STEP PC8, DIR PC9, ENA PA8; start switch PE6 (min), end switch PF7 (max). */
 typedef enum { MOTION_AXIS_X = 0, MOTION_AXIS_Y, MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_COUNT } MotionAxis_t;
 
@@ -147,5 +147,10 @@ void motion_axis_hardware_poll_stream_limit(void);
  * Without a listener the axis brakes itself. Set it once, before the first stream starts. */
 typedef void (*MotionAxisHardwareStreamLimitListener_t)(void *context, MotionAxis_t axis);
 void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimitListener_t listener, void *context);
+
+/* The axes (bit = MotionAxis_t) whose switches the running stream reacts to: those that its blocks move. An axis that
+ * only idles in the stream, e.g. X while Y homes, may stand on its start switch; that must neither stop the stream nor
+ * leave a stop reason on it. Set before each stream starts; every axis is watched until it is set. */
+void motion_axis_hardware_set_stream_watched_axes(uint8_t axes_mask);
 
 #endif /* FM_V3_MOTION_AXIS_HARDWARE_H */

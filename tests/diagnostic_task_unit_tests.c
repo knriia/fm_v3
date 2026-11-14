@@ -135,6 +135,25 @@ void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnosti
     *diagnostics = test_step_generator_diagnostics;
 }
 
+void step_generator_task_get_stream_diagnostics(StepGeneratorTaskStreamDiagnostics_t *diagnostics) {
+    *diagnostics = (StepGeneratorTaskStreamDiagnostics_t){
+        .halted = 1U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT,
+        .halt_member = 1U,
+        .halt_fault = 3U,
+        .halts_total = 7U,
+        .feeder_status = 4U,
+        .feeder_phase = 2U,
+        .members =
+            {
+                {.channel_state = 1U, .channel_fault = 2U, .hardware_status = 3U, .hardware_stop_reason = 4U,
+                 .limit_trips = 5U},
+                {.channel_state = 6U, .channel_fault = 7U, .hardware_status = 8U, .hardware_stop_reason = 9U,
+                 .limit_trips = 10U},
+            },
+    };
+}
+
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     *diagnostics = test_command_queue_diagnostics;
 }
@@ -544,6 +563,23 @@ static void test_diagnostic_frame_contents(void) {
         expect_u32(payload->step_timing[axis].isr_max_ns, 1000U + axis, "step timing ISR maximum");
         expect_u32(payload->step_timing[axis].min_slack_ns, 5000U + axis, "step timing slack");
     }
+    expect_u32(payload->stream.halted, 1U, "stream halted");
+    expect_u32(payload->stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "stream halt cause");
+    expect_u32(payload->stream.halt_member, 1U, "stream halt member");
+    expect_u32(payload->stream.halt_fault, 3U, "stream halt fault");
+    expect_u32(payload->stream.halts_total, 7U, "stream halts total");
+    expect_u32(payload->stream.feeder_status, 4U, "stream feeder status");
+    expect_u32(payload->stream.feeder_phase, 2U, "stream feeder phase");
+    expect_u32(payload->stream.members[0].channel_state, 1U, "stream X channel state");
+    expect_u32(payload->stream.members[0].channel_fault, 2U, "stream X channel fault");
+    expect_u32(payload->stream.members[0].hardware_status, 3U, "stream X hardware status");
+    expect_u32(payload->stream.members[0].hardware_stop_reason, 4U, "stream X stop reason");
+    expect_u32(payload->stream.members[0].limit_trips, 5U, "stream X limit trips");
+    expect_u32(payload->stream.members[1].channel_state, 6U, "stream Y channel state");
+    expect_u32(payload->stream.members[1].channel_fault, 7U, "stream Y channel fault");
+    expect_u32(payload->stream.members[1].hardware_status, 8U, "stream Y hardware status");
+    expect_u32(payload->stream.members[1].hardware_stop_reason, 9U, "stream Y stop reason");
+    expect_u32(payload->stream.members[1].limit_trips, 10U, "stream Y limit trips");
 }
 
 static void test_diagnostic_task_network_paths(void) {

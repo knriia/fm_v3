@@ -199,6 +199,7 @@ static void diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePerc
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         motion_axis_hardware_get_timing((MotionAxis_t)axis, &payload->step_timing[axis]);
     }
+    step_generator_task_get_stream_diagnostics(&payload->stream);
 }
 
 void DiagnosticTask(void *argument) {

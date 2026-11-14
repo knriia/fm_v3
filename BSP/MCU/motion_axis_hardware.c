@@ -96,11 +96,11 @@ static const MotionAxisBoard_t motion_axis_boards[MOTION_AXIS_HARDWARE_COUNT] = 
             .advanced_timer = 1U,
             .timer_irq = {TIM1_UP_IRQn, TIM1_CC_IRQn},
             .timer_irq_count = 2U,
-            .channel = 2U,
+            .channel = 1U,
             .step_alternate_function = 1U,
             .output_port = GPIOA,
             .output_port_clock_bit = RCC_AHB4ENR_GPIOAEN,
-            .step_pin = 9U,
+            .step_pin = 8U,
             .direction_pin = 10U,
             .enable_port = GPIOA,
             .enable_port_clock_bit = RCC_AHB4ENR_GPIOAEN,
@@ -1437,6 +1437,10 @@ void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimi
     motion_axis_stream_limit_listener = listener;
 }
 
+static volatile uint8_t motion_axis_stream_watched_axes = 0xFFU;
+
+void motion_axis_hardware_set_stream_watched_axes(uint8_t axes_mask) { motion_axis_stream_watched_axes = axes_mask; }
+
 /* A planned stream drives the X timer without a hardware status of its own. A switch that it moves toward records the
  * switch point and starts the braking, which the stream axis runs in its DMA interrupt. The start switch turning off
  * while the release stop is armed and the stream moves toward the end switch stops it the same way. The first reason
@@ -1444,9 +1448,13 @@ void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimi
  * changes nothing: the switch point is latched once, the hook runs once, and the brake request is ignored once
  * the axis has left STREAMING. Re-check this when the braking ramp is switched on. */
 static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
-    StepStreamAxis_t *stream_axis =
-        c == &motion_axis_contexts[MOTION_AXIS_X] ? step_stream_axis_get(MOTION_AXIS_X) : NULL;
+    const MotionAxis_t axis = (MotionAxis_t)(c - motion_axis_contexts);
+    StepStreamAxis_t *stream_axis = step_stream_axis_get(axis);
     if (stream_axis == NULL || step_stream_axis_get_state(stream_axis) != STEP_STREAM_AXIS_STATE_STREAMING) {
+        return;
+    }
+    /* An axis the blocks do not move has no meaningful direction; its parked switch would stop the other axes. */
+    if (((motion_axis_stream_watched_axes >> (uint32_t)axis) & 1U) == 0U) {
         return;
     }
     const uint8_t toward_end = motion_axis_direction_toward_end(c, c->current_direction_positive);
@@ -1466,7 +1474,7 @@ static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
     }
     const MotionAxisHardwareStreamLimitListener_t listener = motion_axis_stream_limit_listener;
     if (listener != NULL) {
-        listener(motion_axis_stream_limit_listener_context, MOTION_AXIS_X);
+        listener(motion_axis_stream_limit_listener_context, axis);
         return;
     }
     /* Safety net for a stream that runs with no owner registered: the axis brakes itself. */
@@ -1504,8 +1512,10 @@ static void motion_axis_limit_irq_for(Ctx_t *c, uint32_t pending_lines) {
 }
 
 void motion_axis_hardware_poll_stream_limit(void) {
-    Ctx_t *c = &motion_axis_contexts[MOTION_AXIS_X];
-    motion_axis_stream_limit_irq(c, motion_axis_limit_lines(c->board));
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        Ctx_t *c = &motion_axis_contexts[axis];
+        motion_axis_stream_limit_irq(c, motion_axis_limit_lines(c->board));
+    }
 }
 
 void motion_axis_hardware_limit_irq(uint32_t pending_lines) {

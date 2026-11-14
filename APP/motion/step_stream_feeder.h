@@ -187,6 +187,9 @@ void step_stream_feeder_reset(StepStreamFeeder_t *feeder);
 StepStreamFeederStatus_t step_stream_feeder_service(StepStreamFeeder_t *feeder);
 
 StepStreamFeederPhase_t step_stream_feeder_get_phase(const StepStreamFeeder_t *feeder);
+/* Planner axes (bit = axis) that the blocks of the stream being opened or played move; 0 for a feeder without one. A
+ * lane outside this mask only plays idle records. Valid from the prepare port on. */
+uint8_t step_stream_feeder_get_moving_axes(const StepStreamFeeder_t *feeder);
 void step_stream_feeder_get_diagnostics(const StepStreamFeeder_t *feeder, StepStreamFeederDiagnostics_t *diagnostics);
 
 #endif /* FM_V3_STEP_STREAM_FEEDER_H */

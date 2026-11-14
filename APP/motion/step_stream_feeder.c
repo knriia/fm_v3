@@ -540,6 +540,10 @@ StepStreamFeederPhase_t step_stream_feeder_get_phase(const StepStreamFeeder_t *f
     return feeder == NULL ? STEP_STREAM_FEEDER_PHASE_IDLE : feeder->phase;
 }
 
+uint8_t step_stream_feeder_get_moving_axes(const StepStreamFeeder_t *feeder) {
+    return feeder == NULL ? 0U : feeder->direction_known_mask;
+}
+
 void step_stream_feeder_get_diagnostics(const StepStreamFeeder_t *feeder, StepStreamFeederDiagnostics_t *diagnostics) {
     if (feeder == NULL || diagnostics == NULL) {
         return;
