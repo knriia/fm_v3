@@ -69,10 +69,10 @@ uint32_t step_stream_axis_stale_steps(const StepStreamAxis_t *axis);
 StepStreamAxisStatus_t step_stream_axis_start(StepStreamAxis_t *axis, uint32_t frequency_hz, uint32_t pulse_width_ns);
 
 /* Stream mode: the task is the only writer of EMPTY to FULL. Order: prepare_stream, fill both halves with
- * acquire_half + commit_half, start_stream; while STREAMING the task keeps refilling released halves.
+ * acquire_half + commit_half, arm_stream, trigger; while STREAMING the task keeps refilling released halves.
  * One filler task only: acquire_half is not atomic, a second call before commit_half returns the same half.
  * Stand mode and stream mode share the ring and the buffer and exclude each other: a stand start overwrites
- * records that were prepared for a stream, so never start the stand between prepare_stream and start_stream. */
+ * records that were prepared for a stream, so never start the stand between prepare_stream and arm_stream. */
 
 /* Resets the ring, the fault and the step counters of the last run; only while IDLE (BUSY otherwise). */
 StepStreamAxisStatus_t step_stream_axis_prepare_stream(StepStreamAxis_t *axis);
@@ -82,13 +82,22 @@ StepStreamAxisStatus_t step_stream_axis_prepare_stream(StepStreamAxis_t *axis);
 StepStreamAxisStatus_t step_stream_axis_acquire_half(StepStreamAxis_t *axis, uint8_t *half, uint16_t **records);
 /* EMPTY to FULL after the records were written. INVALID_ARGUMENT for a half that is not EMPTY. */
 StepStreamAxisStatus_t step_stream_axis_commit_half(StepStreamAxis_t *axis, uint8_t half);
-/* NOT_PREPARED without prepare_stream, NOT_READY unless both halves are FULL. The timer idles with no pulse for
+/* Sets the stream up and makes the axis STREAMING, but the timer does not run until trigger. NOT_PREPARED without
+ * prepare_stream, NOT_READY unless both halves are FULL. Once triggered, the timer idles with no pulse for
  * startup_period_ns until the DMA delivers the first record, and that record takes effect one period later, so the
  * first pulse comes after two startup periods. The period must exceed the DMA burst latency: if the burst is not
  * done before the second update, the next record overwrites the first and a step is lost silently.
  * STEP_STREAM_AXIS_MIN_STARTUP_NS is a placeholder that has not been measured: check it on the scope. */
 #define STEP_STREAM_AXIS_MIN_STARTUP_NS 2000U
-StepStreamAxisStatus_t step_stream_axis_start_stream(StepStreamAxis_t *axis, uint32_t startup_period_ns);
+StepStreamAxisStatus_t step_stream_axis_arm_stream(StepStreamAxis_t *axis, uint32_t startup_period_ns);
+/* Starts the timers of the armed axes in one critical section; an axis that is not STREAMING (e.g. stopped after arm)
+ * or a NULL entry is skipped. Then, once, the level of the limit switches is looked at, since an edge that came before
+ * the start was seen by nobody. */
+void step_stream_axis_trigger(StepStreamAxis_t *const *axes, uint32_t count);
+/* The section that the axis functions use (all interrupts masked), for whoever has to change state together with them
+ * and with the interrupts of the axis. exit gets what enter returned. */
+uint32_t step_stream_axis_enter_critical(void);
+void step_stream_axis_exit_critical(uint32_t primask);
 /* Kernel clock of the axis timer in Hz, 0 when the clock tree is not usable. */
 uint32_t step_stream_axis_get_timer_clock_hz(const StepStreamAxis_t *axis);
 void step_stream_axis_stop(StepStreamAxis_t *axis);
