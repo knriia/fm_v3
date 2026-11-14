@@ -17,9 +17,11 @@ typedef enum {
 
 typedef struct {
     /* Half-buffer events (HT or TC) whose flag is set in the DMA status register now. */
-    uint32_t (*pending_half_buffers)(void);
+    uint32_t (*pending_half_buffers)(const void *context);
     /* Remaining DMA transfers (NDTR). */
-    uint32_t (*ndtr)(void);
+    uint32_t (*ndtr)(const void *context);
+    /* Handed to both functions: the axis whose DMA stream is read. */
+    const void *context;
 } StepStreamAxisSnapshotSource_t;
 
 /* Both halves FULL and the cycle started. Returns 0 on success. */
@@ -38,8 +40,8 @@ uint32_t step_stream_axis_logic_read_steps(
 uint32_t step_stream_axis_logic_boundary_steps(uint32_t completed_half_buffers, uint32_t record_count);
 /* Steps played from stale records after a fault: raw minus valid, never negative. */
 uint32_t step_stream_axis_logic_stale_steps(uint32_t raw_steps, uint32_t valid_steps);
-/* Polls until is_done() returns non-zero; 1 if it did within max_polls, 0 on timeout. */
-uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(void), uint32_t max_polls);
+/* Polls until is_done(context) returns non-zero; 1 if it did within max_polls, 0 on timeout. */
+uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(const void *context), const void *context, uint32_t max_polls);
 
 /* Braking on a limit switch. The interrupt replaces the records that the DMA has not played yet with the braking
  * ramp, starting a few records ahead of its position, and from then on refills every released half from the ramp

@@ -13,19 +13,29 @@ static uint32_t fake_pending_count;
 static uint32_t fake_pending_calls;
 static uint32_t fake_ndtr_value;
 static uint32_t fake_ndtr_calls;
+static int fake_context_marker;
+static uint32_t fake_wrong_context_calls;
 
-static uint32_t fake_pending(void) {
+static void check_source_context(const void *context) {
+    if (context != &fake_context_marker) {
+        ++fake_wrong_context_calls;
+    }
+}
+
+static uint32_t fake_pending(const void *context) {
+    check_source_context(context);
     const uint32_t index = fake_pending_calls < fake_pending_count ? fake_pending_calls : fake_pending_count - 1U;
     ++fake_pending_calls;
     return fake_pending_script[index];
 }
 
-static uint32_t fake_ndtr(void) {
+static uint32_t fake_ndtr(const void *context) {
+    check_source_context(context);
     ++fake_ndtr_calls;
     return fake_ndtr_value;
 }
 
-static const StepStreamAxisSnapshotSource_t fake_source = {fake_pending, fake_ndtr};
+static const StepStreamAxisSnapshotSource_t fake_source = {fake_pending, fake_ndtr, &fake_context_marker};
 
 static void set_pending_script(const uint32_t *values, uint32_t count) {
     for (uint32_t i = 0U; i < count; ++i) {
@@ -124,33 +134,39 @@ static void test_restart_after_fault_clears_state(void) {
 
 static void test_read_steps_stable_snapshot(void) {
     const uint32_t stable[] = {0U, 0U};
+    fake_wrong_context_calls = 0U;
     set_pending_script(stable, 2U);
     fake_ndtr_value = 20U;
     /* 10 transfers of 30 are played: 3 records, one of them still in the preload. */
     assert(step_stream_axis_logic_read_steps(&fake_source, 0U, TEST_RECORD_COUNT) == 2U);
     assert(fake_pending_calls == 2U);
     assert(fake_ndtr_calls == 1U);
+    assert(fake_wrong_context_calls == 0U);
 }
 
 static void test_read_steps_retries_when_a_flag_appears(void) {
     /* TC lands between the two flag reads of the first attempt; the second attempt is stable. */
     const uint32_t changing[] = {0U, 1U, 1U, 1U};
+    fake_wrong_context_calls = 0U;
     set_pending_script(changing, 4U);
     fake_ndtr_value = 15U;
     /* One completed half (the pending event) at its boundary: 5 records, minus the preload. */
     assert(step_stream_axis_logic_read_steps(&fake_source, 0U, TEST_RECORD_COUNT) == 4U);
     assert(fake_pending_calls == 4U);
     assert(fake_ndtr_calls == 2U);
+    assert(fake_wrong_context_calls == 0U);
 }
 
 static void test_read_steps_gives_up_after_the_attempt_limit(void) {
     /* Every attempt differs, so the retries end at the limit and the last values are used. */
     const uint32_t endless[] = {0U, 1U, 0U, 1U, 0U, 1U, 0U, 1U};
+    fake_wrong_context_calls = 0U;
     set_pending_script(endless, 8U);
     fake_ndtr_value = 15U;
     assert(step_stream_axis_logic_read_steps(&fake_source, 0U, TEST_RECORD_COUNT) == 4U);
     assert(fake_pending_calls == 8U);
     assert(fake_ndtr_calls == 4U);
+    assert(fake_wrong_context_calls == 0U);
 }
 
 static void test_boundary_steps(void) {
@@ -168,28 +184,37 @@ static void test_stale_steps(void) {
 
 static uint32_t poll_calls_until_done;
 static uint32_t poll_calls;
+static int poll_context_marker;
+static uint32_t poll_wrong_context_calls;
 
-static uint8_t poll_is_done(void) { return ++poll_calls >= poll_calls_until_done ? 1U : 0U; }
+static uint8_t poll_is_done(const void *context) {
+    if (context != &poll_context_marker) {
+        ++poll_wrong_context_calls;
+    }
+    return ++poll_calls >= poll_calls_until_done ? 1U : 0U;
+}
 
 static void test_poll(void) {
+    poll_wrong_context_calls = 0U;
     poll_calls = 0U;
     poll_calls_until_done = 1U;
-    assert(step_stream_axis_logic_poll(poll_is_done, 5U) == 1U);
+    assert(step_stream_axis_logic_poll(poll_is_done, &poll_context_marker, 5U) == 1U);
     assert(poll_calls == 1U);
 
     poll_calls = 0U;
     poll_calls_until_done = 5U;
-    assert(step_stream_axis_logic_poll(poll_is_done, 5U) == 1U);
+    assert(step_stream_axis_logic_poll(poll_is_done, &poll_context_marker, 5U) == 1U);
     assert(poll_calls == 5U);
 
     poll_calls = 0U;
     poll_calls_until_done = 6U;
-    assert(step_stream_axis_logic_poll(poll_is_done, 5U) == 0U);
+    assert(step_stream_axis_logic_poll(poll_is_done, &poll_context_marker, 5U) == 0U);
     assert(poll_calls == 5U);
 
     poll_calls = 0U;
-    assert(step_stream_axis_logic_poll(poll_is_done, 0U) == 0U);
+    assert(step_stream_axis_logic_poll(poll_is_done, &poll_context_marker, 0U) == 0U);
     assert(poll_calls == 0U);
+    assert(poll_wrong_context_calls == 0U);
 }
 
 /* ---- Braking on a limit switch ---- */
