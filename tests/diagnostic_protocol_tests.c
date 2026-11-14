@@ -14,8 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 820U
-#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 828U
+#define EXPECTED_DIAGNOSTIC_PAYLOAD_SIZE 840U
+#define EXPECTED_DIAGNOSTIC_FRAME_SIZE 848U
 
 struct netif gnetif;
 struct stats lwip_stats;
@@ -140,6 +140,9 @@ static void test_payload_layout(void) {
     expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, feeder_status), 20U, "stream feeder status offset");
     expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, feeder_phase), 24U, "stream feeder phase offset");
     expect_u32(offsetof(StepGeneratorTaskStreamDiagnostics_t, members), 28U, "stream members offset");
+    expect_u32(sizeof(StepGeneratorTaskStreamDiagnostics_t), 88U, "stream block size: header 28 plus 3 members of 20");
+    expect_u32(STEP_GENERATOR_TASK_STREAM_MEMBERS, 3U, "the stream block carries X, Y and Z");
+    expect_u32(offsetof(DiagnosticPayloadDTO_t, stream) + sizeof(StepGeneratorTaskStreamDiagnostics_t), 840U, "stream block ends the payload");
     expect_u32(sizeof(StepGeneratorTaskMemberDiagnostics_t), 20U, "stream member size");
     expect_u32(offsetof(StepGeneratorTaskMemberDiagnostics_t, limit_trips), 16U, "stream member limit trips offset");
     expect_u32(offsetof(MotionAxisHardwareTiming_t, status), 0U, "step timing status offset");
