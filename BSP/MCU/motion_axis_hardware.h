@@ -139,7 +139,13 @@ void motion_axis_hardware_reset_timing_peaks(MotionAxis_t axis);
 void motion_axis_hardware_timer_irq(MotionAxis_t axis);
 void motion_axis_hardware_limit_irq(uint32_t pending_lines);
 /* Looks at the level of the X limit switches and brakes the running planned stream if it moves toward a pressed one.
- * The stream start calls it, because an edge that came before the start raised no interrupt that anybody acted on. */
+ * The stream trigger calls it, because an edge that came before the start raised no interrupt that anybody acted on. */
 void motion_axis_hardware_poll_stream_limit(void);
+
+/* Who decides what a limit switch does to a running planned stream. The listener runs in the switch interrupt with the
+ * axis that reached the switch, after the switch point is latched; it must not block and must start the braking.
+ * Without a listener the axis brakes itself. Set it once, before the first stream starts. */
+typedef void (*MotionAxisHardwareStreamLimitListener_t)(void *context, MotionAxis_t axis);
+void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimitListener_t listener, void *context);
 
 #endif /* FM_V3_MOTION_AXIS_HARDWARE_H */

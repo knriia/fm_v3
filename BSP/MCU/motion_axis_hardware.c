@@ -1429,6 +1429,14 @@ motion_axis_pending_limit_reason(const Ctx_t *c, uint32_t pending_lines, uint8_t
     return MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
 }
 
+static MotionAxisHardwareStreamLimitListener_t volatile motion_axis_stream_limit_listener;
+static void *volatile motion_axis_stream_limit_listener_context;
+
+void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimitListener_t listener, void *context) {
+    motion_axis_stream_limit_listener_context = context;
+    motion_axis_stream_limit_listener = listener;
+}
+
 /* A planned stream drives the X timer without a hardware status of its own. A switch that it moves toward records the
  * switch point and starts the braking, which the stream axis runs in its DMA interrupt. The start switch turning off
  * while the release stop is armed and the stream moves toward the end switch stops it the same way. The first reason
@@ -1456,6 +1464,12 @@ static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
     if (c->stop_reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
         c->stop_reason = reason;
     }
+    const MotionAxisHardwareStreamLimitListener_t listener = motion_axis_stream_limit_listener;
+    if (listener != NULL) {
+        listener(motion_axis_stream_limit_listener_context, MOTION_AXIS_X);
+        return;
+    }
+    /* Safety net for a stream that runs with no owner registered: the axis brakes itself. */
     step_stream_axis_request_brake(stream_axis);
 }
 

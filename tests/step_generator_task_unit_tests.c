@@ -1,4 +1,5 @@
 #include "motion/plan_buffer.h"
+#include "motion/step_stream_group.h"
 #include "motion_axis_hardware.h"
 #include "step_generator_task.h"
 #include "step_stream_axis.h"
@@ -16,11 +17,19 @@
 #define TEST_TIMER_CLOCK_HZ 275000000U
 #define TEST_HALF_WORDS (STEP_STREAM_AXIS_HALF_RECORD_COUNT * 3U)
 
+/* Defined by the task source included below, where `static` is switched off for the tests. */
+extern StepStreamGroup_t step_generator_task_group;
+
 typedef enum {
     TEST_ACTION_NONE = 0,
     TEST_ACTION_RELEASE_HALF_0,
     TEST_ACTION_RELEASE_HALF_1,
-    TEST_ACTION_PUSH_BLOCK
+    TEST_ACTION_PUSH_BLOCK,
+    /* The group runs a stream that then ends by itself. */
+    TEST_ACTION_RUN_GROUP_THEN_END,
+    TEST_ACTION_AXIS_STREAMING,
+    /* A channel fails while the group runs, then STOP comes; the fault must survive the STOP. */
+    TEST_ACTION_FAULT_THEN_STOP
 } TestWaitAction_t;
 
 static uint32_t test_failures;
@@ -57,6 +66,13 @@ static uint8_t test_fail_acquire;
 static uint8_t test_fail_commit;
 static uint8_t test_fail_start;
 static uint32_t test_other_axis_calls;
+static uint8_t test_axis_streaming;
+static uint32_t test_trigger_calls;
+static uint32_t test_trigger_axes;
+static uint32_t test_brake_requests;
+static MotionAxisHardwareStreamLimitListener_t test_limit_listener;
+static void *test_limit_context;
+static uint32_t test_limit_listener_calls;
 static uint32_t test_configure_brake_calls;
 /* The stream channel of X is this object; a call that carries any other pointer is counted. */
 static int test_x_axis_marker;
@@ -172,6 +188,42 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
     case TEST_ACTION_PUSH_BLOCK:
         push_block(300U + index, 2);
         break;
+    case TEST_ACTION_RUN_GROUP_THEN_END:
+        expect_u32(
+            step_stream_group_prepare(&step_generator_task_group),
+            STEP_STREAM_GROUP_STATUS_OK,
+            "group prepares"
+        );
+        expect_u32(
+            step_stream_group_start(&step_generator_task_group, 2500U),
+            STEP_STREAM_GROUP_STATUS_OK,
+            "group starts"
+        );
+        test_axis_streaming = 0U;
+        break;
+    case TEST_ACTION_AXIS_STREAMING:
+        test_axis_streaming = 1U;
+        break;
+    case TEST_ACTION_FAULT_THEN_STOP:
+        expect_u32(
+            step_stream_group_prepare(&step_generator_task_group),
+            STEP_STREAM_GROUP_STATUS_OK,
+            "group prepares"
+        );
+        expect_u32(
+            step_stream_group_start(&step_generator_task_group, 2500U),
+            STEP_STREAM_GROUP_STATUS_OK,
+            "group starts"
+        );
+        test_stream_listener.on_fault(test_stream_listener.context, STEP_STREAM_AXIS_FAULT_SEQUENCE);
+        test_axis_streaming = 0U;
+        step_generator_task_halt();
+        expect_u32(
+            step_stream_group_get_state(&step_generator_task_group),
+            STEP_STREAM_GROUP_STATE_FAULT,
+            "STOP does not clear a fault"
+        );
+        break;
     case TEST_ACTION_NONE:
     default:
         break;
@@ -236,16 +288,50 @@ StepStreamAxisStatus_t step_stream_axis_commit_half(StepStreamAxis_t *axis, uint
     return STEP_STREAM_AXIS_STATUS_OK;
 }
 
-StepStreamAxisStatus_t step_stream_axis_start_stream(StepStreamAxis_t *axis, uint32_t startup_period_ns) {
+StepStreamAxisStatus_t step_stream_axis_arm_stream(StepStreamAxis_t *axis, uint32_t startup_period_ns) {
     check_axis(axis);
     ++test_start_calls;
     test_last_startup_ns = startup_period_ns;
-    return test_fail_start != 0U ? STEP_STREAM_AXIS_STATUS_AXIS_BUSY : STEP_STREAM_AXIS_STATUS_OK;
+    if (test_fail_start != 0U) {
+        return STEP_STREAM_AXIS_STATUS_AXIS_BUSY;
+    }
+    test_axis_streaming = 1U;
+    return STEP_STREAM_AXIS_STATUS_OK;
+}
+
+void step_stream_axis_trigger(StepStreamAxis_t *const *axes, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        check_axis(axes[index]);
+    }
+    test_trigger_axes = count;
+    ++test_trigger_calls;
 }
 
 void step_stream_axis_stop(StepStreamAxis_t *axis) {
     check_axis(axis);
     ++test_stop_calls;
+    test_axis_streaming = 0U;
+}
+
+void step_stream_axis_request_brake(StepStreamAxis_t *axis) {
+    check_axis(axis);
+    ++test_brake_requests;
+}
+
+StepStreamAxisState_t step_stream_axis_get_state(const StepStreamAxis_t *axis) {
+    check_axis(axis);
+    return test_axis_streaming != 0U ? STEP_STREAM_AXIS_STATE_STREAMING : STEP_STREAM_AXIS_STATE_IDLE;
+}
+
+/* The host has no interrupts to mask; the sections of the group are tested with the fake ports of its own tests. */
+uint32_t step_stream_axis_enter_critical(void) { return 0U; }
+
+void step_stream_axis_exit_critical(uint32_t primask) { (void)primask; }
+
+void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimitListener_t listener, void *context) {
+    ++test_limit_listener_calls;
+    test_limit_listener = listener;
+    test_limit_context = context;
 }
 
 StepStreamAxisStatus_t step_stream_axis_configure_brake(StepStreamAxis_t *axis, const StepStreamBrakeConfig_t *config) {
@@ -306,6 +392,14 @@ static void reset_fixture(void) {
     test_fail_start = 0U;
     test_configure_brake_calls = 0U;
     test_wrong_axis_calls = 0U;
+    test_axis_streaming = 0U;
+    test_trigger_calls = 0U;
+    test_trigger_axes = 0U;
+    test_brake_requests = 0U;
+    test_limit_listener = NULL;
+    test_limit_context = NULL;
+    test_limit_listener_calls = 0U;
+    step_generator_task_group = (StepStreamGroup_t)STEP_GENERATOR_TASK_GROUP_INITIAL;
     test_brake_config = (StepStreamBrakeConfig_t){0};
     test_configure_brake_result = STEP_STREAM_AXIS_STATUS_OK;
     test_task_config = (StepGeneratorTaskConfig_t){
@@ -341,6 +435,13 @@ static void test_task_streams_a_block(void) {
     expect_u32(test_listener_calls, 1U, "task registers its stream listener once");
 
     expect_u32(test_prepare_calls, 1U, "stream is prepared");
+    expect_u32(test_trigger_calls, 1U, "the group triggers the channels once, after arming them");
+    expect_u32(test_trigger_axes, 1U, "one trigger covers every channel of the group");
+    expect_u32(
+        step_stream_group_get_state(&step_generator_task_group),
+        STEP_STREAM_GROUP_STATE_RUNNING,
+        "the group runs the stream"
+    );
     expect_u32(test_wrong_axis_calls, 0U, "every stream call goes to the channel of X");
     expect_u32(test_outputs_calls, 1U, "driver outputs are set once");
     expect_u32(test_outputs_positive, 1U, "positive block sets the positive direction");
@@ -606,8 +707,22 @@ static void test_listener_and_notifications(void) {
         "a released ring half wakes the task"
     );
     expect_u32(step_generator_task_halted, 0U, "a released half does not halt the task");
+    expect_u32(step_stream_group_prepare(&step_generator_task_group), STEP_STREAM_GROUP_STATUS_OK, "group prepares");
+    expect_u32(step_stream_group_start(&step_generator_task_group, 2500U), STEP_STREAM_GROUP_STATUS_OK, "group starts");
     test_stream_listener.on_fault(test_stream_listener.context, STEP_STREAM_AXIS_FAULT_UNDERRUN);
     expect_u32(step_generator_task_halted, 1U, "a stream fault halts feeding");
+    expect_u32(
+        step_stream_group_get_state(&step_generator_task_group),
+        STEP_STREAM_GROUP_STATE_FAULT,
+        "a channel fault puts the group in FAULT"
+    );
+    expect_u32(
+        step_stream_group_get_fault(&step_generator_task_group),
+        (uint32_t)STEP_STREAM_AXIS_FAULT_UNDERRUN,
+        "the group keeps the fault of the channel"
+    );
+    expect_u32(step_stream_group_get_fault_member(&step_generator_task_group), 0U, "the fault is that of member 0");
+    expect_u32(test_wrong_axis_calls, 0U, "the group stops and starts the channel of X");
 
     step_generator_task_halted = 0U;
     test_stream_listener.on_brake(test_stream_listener.context);
@@ -626,6 +741,71 @@ static void test_listener_and_notifications(void) {
     volatile uint32_t counter = UINT32_MAX;
     step_generator_counter_increment(&counter);
     expect_u32(counter, UINT32_MAX, "diagnostic counter saturates");
+}
+
+static void test_limit_switch_brakes_through_the_group(void) {
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_limit_listener_calls, 1U, "the task registers its limit listener once");
+    expect_true(test_limit_listener != NULL, "the limit listener is set");
+
+    expect_u32(step_stream_group_prepare(&step_generator_task_group), STEP_STREAM_GROUP_STATUS_OK, "group prepares");
+    expect_u32(step_stream_group_start(&step_generator_task_group, 2500U), STEP_STREAM_GROUP_STATUS_OK, "group starts");
+    test_limit_listener(test_limit_context, MOTION_AXIS_Y);
+    expect_u32(test_brake_requests, 0U, "a switch of another axis brakes nothing");
+    expect_u32(
+        step_stream_group_get_state(&step_generator_task_group),
+        STEP_STREAM_GROUP_STATE_RUNNING,
+        "a switch of another axis does not stop the group"
+    );
+
+    test_limit_listener(test_limit_context, MOTION_AXIS_X);
+    expect_u32(test_brake_requests, 1U, "the switch of X brakes the channel of X");
+    expect_u32(
+        step_stream_group_get_state(&step_generator_task_group),
+        STEP_STREAM_GROUP_STATE_STOPPING,
+        "the group stops when a switch is reached"
+    );
+    expect_u32(test_wrong_axis_calls, 0U, "the brake goes to the channel of X");
+}
+
+static void test_group_ends_with_its_stream(void) {
+    reset_fixture();
+    test_wait_script_count = 2U;
+    test_wait_actions[0] = TEST_ACTION_RUN_GROUP_THEN_END;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_stream_group_get_state(&step_generator_task_group),
+        STEP_STREAM_GROUP_STATE_IDLE,
+        "the task sees that no channel runs and the group is IDLE again"
+    );
+}
+
+static void test_stop_reset_clears_a_group_fault(void) {
+    reset_fixture();
+    test_wait_script_count = 2U;
+    test_wait_actions[0] = TEST_ACTION_FAULT_THEN_STOP;
+    test_wait_results[1] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_stream_group_get_state(&step_generator_task_group),
+        STEP_STREAM_GROUP_STATE_IDLE,
+        "the reset after STOP clears the fault of the group"
+    );
+    expect_u32(step_stream_group_get_fault(&step_generator_task_group), 0U, "the reset forgets the fault");
+    expect_u32(step_generator_task_halted, 0U, "feeding goes on after the reset");
+    expect_u32(step_generator_task_diagnostics.axis_errors, 0U, "a clean reset is no error");
+}
+
+static void test_reset_is_refused_while_a_channel_runs(void) {
+    reset_fixture();
+    test_wait_script_count = 1U;
+    test_wait_actions[0] = TEST_ACTION_AXIS_STREAMING;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_task_diagnostics.axis_errors, 1U, "a channel that still runs is an axis error");
+    expect_u32(step_generator_task_halted, 1U, "nothing is fed while a channel runs after STOP");
 }
 
 static void test_brake_ramp_is_built_from_the_driver_timing(void) {
@@ -691,6 +871,10 @@ int main(void) {
     test_busy_covers_queue_and_stream();
     test_faults_halt_the_task();
     test_listener_and_notifications();
+    test_limit_switch_brakes_through_the_group();
+    test_group_ends_with_its_stream();
+    test_stop_reset_clears_a_group_fault();
+    test_reset_is_refused_while_a_channel_runs();
     test_brake_ramp_is_built_from_the_driver_timing();
     test_brake_is_skipped_or_counted();
     expect_u32(test_other_axis_calls, 0U, "the generator drives only X");

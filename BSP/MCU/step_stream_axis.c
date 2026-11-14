@@ -219,14 +219,14 @@ static uint8_t step_stream_axis_brake_active(const StepStreamAxis_t *axis) {
     return *(const volatile uint8_t *)&axis->brake.active;
 }
 
-static uint32_t step_stream_axis_enter_critical(void) {
+uint32_t step_stream_axis_enter_critical(void) {
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
     __DMB();
     return primask;
 }
 
-static void step_stream_axis_exit_critical(uint32_t primask) {
+void step_stream_axis_exit_critical(uint32_t primask) {
     __DMB();
     __set_PRIMASK(primask);
 }
@@ -349,6 +349,12 @@ static uint32_t step_stream_axis_current_steps(const StepStreamAxis_t *axis) {
     return steps;
 }
 
+/* Enable the output only now: with CNT below CCR1 it would drive STEP high before the first period starts. */
+static void step_stream_axis_run_timer(const StepStreamAxis_t *axis) {
+    axis->hardware->timer->CCER = TIM_CCER_CC1E;
+    axis->hardware->timer->CR1 |= TIM_CR1_CEN;
+}
+
 /* Common start: the ring is already prepared (stream) or prepared here (stand). The timer idles at period_ticks with
  * the first pulse at pulse_ticks (0 = none) until the DMA delivers the first record. */
 static StepStreamAxisStatus_t
@@ -406,14 +412,11 @@ step_stream_axis_launch(StepStreamAxis_t *axis, uint32_t period_ticks, uint32_t 
     hardware->timer->DIER = TIM_DIER_UDE;
     axis->state = STEP_STREAM_AXIS_STATE_STREAMING;
     __DMB();
-    /* Enable the output only now: with CNT below CCR1 it would drive STEP high before the first period starts. */
-    hardware->timer->CCER = TIM_CCER_CC1E;
-    hardware->timer->CR1 |= TIM_CR1_CEN;
-    step_stream_axis_exit_critical(primask);
-    if (stand == 0U) {
-        /* A switch edge that came between the direction output and this start was seen by nobody: look at the level. */
-        motion_axis_hardware_poll_stream_limit();
+    /* A stream is armed only: the timer waits for step_stream_axis_trigger. The stand runs at once. */
+    if (stand != 0U) {
+        step_stream_axis_run_timer(axis);
     }
+    step_stream_axis_exit_critical(primask);
     return STEP_STREAM_AXIS_STATUS_OK;
 }
 
@@ -529,7 +532,7 @@ StepStreamAxisStatus_t step_stream_axis_commit_half(StepStreamAxis_t *axis, uint
     return status;
 }
 
-StepStreamAxisStatus_t step_stream_axis_start_stream(StepStreamAxis_t *axis, uint32_t startup_period_ns) {
+StepStreamAxisStatus_t step_stream_axis_arm_stream(StepStreamAxis_t *axis, uint32_t startup_period_ns) {
     if (axis == NULL) {
         return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
     }
@@ -549,6 +552,27 @@ StepStreamAxisStatus_t step_stream_axis_start_stream(StepStreamAxis_t *axis, uin
         return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
     }
     return step_stream_axis_launch(axis, (uint32_t)ticks, 0U, 0U);
+}
+
+void step_stream_axis_trigger(StepStreamAxis_t *const *axes, uint32_t count) {
+    if (axes == NULL) {
+        return;
+    }
+    uint8_t started = 0U;
+    const uint32_t primask = step_stream_axis_enter_critical();
+    for (uint32_t index = 0U; index < count; ++index) {
+        const StepStreamAxis_t *axis = axes[index];
+        /* A stop between arm and trigger left the axis IDLE: there is nothing to start then. */
+        if (axis != NULL && axis->state == STEP_STREAM_AXIS_STATE_STREAMING) {
+            step_stream_axis_run_timer(axis);
+            started = 1U;
+        }
+    }
+    step_stream_axis_exit_critical(primask);
+    if (started != 0U) {
+        /* A switch edge that came between the direction output and this start was seen by nobody: look at the level. */
+        motion_axis_hardware_poll_stream_limit();
+    }
 }
 
 /* Caller holds the critical section (or is the DMA interrupt itself) and the axis is STREAMING. */
