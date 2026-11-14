@@ -18,6 +18,7 @@ static volatile uint32_t plan_buffer_initialized;
 static volatile uint32_t plan_buffer_head;
 static volatile uint32_t plan_buffer_tail;
 static volatile uint32_t plan_buffer_count;
+static volatile uint32_t plan_buffer_epoch;
 static volatile uint32_t plan_buffer_max_queued;
 static volatile uint32_t plan_buffer_enqueued_total;
 static volatile uint32_t plan_buffer_dequeued_total;
@@ -58,6 +59,7 @@ PlanBufferStatus_t plan_buffer_init(void) {
     plan_buffer_head = 0U;
     plan_buffer_tail = 0U;
     plan_buffer_count = 0U;
+    plan_buffer_epoch = 0U;
     plan_buffer_max_queued = 0U;
     plan_buffer_enqueued_total = 0U;
     plan_buffer_dequeued_total = 0U;
@@ -119,6 +121,54 @@ PlanBufferStatus_t plan_buffer_try_pop(MotionPlanBlock_t *block) {
     return status;
 }
 
+PlanBufferStatus_t plan_buffer_try_peek(uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block) {
+    if (plan_buffer_initialized == 0U) {
+        plan_buffer_counter_increment(&plan_buffer_rejected_operations);
+        return block == NULL ? PLAN_BUFFER_STATUS_INVALID_ARGUMENT : PLAN_BUFFER_STATUS_NOT_INITIALIZED;
+    }
+
+    PlanBufferStatus_t status = PLAN_BUFFER_STATUS_OK;
+    plan_buffer_lock();
+    if (block == NULL) {
+        plan_buffer_counter_increment(&plan_buffer_rejected_operations);
+        status = PLAN_BUFFER_STATUS_INVALID_ARGUMENT;
+    } else if (epoch != plan_buffer_epoch) {
+        plan_buffer_counter_increment(&plan_buffer_rejected_operations);
+        status = PLAN_BUFFER_STATUS_STALE;
+    } else if (offset >= plan_buffer_count) {
+        status = PLAN_BUFFER_STATUS_EMPTY;
+    } else {
+        *block = plan_buffer_entries[(plan_buffer_head + offset) % PLAN_BUFFER_CAPACITY];
+    }
+    plan_buffer_unlock();
+    return status;
+}
+
+PlanBufferStatus_t plan_buffer_discard(uint32_t epoch, uint32_t count) {
+    if (plan_buffer_initialized == 0U) {
+        plan_buffer_counter_increment(&plan_buffer_rejected_operations);
+        return PLAN_BUFFER_STATUS_NOT_INITIALIZED;
+    }
+
+    PlanBufferStatus_t status = PLAN_BUFFER_STATUS_OK;
+    plan_buffer_lock();
+    if (epoch != plan_buffer_epoch) {
+        plan_buffer_counter_increment(&plan_buffer_rejected_operations);
+        status = PLAN_BUFFER_STATUS_STALE;
+    } else if (count > plan_buffer_count) {
+        plan_buffer_counter_increment(&plan_buffer_rejected_operations);
+        status = PLAN_BUFFER_STATUS_INVALID_ARGUMENT;
+    } else {
+        plan_buffer_head = (plan_buffer_head + count) % PLAN_BUFFER_CAPACITY;
+        plan_buffer_count -= count;
+        plan_buffer_counter_add(&plan_buffer_dequeued_total, count);
+    }
+    plan_buffer_unlock();
+    return status;
+}
+
+uint32_t plan_buffer_get_epoch(void) { return plan_buffer_epoch; }
+
 PlanBufferStatus_t plan_buffer_clear(void) {
     if (plan_buffer_initialized == 0U) {
         plan_buffer_counter_increment(&plan_buffer_rejected_operations);
@@ -127,6 +177,7 @@ PlanBufferStatus_t plan_buffer_clear(void) {
 
     plan_buffer_lock();
     plan_buffer_counter_add(&plan_buffer_cancelled_blocks, plan_buffer_count);
+    ++plan_buffer_epoch;
     plan_buffer_head = 0U;
     plan_buffer_tail = 0U;
     plan_buffer_count = 0U;
@@ -164,6 +215,7 @@ void plan_buffer_test_reset(void) {
     plan_buffer_head = 0U;
     plan_buffer_tail = 0U;
     plan_buffer_count = 0U;
+    plan_buffer_epoch = 0U;
     plan_buffer_max_queued = 0U;
     plan_buffer_enqueued_total = 0U;
     plan_buffer_dequeued_total = 0U;

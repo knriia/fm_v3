@@ -160,10 +160,12 @@ static void test_mutex_guards_every_operation(void) {
     (void)plan_buffer_try_pop(&output);
     (void)plan_buffer_try_pop(&output);
     (void)plan_buffer_try_pop(NULL);
+    (void)plan_buffer_try_peek(plan_buffer_get_epoch(), 0U, &output);
+    (void)plan_buffer_discard(plan_buffer_get_epoch(), 0U);
     (void)plan_buffer_clear();
     (void)plan_buffer_get_diagnostics(&diagnostics);
-    expect_u32(test_mutex_acquire_calls, 7U, "every operation on an initialized buffer locks");
-    expect_u32(test_mutex_release_calls, 7U, "every lock is released");
+    expect_u32(test_mutex_acquire_calls, 9U, "every operation on an initialized buffer locks");
+    expect_u32(test_mutex_release_calls, 9U, "every lock is released");
     expect_u32(test_mutex_max_depth, 1U, "operations never nest locks");
     expect_u32(test_mutex_last_timeout, osWaitForever, "operations wait for the mutex holder");
     expect_u32(test_mutex_wrong_handle, 0U, "operations use the buffer mutex");
@@ -266,6 +268,149 @@ static void test_clear_cancels_only_pending_blocks(void) {
     expect_u32(diagnostics.cancelled_blocks, 2U, "empty clear cancels no additional blocks");
 }
 
+static void test_peek_reads_ahead_without_taking(void) {
+    reset_buffer();
+    (void)plan_buffer_init();
+    const uint32_t epoch = plan_buffer_get_epoch();
+    MotionPlanBlock_t output = {0};
+    expect_u32(
+        plan_buffer_try_peek(epoch, 0U, &output),
+        PLAN_BUFFER_STATUS_EMPTY,
+        "an empty buffer has nothing to peek"
+    );
+
+    for (uint32_t sequence = 1U; sequence <= 3U; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "buffer accepts blocks for the peek test");
+    }
+    for (uint32_t offset = 0U; offset < 3U; ++offset) {
+        expect_u32(plan_buffer_try_peek(epoch, offset, &output), PLAN_BUFFER_STATUS_OK, "peek reads a queued block");
+        expect_block_equal(&output, offset + 1U);
+    }
+    expect_u32(
+        plan_buffer_try_peek(epoch, 3U, &output),
+        PLAN_BUFFER_STATUS_EMPTY,
+        "peek behind the last block finds none"
+    );
+    expect_u32(plan_buffer_try_peek(epoch, UINT32_MAX, &output), PLAN_BUFFER_STATUS_EMPTY, "a huge offset finds none");
+
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queued, 3U, "peek takes nothing");
+    expect_u32(diagnostics.dequeued_total, 0U, "peek is not a dequeue");
+
+    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_OK, "the front is still there after the peeks");
+    expect_block_equal(&output, 1U);
+}
+
+static void test_discard_drops_the_front(void) {
+    reset_buffer();
+    (void)plan_buffer_init();
+    const uint32_t epoch = plan_buffer_get_epoch();
+    expect_u32(plan_buffer_discard(epoch, 0U), PLAN_BUFFER_STATUS_OK, "discarding nothing is fine");
+    for (uint32_t sequence = 1U; sequence <= 5U; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        (void)plan_buffer_try_push(&block);
+    }
+    expect_u32(plan_buffer_discard(epoch, 2U), PLAN_BUFFER_STATUS_OK, "discard drops the first blocks");
+
+    MotionPlanBlock_t output = {0};
+    expect_u32(plan_buffer_try_peek(epoch, 0U, &output), PLAN_BUFFER_STATUS_OK, "the front moved");
+    expect_block_equal(&output, 3U);
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queued, 3U, "discard shrinks the queue");
+    expect_u32(diagnostics.dequeued_total, 2U, "discarded blocks count as dequeued");
+
+    expect_u32(plan_buffer_discard(epoch, 4U), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "more than queued is refused");
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queued, 3U, "a refused discard changes nothing");
+    expect_u32(diagnostics.rejected_operations, 1U, "a refused discard is counted");
+    expect_u32(plan_buffer_discard(epoch, 3U), PLAN_BUFFER_STATUS_OK, "everything queued can be discarded");
+    expect_u32(plan_buffer_try_peek(epoch, 0U, &output), PLAN_BUFFER_STATUS_EMPTY, "nothing is left after it");
+}
+
+static void test_peek_and_discard_wrap_around(void) {
+    reset_buffer();
+    (void)plan_buffer_init();
+    const uint32_t epoch = plan_buffer_get_epoch();
+    for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        (void)plan_buffer_try_push(&block);
+    }
+    expect_u32(
+        plan_buffer_discard(epoch, PLAN_BUFFER_CAPACITY - 2U),
+        PLAN_BUFFER_STATUS_OK,
+        "discard nearly everything"
+    );
+    for (uint32_t sequence = PLAN_BUFFER_CAPACITY + 1U; sequence <= PLAN_BUFFER_CAPACITY + 3U; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "the queue wraps");
+    }
+    MotionPlanBlock_t output = {0};
+    for (uint32_t offset = 0U; offset < 5U; ++offset) {
+        expect_u32(plan_buffer_try_peek(epoch, offset, &output), PLAN_BUFFER_STATUS_OK, "peek follows the wrap");
+        expect_block_equal(&output, PLAN_BUFFER_CAPACITY - 1U + offset);
+    }
+    expect_u32(
+        plan_buffer_try_peek(epoch, 5U, &output),
+        PLAN_BUFFER_STATUS_EMPTY,
+        "the queue ends where it was pushed"
+    );
+}
+
+static void test_clear_makes_old_positions_stale(void) {
+    reset_buffer();
+    (void)plan_buffer_init();
+    const uint32_t old_epoch = plan_buffer_get_epoch();
+    const MotionPlanBlock_t first = make_block(1U);
+    (void)plan_buffer_try_push(&first);
+    (void)plan_buffer_clear();
+    const uint32_t new_epoch = plan_buffer_get_epoch();
+    expect_u32(new_epoch != old_epoch, 1U, "a clear changes the epoch");
+    (void)plan_buffer_clear();
+    expect_u32(plan_buffer_get_epoch() != new_epoch, 1U, "even a clear of an empty buffer changes it");
+
+    const MotionPlanBlock_t second = make_block(2U);
+    (void)plan_buffer_try_push(&second);
+    MotionPlanBlock_t output = {0};
+    expect_u32(plan_buffer_try_peek(old_epoch, 0U, &output), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot peek");
+    expect_u32(plan_buffer_discard(old_epoch, 1U), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot discard");
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queued, 1U, "a stale discard changes nothing");
+    expect_u32(diagnostics.rejected_operations, 2U, "stale calls are counted");
+    expect_u32(
+        plan_buffer_try_peek(plan_buffer_get_epoch(), 0U, &output),
+        PLAN_BUFFER_STATUS_OK,
+        "the new epoch works"
+    );
+    expect_block_equal(&output, 2U);
+}
+
+static void test_peek_and_discard_before_init_and_with_bad_arguments(void) {
+    reset_buffer();
+    MotionPlanBlock_t output = {0};
+    expect_u32(
+        plan_buffer_try_peek(0U, 0U, &output),
+        PLAN_BUFFER_STATUS_NOT_INITIALIZED,
+        "peek before init is rejected"
+    );
+    expect_u32(
+        plan_buffer_try_peek(0U, 0U, NULL),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "null peek before init is rejected"
+    );
+    expect_u32(plan_buffer_discard(0U, 0U), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "discard before init is rejected");
+    expect_u32(plan_buffer_get_epoch(), 0U, "the epoch starts at zero");
+
+    (void)plan_buffer_init();
+    expect_u32(plan_buffer_try_peek(0U, 0U, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null peek output is rejected");
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.rejected_operations, 1U, "the null peek is counted");
+}
+
 static void test_invalid_arguments_are_reported(void) {
     reset_buffer();
     (void)plan_buffer_init();
@@ -326,6 +471,11 @@ int main(void) {
     test_initialization_and_preinit_results();
     test_fifo_full_wraparound_and_copy();
     test_clear_cancels_only_pending_blocks();
+    test_peek_reads_ahead_without_taking();
+    test_discard_drops_the_front();
+    test_peek_and_discard_wrap_around();
+    test_clear_makes_old_positions_stale();
+    test_peek_and_discard_before_init_and_with_bad_arguments();
     test_invalid_arguments_are_reported();
     test_diagnostic_counters_saturate();
     test_mutex_guards_every_operation();

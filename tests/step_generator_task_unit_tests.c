@@ -588,7 +588,7 @@ static void test_direction_is_refused_while_halted(void) {
     reset_fixture();
     step_generator_task_halted = 1U;
     expect_u32(
-        step_generator_task_port_set_direction(1U),
+        step_generator_task_port_set_direction(0U, 1U),
         STEP_STREAM_FEEDER_AXIS_ERROR,
         "the driver is not touched after STOP"
     );
@@ -603,10 +603,47 @@ static void test_busy_covers_queue_and_stream(void) {
     push_block(20U, 3);
     expect_u32(step_generator_task_is_busy(), 1U, "a queued block makes the task busy");
 
-    MotionPlanBlock_t popped;
-    expect_u32(step_generator_task_port_pop_block(&popped), 1U, "block is taken");
+    /* Looking at the block takes nothing; giving it back is what the busy flag has to survive. */
+    const uint32_t epoch = step_generator_task_port_plan_epoch();
+    MotionPlanBlock_t seen;
+    expect_u32(step_generator_task_port_peek_block(epoch, 0U, &seen), STEP_STREAM_FEEDER_PLAN_OK, "block is seen");
+    expect_u32(seen.sequence, 20U, "the block that was queued");
+    expect_u32(step_generator_task_port_peek_block(epoch, 1U, &seen), STEP_STREAM_FEEDER_PLAN_NONE, "no second block");
+    expect_u32(step_generator_task_stream_busy, 0U, "looking does not mark a stream");
+    expect_u32(
+        step_generator_task_port_discard_blocks(epoch, 1U),
+        STEP_STREAM_FEEDER_PLAN_OK,
+        "the block is given back"
+    );
+    expect_u32(step_generator_task_stream_busy, 1U, "giving a block back marks the stream before the plan is empty");
     expect_u32(step_generator_task_is_busy(), 1U, "a block taken from the plan keeps the task busy");
-    expect_u32(step_generator_task_port_pop_block(&popped), 0U, "empty plan gives no block");
+    expect_u32(
+        step_generator_task_port_peek_block(epoch, 0U, &seen),
+        STEP_STREAM_FEEDER_PLAN_NONE,
+        "the plan holds nothing now"
+    );
+    expect_u32(
+        step_generator_task_port_discard_blocks(epoch, 1U),
+        STEP_STREAM_FEEDER_PLAN_ERROR,
+        "more blocks than queued cannot be given back"
+    );
+    (void)plan_buffer_clear();
+    expect_u32(
+        step_generator_task_port_peek_block(epoch, 0U, &seen),
+        STEP_STREAM_FEEDER_PLAN_STALE,
+        "a clear makes the old epoch stale"
+    );
+    expect_u32(
+        step_generator_task_port_discard_blocks(epoch, 0U),
+        STEP_STREAM_FEEDER_PLAN_STALE,
+        "stale for a discard too"
+    );
+    /* The plan buffer checks the output before the epoch, so a missing output is an error even for a stale epoch. */
+    expect_u32(
+        step_generator_task_port_peek_block(epoch, 0U, NULL),
+        STEP_STREAM_FEEDER_PLAN_ERROR,
+        "a missing output is an error"
+    );
 
     /* A finished stream clears the flag; a fault keeps it until STOP resets the task. */
     reset_fixture();

@@ -21,6 +21,10 @@
 /* Filler record of an empty stretch. A half of them takes about 14 ms, which is how long a new block can wait behind
  * an idle half; shorter records would only load the DMA interrupt more. */
 #define STEP_GENERATOR_TASK_IDLE_RECORD_NS 10000U
+/* Longest record of a wait; 0 is the format maximum (238 us). With several axes it must be short enough that a ring
+ * half of an axis that mostly waits spans about the time of a half of an axis that steps: the plan has to hold the
+ * blocks of the longest half. Set it when a second axis streams. */
+#define STEP_GENERATOR_TASK_MAX_WAIT_RECORD_NS 0U
 /* The braking ramp starts at this step rate: the fast seek of homing. A faster axis is brought down to it at once. */
 #define STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ 50000U
 /* DIR setup before the first STEP is at least this long; the shortest RTOS delay covers it. */
@@ -56,6 +60,10 @@ static StepStreamGroup_t step_generator_task_group;
 static const uint32_t step_generator_task_member_ids[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U};
 static const MotionAxis_t step_generator_task_member_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
     STEP_GENERATOR_TASK_AXIS,
+};
+/* The planner axis behind each member, in the order of the members. */
+static const uint32_t step_generator_task_member_planner_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
+    STEP_GENERATOR_TASK_PLANNER_AXIS_INDEX,
 };
 
 /* The group passes only members below its count, so the index is always inside the table. */
@@ -115,24 +123,27 @@ static StepStreamFeederAxisResult_t step_generator_task_port_prepare(void) {
     return step_generator_task_group_result(step_stream_group_prepare(&step_generator_task_group));
 }
 
-static StepStreamFeederAxisResult_t step_generator_task_port_acquire_half(uint8_t *half, uint16_t **records) {
-    const StepStreamAxisStatus_t status = step_stream_axis_acquire_half(step_generator_task_axis(), half, records);
+static StepStreamFeederAxisResult_t
+step_generator_task_port_acquire_half(uint32_t lane, uint8_t *half, uint16_t **records) {
+    const StepStreamAxisStatus_t status =
+        step_stream_axis_acquire_half(step_generator_task_member_axis(lane), half, records);
     if (status == STEP_STREAM_AXIS_STATUS_NO_FILL_REQUEST) {
         return STEP_STREAM_FEEDER_AXIS_NO_REQUEST;
     }
     return step_generator_task_port_result(status);
 }
 
-static StepStreamFeederAxisResult_t step_generator_task_port_commit_half(uint8_t half) {
-    return step_generator_task_port_result(step_stream_axis_commit_half(step_generator_task_axis(), half));
+static StepStreamFeederAxisResult_t step_generator_task_port_commit_half(uint32_t lane, uint8_t half) {
+    return step_generator_task_port_result(step_stream_axis_commit_half(step_generator_task_member_axis(lane), half));
 }
 
-static StepStreamFeederAxisResult_t step_generator_task_port_set_direction(uint8_t positive) {
+static StepStreamFeederAxisResult_t step_generator_task_port_set_direction(uint32_t lane, uint8_t positive) {
     /* With task switching paused, STOP and MotionTask cannot touch the axis between the flag check and the write. */
     MotionAxisHardwareStatus_t status = MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
     (void)osKernelLock();
     if (step_generator_task_halted == 0U) {
-        status = motion_axis_hardware_set_stream_outputs(STEP_GENERATOR_TASK_AXIS, positive);
+        /* The feeder passes lanes below the member count only; this port needs the motion axis, not the channel. */
+        status = motion_axis_hardware_set_stream_outputs(step_generator_task_member_axes[lane], positive);
     }
     (void)osKernelUnlock();
     /* A refusal returns the status of a busy or faulted axis; a write leaves a status the axis can start from. */
@@ -156,13 +167,30 @@ static StepStreamFeederAxisResult_t step_generator_task_port_start(uint32_t star
 
 static void step_generator_task_port_stop(void) { step_stream_group_stop(&step_generator_task_group); }
 
-static uint8_t step_generator_task_port_pop_block(MotionPlanBlock_t *block) {
-    if (plan_buffer_try_pop(block) != PLAN_BUFFER_STATUS_OK) {
-        return 0U;
+static StepStreamFeederPlanResult_t step_generator_task_plan_result(PlanBufferStatus_t status) {
+    switch (status) {
+    case PLAN_BUFFER_STATUS_OK:
+        return STEP_STREAM_FEEDER_PLAN_OK;
+    case PLAN_BUFFER_STATUS_EMPTY:
+        return STEP_STREAM_FEEDER_PLAN_NONE;
+    case PLAN_BUFFER_STATUS_STALE:
+        return STEP_STREAM_FEEDER_PLAN_STALE;
+    default:
+        return STEP_STREAM_FEEDER_PLAN_ERROR;
     }
-    /* Set before the block is out of sight, so HOME never sees an empty plan buffer and an idle stream in between. */
+}
+
+static uint32_t step_generator_task_port_plan_epoch(void) { return plan_buffer_get_epoch(); }
+
+static StepStreamFeederPlanResult_t
+step_generator_task_port_peek_block(uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block) {
+    return step_generator_task_plan_result(plan_buffer_try_peek(epoch, offset, block));
+}
+
+static StepStreamFeederPlanResult_t step_generator_task_port_discard_blocks(uint32_t epoch, uint32_t count) {
+    /* Set before the blocks are out of sight, so HOME never sees an empty plan buffer and an idle stream in between. */
     step_generator_task_stream_busy = 1U;
-    return 1U;
+    return step_generator_task_plan_result(plan_buffer_discard(epoch, count));
 }
 
 /* DMA interrupt: a half of the ring has been played. */
@@ -333,10 +361,12 @@ static uint8_t step_generator_task_setup_feeder(const StepGeneratorTaskConfig_t 
             task_config->step_pulse_width_ns,
             task_config->step_low_time_ns,
             STEP_GENERATOR_TASK_MIN_RECORD_NS,
+            STEP_GENERATOR_TASK_MAX_WAIT_RECORD_NS,
             STEP_GENERATOR_TASK_IDLE_RECORD_NS,
             STEP_GENERATOR_TASK_STARTUP_PERIOD_NS,
             STEP_STREAM_AXIS_HALF_RECORD_COUNT,
-            STEP_GENERATOR_TASK_PLANNER_AXIS_INDEX,
+            step_generator_task_member_planner_axes,
+            STEP_GENERATOR_TASK_MEMBER_COUNT,
             &config
         ) != STEP_STREAM_FEEDER_STATUS_OK) {
         return 0U;
@@ -348,7 +378,9 @@ static uint8_t step_generator_task_setup_feeder(const StepGeneratorTaskConfig_t 
         step_generator_task_port_set_direction,
         step_generator_task_port_start,
         step_generator_task_port_stop,
-        step_generator_task_port_pop_block,
+        step_generator_task_port_plan_epoch,
+        step_generator_task_port_peek_block,
+        step_generator_task_port_discard_blocks,
     };
     /* The ramp depends on the config only, so it is set up whether or not the feeder takes it. */
     step_generator_task_setup_brake(task_config, &config);
