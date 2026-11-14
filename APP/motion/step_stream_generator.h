@@ -16,6 +16,10 @@ typedef struct {
     uint32_t pulse_ticks;
     uint32_t low_ticks;
     uint32_t min_record_ticks;
+    /* Longest record of a wait: a longer interval is split into several. 0 means the format maximum. The shorter it is,
+     * the less time a ring half spans when it is mostly waiting, so axes with few steps stay close in time to axes with
+     * many; the price is more records, thus more DMA transfers and more filling work. */
+    uint32_t max_record_ticks;
 } StepStreamGeneratorConfig_t;
 
 typedef struct {

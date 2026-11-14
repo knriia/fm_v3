@@ -472,10 +472,107 @@ static int test_speed_profiles(void) {
     return 1;
 }
 
+static int test_max_record_ticks(void) {
+    StepStreamGenerator_t generator;
+    StepStreamGeneratorConfig_t config = default_config();
+    uint16_t records[64 * STEP_STREAM_GENERATOR_RECORD_WORDS] = {0};
+    size_t written = 0U;
+
+    /* Zero keeps the format maximum: a wait of 70000 ticks needs two records, as before. */
+    config.timer_clock_hz = 1000000U;
+    config.min_record_ticks = 1U;
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 70000000ULL, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 64U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 2U);
+    CHECK(record_period(records, 0U) + record_period(records, 1U) == 70000U);
+
+    /* A shorter limit splits the same wait into more records of at most that length, summing to the same time. */
+    config.max_record_ticks = 1000U;
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 64000000ULL, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 64U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 64U);
+    size_t total_ticks = 0U;
+    for (size_t index = 0U; index < written; ++index) {
+        CHECK(record_period(records, index) <= 1000U);
+        total_ticks += record_period(records, index);
+    }
+    CHECK(total_ticks == 64000U);
+
+    /* The limit bounds a step interval too: a step every 2500 ticks becomes three records, the first with the pulse. */
+    config.max_record_ticks = 1000U;
+    CHECK(step_stream_generator_init(&generator, &config, 1U, 2500000U, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 64U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 3U);
+    CHECK(count_pulses(records, written) == 1U);
+    CHECK(records[2] != 0U);
+    CHECK(record_period(records, 0U) + record_period(records, 1U) + record_period(records, 2U) == 2500U);
+
+    /* The interval that equals the limit is one record; one tick more is split in two, as even as it can be. */
+    config = default_config();
+    config.timer_clock_hz = 1000000U;
+    config.min_record_ticks = 1U;
+    config.max_record_ticks = 1000U;
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 1000000ULL, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 64U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 1U);
+    CHECK(record_period(records, 0U) == 1000U);
+    CHECK(step_stream_generator_init(&generator, &config, 0U, 1001000ULL, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 64U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 2U);
+    CHECK(record_period(records, 0U) + record_period(records, 1U) == 1001U);
+    CHECK(record_period(records, 0U) == 501U && record_period(records, 1U) == 500U);
+
+    /* The limit must fit the format and the rest of the configuration. */
+    config = default_config();
+    config.max_record_ticks = STEP_STREAM_GENERATOR_MAX_RECORD_TICKS + 1U;
+    CHECK(
+        step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT
+    );
+    config.max_record_ticks = STEP_STREAM_GENERATOR_MAX_RECORD_TICKS;
+    CHECK(step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    config.max_record_ticks = config.pulse_ticks;
+    CHECK(
+        step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT
+    );
+    config.max_record_ticks = config.pulse_ticks + 1U;
+    config.low_ticks = 3U;
+    config.min_record_ticks = 1U;
+    CHECK(
+        step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT
+    );
+    config = default_config();
+    config.min_record_ticks = 50U;
+    config.max_record_ticks = 49U;
+    CHECK(
+        step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT
+    );
+
+    /* An interval just over the limit splits in halves, so the limit must hold two minimal records and a pulse. */
+    config = default_config();
+    config.min_record_ticks = 600U;
+    config.max_record_ticks = 1000U;
+    CHECK(
+        step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT
+    );
+    config.max_record_ticks = 1200U;
+    CHECK(step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    config = default_config();
+    config.min_record_ticks = 1U;
+    config.pulse_ticks = 500U;
+    config.low_ticks = 0U;
+    config.max_record_ticks = 1000U;
+    CHECK(
+        step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT
+    );
+    config.max_record_ticks = 1002U;
+    CHECK(step_stream_generator_init(&generator, &config, 1U, 1U, NULL) == STEP_STREAM_GENERATOR_STATUS_OK);
+    return 1;
+}
+
 int main(void) {
-    if (!test_invalid_arguments() || !test_block_wrapper_and_duration() ||
-        !test_idle_and_split_boundaries() || !test_resume_and_exact_sums() ||
-        !test_carry_and_overflow() || !test_speed_profiles()) {
+    if (!test_invalid_arguments() || !test_block_wrapper_and_duration() || !test_idle_and_split_boundaries() ||
+        !test_resume_and_exact_sums() || !test_carry_and_overflow() || !test_speed_profiles() ||
+        !test_max_record_ticks()) {
         return 1;
     }
     puts("step_stream_generator_unit_tests: PASS");

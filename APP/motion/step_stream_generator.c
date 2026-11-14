@@ -7,15 +7,29 @@ static uint64_t step_stream_generator_abs_i64(int64_t value) {
     return value < 0 ? (uint64_t)(-(value + 1)) + 1U : (uint64_t)value;
 }
 
+static uint32_t step_stream_generator_max_record_ticks(const StepStreamGeneratorConfig_t *config) {
+    return config->max_record_ticks != 0U ? config->max_record_ticks : STEP_STREAM_GENERATOR_MAX_RECORD_TICKS;
+}
+
 static StepStreamGeneratorStatus_t step_stream_generator_validate_config(const StepStreamGeneratorConfig_t *config) {
-    if (config->timer_clock_hz == 0U || config->pulse_ticks == 0U ||
-        config->pulse_ticks >= STEP_STREAM_GENERATOR_MAX_RECORD_TICKS || config->min_record_ticks == 0U ||
-        config->min_record_ticks > STEP_STREAM_GENERATOR_MAX_RECORD_TICKS) {
+    if (config->max_record_ticks > STEP_STREAM_GENERATOR_MAX_RECORD_TICKS) {
+        return STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT;
+    }
+    const uint32_t max_ticks = step_stream_generator_max_record_ticks(config);
+    if (config->timer_clock_hz == 0U || config->pulse_ticks == 0U || config->pulse_ticks >= max_ticks ||
+        config->min_record_ticks == 0U || config->min_record_ticks > max_ticks) {
+        return STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT;
+    }
+
+    /* An interval just over the limit is split in two records of about half of it; each must still be a valid record,
+     * and the first of a step must be longer than the pulse. */
+    if (config->max_record_ticks != 0U &&
+        ((uint64_t)config->min_record_ticks * 2U > max_ticks || (uint64_t)config->pulse_ticks * 2U >= max_ticks)) {
         return STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT;
     }
 
     const uint64_t pulse_and_low = (uint64_t)config->pulse_ticks + config->low_ticks;
-    if (pulse_and_low > STEP_STREAM_GENERATOR_MAX_RECORD_TICKS) {
+    if (pulse_and_low > max_ticks) {
         return STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT;
     }
 
@@ -96,7 +110,7 @@ static StepStreamGeneratorStatus_t step_stream_generator_prepare_interval(StepSt
         return conversion_status;
     }
 
-    const uint64_t max_ticks = STEP_STREAM_GENERATOR_MAX_RECORD_TICKS;
+    const uint64_t max_ticks = step_stream_generator_max_record_ticks(&generator->config);
     if (interval_ticks == 0U) {
         return generator->step_count == 0U ? STEP_STREAM_GENERATOR_STATUS_IDLE_INTERVAL_TOO_SHORT
                                            : STEP_STREAM_GENERATOR_STATUS_STEP_INTERVAL_TOO_SHORT;
