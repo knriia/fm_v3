@@ -1465,12 +1465,28 @@ uint8_t motion_axis_hardware_set_stream_limit_listener(
     const uint32_t primask = motion_axis_enter_critical();
     const uint8_t idle =
         (uint8_t)(stream_axis == NULL || step_stream_axis_get_state(stream_axis) == STEP_STREAM_AXIS_STATE_IDLE);
-    if (idle != 0U) {
+    const uint8_t is_owner = (uint8_t)(owner->listener == NULL || owner->context == context);
+    uint8_t taken = 0U;
+    if (listener == NULL) {
+        /* A release lets go of the caller's own listener; with nothing of the caller's there is nothing to refuse, also
+         * while the owner's stream runs. */
+        taken = 1U;
+        if (owner->listener != NULL && owner->context == context) {
+            if (idle != 0U) {
+                owner->context = NULL;
+                owner->listener = NULL;
+            } else {
+                taken = 0U;
+            }
+        }
+    } else if (idle != 0U && is_owner != 0U) {
+        /* A listener installs only into a free slot or over the same owner. */
         owner->context = context;
         owner->listener = listener;
+        taken = 1U;
     }
     motion_axis_exit_critical(primask);
-    return idle;
+    return taken;
 }
 
 void motion_axis_hardware_set_stream_axis_watched(MotionAxis_t axis, uint8_t watched) {

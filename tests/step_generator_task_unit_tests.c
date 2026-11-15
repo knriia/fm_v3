@@ -36,8 +36,14 @@ static void reset_test_plan_buffer(void) {
 static StepStreamGroup_t *test_group(void);
 /* Same value as STEP_GENERATOR_TASK_FLAG_STOP_RESET, which the file under test defines after the mocks. */
 #define TEST_FLAG_STOP_RESET (1UL << 1)
-/* Asks the instance under test to reset, through its real resume function. */
+/* Asks every instance to reset, through the real resume function; an instance that is not set up ignores it. */
 static void test_request_reset(void);
+/* The print instance takes its channels by hand, for the tests that fire the listeners without a stream. */
+static void test_claim_print_channels(void);
+/* The context that a channel or a switch of the axis instance of X reports with, and the print instance's by member. */
+static const void *test_axis_context(MotionAxis_t axis);
+static const void *test_print_context(uint32_t member);
+static void test_check_print_still_holds(void);
 
 typedef enum {
     TEST_ACTION_NONE = 0,
@@ -51,7 +57,16 @@ typedef enum {
     /* The channel of Z still runs when the task is asked to reset. */
     TEST_ACTION_Z_STREAMING,
     /* The channel of Y fails while the group runs, then STOP comes; the fault must survive the STOP. */
-    TEST_ACTION_FAULT_THEN_STOP
+    TEST_ACTION_FAULT_THEN_STOP,
+    /* The channels no longer stream: the ramp that kept them busy has been played. Checks that the print instance
+     * went on holding them until now. */
+    TEST_ACTION_FREE_STUCK_CHANNELS,
+    /* STOP of the instance of X in the middle of its stream; the channel of X is at rest afterwards. */
+    TEST_ACTION_HALT_X_AXIS_INSTANCE,
+    /* STOP of the instance of X after which the channel of X is still running. */
+    TEST_ACTION_HALT_X_AXIS_INSTANCE_CHANNEL_RUNS,
+    /* A block of X and Y arrives in the print queue while another instance already streams on X. */
+    TEST_ACTION_PUSH_PRINT_BLOCK_XY
 } TestWaitAction_t;
 
 static uint32_t test_failures;
@@ -78,8 +93,14 @@ static uint32_t test_prepare_calls[TEST_CHANNELS];
 static uint32_t test_start_calls[TEST_CHANNELS];
 static uint32_t test_last_startup_ns[TEST_CHANNELS];
 static uint32_t test_stop_calls[TEST_CHANNELS];
+/* Calls of step_stream_axis_set_listener, accepted or not. */
 static uint32_t test_listener_calls[TEST_CHANNELS];
+/* The context of the owner of each channel (the listener's context), NULL while the channel is free; the callbacks of the
+ * owner are in test_stream_listener. */
+static const void *test_stream_owner[TEST_CHANNELS];
 static StepStreamAxisListener_t test_stream_listener[TEST_CHANNELS];
+/* The channel goes on streaming after a stop, as one that plays its braking ramp does. */
+static uint8_t test_axis_stuck[TEST_CHANNELS];
 static uint32_t test_timer_clock_hz[TEST_CHANNELS];
 static uint8_t test_axis_streaming[TEST_CHANNELS];
 static uint32_t test_brake_requests[TEST_CHANNELS];
@@ -95,18 +116,14 @@ static uint8_t test_fail_acquire;
 static uint8_t test_fail_commit;
 /* Channel whose arming fails, or TEST_CHANNELS for none. */
 static uint8_t test_fail_start_channel;
-/* The last listener that an axis accepted, for the tests that fire it; the per-axis tables say who owns which axis. */
-static MotionAxisHardwareStreamLimitListener_t test_limit_listener;
-static void *test_limit_context;
+/* The switch listener of each axis and who owns it; NULL while the axis is free. */
 static MotionAxisHardwareStreamLimitListener_t test_limit_listeners[MOTION_AXIS_HARDWARE_COUNT];
 static void *test_limit_contexts[MOTION_AXIS_HARDWARE_COUNT];
+/* Calls that offer a listener, and calls that let go (listener NULL), accepted or not. */
 static uint32_t test_limit_listener_calls[MOTION_AXIS_HARDWARE_COUNT];
 static uint32_t test_limit_releases[MOTION_AXIS_HARDWARE_COUNT];
-/* The channel (and its axis) that refuses a new owner, as a stream that is still running does; TEST_CHANNELS for none. */
-static uint8_t test_busy_channel;
-/* The axis whose switch listener alone refuses a new owner; TEST_CHANNELS for none. */
-static uint8_t test_busy_limit_axis;
-static uint32_t test_listener_releases[3];
+/* Calls of step_stream_axis_release_listener, whoever the owner is. */
+static uint32_t test_listener_releases[TEST_CHANNELS];
 /* A call that carries any other pointer than a channel marker is counted. */
 static uint32_t test_wrong_axis_calls;
 static StepStreamBrakeConfig_t test_brake_config;
@@ -282,7 +299,28 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
     case TEST_ACTION_Z_STREAMING:
         test_axis_streaming[TEST_CH_Z] = 1U;
         break;
+    case TEST_ACTION_PUSH_PRINT_BLOCK_XY:
+        push_block_xy(400U + index, 3, 3);
+        break;
+    case TEST_ACTION_FREE_STUCK_CHANNELS:
+        test_check_print_still_holds();
+        (void)memset(test_axis_stuck, 0, sizeof(test_axis_stuck));
+        (void)memset(test_axis_streaming, 0, sizeof(test_axis_streaming));
+        break;
+    case TEST_ACTION_HALT_X_AXIS_INSTANCE:
+    case TEST_ACTION_HALT_X_AXIS_INSTANCE_CHANNEL_RUNS:
+        expect_true(
+            test_stream_owner[TEST_CH_X] == test_axis_context(MOTION_AXIS_X),
+            "the instance of X owns its channel while it streams"
+        );
+        step_generator_instance_halt(step_generator_task_get_axis_instance(MOTION_AXIS_X));
+        if (test_wait_actions[index] == TEST_ACTION_HALT_X_AXIS_INSTANCE_CHANNEL_RUNS) {
+            test_axis_streaming[TEST_CH_X] = 1U;
+        }
+        break;
     case TEST_ACTION_FAULT_THEN_STOP:
+        /* The fault is reported by a channel, so the print instance has to own its channels. */
+        test_claim_print_channels();
         run_group_prepared_and_started();
         test_stream_listener[TEST_CH_Y].on_fault(
             test_stream_listener[TEST_CH_Y].context,
@@ -319,17 +357,40 @@ StepStreamAxis_t *step_stream_axis_get(MotionAxis_t axis) {
     return axis == MOTION_AXIS_Z ? (StepStreamAxis_t *)&test_axis_markers[TEST_CH_Z] : NULL;
 }
 
+/* As the channel does: BUSY while it streams and while another owner (another context) holds it; the owner may repeat. */
 StepStreamAxisStatus_t step_stream_axis_set_listener(StepStreamAxis_t *axis, const StepStreamAxisListener_t *listener) {
     const uint32_t channel = channel_index(axis);
-    if (listener == NULL) {
-        ++test_listener_releases[channel];
-        return STEP_STREAM_AXIS_STATUS_OK;
-    }
     ++test_listener_calls[channel];
-    if (test_busy_channel == channel) {
+    const uint8_t owned_by_other =
+        (uint8_t)(listener != NULL && test_stream_owner[channel] != NULL && test_stream_owner[channel] != listener->context);
+    if (test_axis_streaming[channel] != 0U || owned_by_other != 0U) {
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
+    if (listener == NULL) {
+        test_stream_owner[channel] = NULL;
+        memset(&test_stream_listener[channel], 0, sizeof(test_stream_listener[channel]));
+        return STEP_STREAM_AXIS_STATUS_OK;
+    }
     test_stream_listener[channel] = *listener;
+    test_stream_owner[channel] = listener->context;
+    return STEP_STREAM_AXIS_STATUS_OK;
+}
+
+/* As the channel does: lets go only of the listener whose context is `context`; BUSY while the owner's channel streams. */
+StepStreamAxisStatus_t step_stream_axis_release_listener(StepStreamAxis_t *axis, const void *context) {
+    const uint32_t channel = channel_index(axis);
+    ++test_listener_releases[channel];
+    if (context == NULL) {
+        return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (test_stream_owner[channel] != context) {
+        return STEP_STREAM_AXIS_STATUS_OK;
+    }
+    if (test_axis_streaming[channel] != 0U) {
+        return STEP_STREAM_AXIS_STATUS_BUSY;
+    }
+    test_stream_owner[channel] = NULL;
+    memset(&test_stream_listener[channel], 0, sizeof(test_stream_listener[channel]));
     return STEP_STREAM_AXIS_STATUS_OK;
 }
 
@@ -402,7 +463,9 @@ void step_stream_axis_trigger(StepStreamAxis_t *const *axes, uint32_t count) {
 void step_stream_axis_stop(StepStreamAxis_t *axis) {
     const uint32_t channel = channel_index(axis);
     ++test_stop_calls[channel];
-    test_axis_streaming[channel] = 0U;
+    if (test_axis_stuck[channel] == 0U) {
+        test_axis_streaming[channel] = 0U;
+    }
 }
 
 void step_stream_axis_request_brake(StepStreamAxis_t *axis) { ++test_brake_requests[channel_index(axis)]; }
@@ -436,20 +499,30 @@ uint8_t motion_axis_hardware_set_stream_limit_listener(
     MotionAxisHardwareStreamLimitListener_t listener,
     void *context
 ) {
+    /* As the axis does: a release has nothing to refuse when the caller owns nothing (also while the channel streams),
+     * refuses while the owner's channel streams, and lets go otherwise; a listener goes into a free slot or over the
+     * same owner, and only while the channel is IDLE. */
+    const uint8_t idle = test_axis_streaming[axis] == 0U ? 1U : 0U;
     if (listener == NULL) {
         ++test_limit_releases[axis];
-        test_limit_listeners[axis] = NULL;
-        test_limit_contexts[axis] = NULL;
+        if (test_limit_listeners[axis] != NULL && test_limit_contexts[axis] == context) {
+            if (idle == 0U) {
+                return 0U;
+            }
+            test_limit_listeners[axis] = NULL;
+            test_limit_contexts[axis] = NULL;
+        }
         return 1U;
     }
     ++test_limit_listener_calls[axis];
-    if (test_busy_channel == (uint8_t)axis || test_busy_limit_axis == (uint8_t)axis) {
+    if (idle == 0U) {
+        return 0U;
+    }
+    if (test_limit_listeners[axis] != NULL && test_limit_contexts[axis] != context) {
         return 0U;
     }
     test_limit_listeners[axis] = listener;
     test_limit_contexts[axis] = context;
-    test_limit_listener = listener;
-    test_limit_context = context;
     return 1U;
 }
 
@@ -477,12 +550,73 @@ MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t 
 
 _Static_assert(TEST_FLAG_STOP_RESET == STEP_GENERATOR_TASK_FLAG_STOP_RESET, "the mock returns the reset flag of the task");
 
-static void test_request_reset(void) { step_generator_instance_resume_after_stop(&step_generator_task_instance); }
+static void test_request_reset(void) { step_generator_task_resume_all_after_stop(); }
 #undef static
 
 static StepStreamGroup_t *test_group(void) { return &step_generator_task_instance.group; }
 
+static const void *test_axis_context(MotionAxis_t axis) {
+    return &step_generator_task_axis_instances[axis].member_contexts[0];
+}
+
+static const void *test_print_context(uint32_t member) { return &step_generator_task_instance.member_contexts[member]; }
+
+static void test_claim_print_channels(void) {
+    expect_u32(
+        step_generator_task_claim_channels(&step_generator_task_instance),
+        1U,
+        "the print instance takes its channels"
+    );
+}
+
+/* The print instance tried to let go of its channels while they still stream: it holds them and its listeners stay. */
+static void test_check_print_still_holds(void) {
+    expect_u32(step_generator_task_instance.channels_held, 1U, "an instance that could not let go still holds its channels");
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        expect_true(
+            test_stream_owner[member] == test_print_context(member),
+            "the print instance stays the owner of a channel that still streams"
+        );
+        expect_true(
+            test_limit_contexts[member] == &step_generator_task_instance,
+            "the print instance stays the owner of the switch of a channel that still streams"
+        );
+    }
+    /* One attempt when the feeder stopped the stream, one when the pass ended with an idle feeder. */
+    expect_u32(test_listener_releases[TEST_CH_X], 2U, "the release was tried twice while the channel streamed");
+}
+
+/* A second instance with the same tables, standing for a stream of HOME or CALIBRATE: every link of it points to
+ * itself. */
+static void make_other_instance(StepGeneratorInstance_t *other) {
+    *other = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL(
+        *other,
+        step_generator_task_member_axes,
+        step_generator_task_member_planner_axes,
+        STEP_GENERATOR_TASK_MEMBER_COUNT
+    );
+}
+
 static StepGeneratorTaskConfig_t test_task_config;
+/* The queues of the one-lane instances, indexed by MotionAxis_t; a test hands one to the config with init_axis_plan_buffer. */
+static PlanBuffer_t test_axis_plan_buffer[MOTION_AXIS_HARDWARE_COUNT];
+static MotionPlanBlock_t test_axis_plan_entries[MOTION_AXIS_HARDWARE_COUNT][PLAN_BUFFER_CAPACITY];
+
+static void reset_instances(void) {
+    step_generator_task_instance = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL(
+        step_generator_task_instance,
+        step_generator_task_member_axes,
+        step_generator_task_member_planner_axes,
+        STEP_GENERATOR_TASK_MEMBER_COUNT
+    );
+    step_generator_task_axis_instances[MOTION_AXIS_X] =
+        (StepGeneratorInstance_t)STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_X);
+    step_generator_task_axis_instances[MOTION_AXIS_Y] =
+        (StepGeneratorInstance_t)STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_Y);
+    step_generator_task_axis_instances[MOTION_AXIS_Z] =
+        (StepGeneratorInstance_t)STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_Z);
+}
+
 static void reset_fixture(void) {
     reset_test_plan_buffer();
     expect_u32(
@@ -490,8 +624,10 @@ static void reset_fixture(void) {
         PLAN_BUFFER_STATUS_OK,
         "plan buffer initializes"
     );
-    step_generator_task_instance = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL;
+    reset_instances();
     step_generator_task_instance.plan_buffer = &test_plan_buffer;
+    (void)memset(test_axis_plan_buffer, 0, sizeof(test_axis_plan_buffer));
+    (void)memset(test_axis_plan_entries, 0, sizeof(test_axis_plan_entries));
     step_generator_task_thread_id = NULL;
     test_watched_axes = TEST_ALL_AXES_WATCHED;
     test_watched_axes_calls = 0U;
@@ -533,15 +669,13 @@ static void reset_fixture(void) {
     test_wrong_axis_calls = 0U;
     test_trigger_calls = 0U;
     test_trigger_axes = 0U;
-    test_limit_listener = NULL;
-    test_limit_context = NULL;
     memset(test_limit_listener_calls, 0, sizeof(test_limit_listener_calls));
     memset(test_limit_releases, 0, sizeof(test_limit_releases));
     memset(test_limit_listeners, 0, sizeof(test_limit_listeners));
     memset(test_limit_contexts, 0, sizeof(test_limit_contexts));
     memset(test_listener_releases, 0, sizeof(test_listener_releases));
-    test_busy_channel = TEST_CHANNELS;
-    test_busy_limit_axis = TEST_CHANNELS;
+    memset(test_stream_owner, 0, sizeof(test_stream_owner));
+    memset(test_axis_stuck, 0, sizeof(test_axis_stuck));
     test_brake_config = (StepStreamBrakeConfig_t){0};
     test_configure_brake_result = STEP_STREAM_AXIS_STATUS_OK;
     test_task_config = (StepGeneratorTaskConfig_t){
@@ -575,9 +709,13 @@ static void test_task_streams_a_block(void) {
     expect_true(step_generator_task_thread_id == TEST_THREAD_ID, "task stores its id for wakeups");
     expect_u32(test_wait_calls, 2U, "task waits again after each service");
     expect_u32(test_wait_last_timeout, osWaitForever, "task waits for work without polling");
-    expect_u32(test_listener_calls[TEST_CH_X], 1U, "task registers the stream listener of X once");
-    expect_u32(test_listener_calls[TEST_CH_Y], 1U, "task registers the stream listener of Y once");
-    expect_u32(test_listener_calls[TEST_CH_Z], 1U, "task registers the stream listener of Z once");
+    expect_u32(test_listener_calls[TEST_CH_X], 1U, "the stream registers the stream listener of X once");
+    expect_u32(test_listener_calls[TEST_CH_Y], 1U, "the stream registers the stream listener of Y once");
+    expect_u32(test_listener_calls[TEST_CH_Z], 1U, "the stream registers the stream listener of Z once");
+    expect_true(test_stream_owner[TEST_CH_X] == test_print_context(0U), "X channel belongs to the print instance");
+    expect_true(test_stream_owner[TEST_CH_Y] == test_print_context(1U), "Y channel belongs to the print instance");
+    expect_true(test_stream_owner[TEST_CH_Z] == test_print_context(2U), "Z channel belongs to the print instance");
+    expect_u32(step_generator_task_instance.channels_held, 1U, "the print instance holds its channels while it streams");
     expect_u32(
         test_watched_axes,
         1U << MOTION_AXIS_X,
@@ -741,6 +879,12 @@ static void test_idle_stream_stops(void) {
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "and on the channel of Z");
     expect_u32(step_generator_task_instance.diagnostics.streams_stopped, 1U, "stream stop is counted");
     expect_u32(step_generator_task_instance.halted, 0U, "a normal end does not halt the task");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_true(test_stream_owner[channel] == NULL, "the channel is free once its stream has stopped");
+        expect_true(test_limit_contexts[channel] == NULL, "the switch of the axis is free once its stream has stopped");
+        expect_u32(test_limit_releases[channel], 1U, "the switch listener is let go once, at the stop of the stream");
+    }
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the print instance holds nothing after its stream");
 
     /* A block that arrives later opens a new stream. */
     reset_fixture();
@@ -756,6 +900,9 @@ static void test_idle_stream_stops(void) {
     expect_u32(test_start_calls[TEST_CH_X], 2U, "the next block starts a second stream on X");
     expect_u32(test_start_calls[TEST_CH_Y], 2U, "and on Y");
     expect_u32(test_start_calls[TEST_CH_Z], 2U, "and on Z");
+    expect_u32(test_listener_calls[TEST_CH_X], 2U, "each stream takes the channel of X again");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 2U, "each stream takes the switch of X again");
+    expect_true(test_stream_owner[TEST_CH_X] == test_print_context(0U), "the second stream owns the channel of X");
 }
 
 static void test_unusable_timing_disables_feeding(void) {
@@ -836,10 +983,12 @@ static void test_stop_halts_and_resets(void) {
     reset_fixture();
     push_block(5U, 3);
     expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 0U, "a fresh task is not halted");
+    /* Only an instance that holds its channels stops them: the one-lane instances hold none here. */
+    test_claim_print_channels();
     step_generator_task_halt_all();
-    expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP stops the channel of X at once");
-    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP stops the channel of Y at once");
-    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP stops the channel of Z at once");
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP stops the channel of X at once, only for the instance that holds it");
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP stops the channel of Y at once, only for the instance that holds it");
+    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP stops the channel of Z at once, only for the instance that holds it");
     expect_u32(test_wrong_axis_calls, 0U, "STOP reaches the channels of X, Y and Z only");
     expect_u32(step_generator_task_instance.halted, 1U, "STOP halts feeding");
     expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 1U, "the halt is visible to MotionTask");
@@ -888,9 +1037,11 @@ static void test_instance_api(void) {
     expect_u32(step_generator_task_instance.reset_requested, 0U, "NULL resume touches no instance");
     expect_u32(test_flags_set_calls, 0U, "NULL resume signals nothing");
 
-    /* One instance: halt stops its channels and records the cause. */
+    /* An instance that holds no channel halts feeding but stops no channel: they are not its own. */
     step_generator_instance_halt(&step_generator_task_instance);
-    expect_u32(test_stop_calls[TEST_CH_X], 1U, "instance halt stops the channel of X");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_stop_calls[channel], 0U, "halt of an instance without channels stops none");
+    }
     expect_u32(step_generator_task_instance.halted, 1U, "instance halt halts feeding");
     expect_u32(
         step_generator_task_instance.halt_cause,
@@ -898,12 +1049,21 @@ static void test_instance_api(void) {
         "instance halt records a halt call"
     );
 
-    /* STOP of all instances reaches the same channels. */
+    /* One instance that holds its channels: halt stops exactly its own, each once. */
     reset_fixture();
+    test_claim_print_channels();
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "instance halt stops the channel of X");
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "instance halt stops the channel of Y");
+    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "instance halt stops the channel of Z");
+
+    /* STOP of all instances reaches the channels of the instance that holds them. */
+    reset_fixture();
+    test_claim_print_channels();
     step_generator_task_halt_all();
-    expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP of all stops the channel of X");
-    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP of all stops the channel of Y");
-    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP of all stops the channel of Z");
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP of all stops the channel of X once, for its holder");
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP of all stops the channel of Y once, for its holder");
+    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP of all stops the channel of Z once, for its holder");
     expect_u32(step_generator_task_instance.halts_total, 1U, "STOP of all halts the instance once");
 
     /* Resume marks the instance, then wakes the task. */
@@ -938,7 +1098,7 @@ static void test_instance_api(void) {
     /* Two instances: a STOP, a request and the busy flag of one do not reach the other. */
     reset_fixture();
     static StepGeneratorInstance_t other;
-    other = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL;
+    make_other_instance(&other);
     other.plan_buffer = &test_plan_buffer;
     StepGeneratorInstance_t *const pair[] = {&step_generator_task_instance, &other};
     step_generator_task_halt_list(&pair[0], 1U);
@@ -952,27 +1112,27 @@ static void test_instance_api(void) {
     expect_u32(other.halted, 1U, "STOP of the list halts the second instance");
     expect_u32(other.halts_total, 1U, "the second instance counts its halt once");
     expect_u32(step_generator_task_instance.halts_total, 2U, "the first instance counts both halts");
-    expect_u32(step_generator_task_any_busy_in_list(pair, 2U), 0U, "no instance of the list is busy");
-    other.stream_busy = 1U;
-    expect_u32(step_generator_task_any_busy_in_list(pair, 2U), 1U, "the busy second instance is found");
-    expect_u32(step_generator_task_any_busy_in_list(pair, 1U), 0U, "the first instance alone is not busy");
     step_generator_task_resume_list(pair, 2U);
     expect_u32(step_generator_task_instance.reset_requested, 1U, "resume of the list marks the first instance");
 
-    /* A channel claimed by an instance that could not be set up is let go. */
+    /* The setup of an instance takes no channel, whether it succeeds or not: channels are taken when a stream opens. */
     reset_fixture();
     test_task_config.plan_buffer = NULL;
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
     for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
-        expect_u32(test_listener_releases[channel], 1U, "the channel of a failed setup is released once");
+        expect_u32(test_listener_calls[channel], 0U, "a failed setup offers no stream listener");
+        expect_u32(test_limit_listener_calls[channel], 0U, "a failed setup offers no switch listener");
+        expect_true(test_stream_owner[channel] == NULL, "a failed setup owns no channel");
     }
-
-    /* Busy of all instances follows the queue of the instance. */
     reset_fixture();
-    expect_u32(step_generator_task_any_busy(), 0U, "idle instances are not busy");
-    push_block(10U, 3);
-    expect_u32(step_generator_task_any_busy(), 1U, "a queued block makes the task busy");
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_listener_calls[channel], 0U, "a good setup does not take the stream listener before a stream");
+        expect_u32(test_limit_listener_calls[channel], 0U, "a good setup does not take the switch listener either");
+    }
+    expect_u32(step_generator_task_instance.channels_held, 0U, "a ready instance without a stream holds nothing");
 }
 
 static void test_start_is_refused_while_halted(void) {
@@ -1144,7 +1304,8 @@ static void test_faults_halt_the_task(void) {
     expect_u32(step_generator_task_instance.halted, 1U, "a refused start halts feeding");
     expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "axis error is counted");
     expect_u32(step_generator_task_instance.diagnostics.streams_started, 0U, "no stream started");
-    expect_true(test_stop_calls[TEST_CH_X] >= 1U, "the feeder stops the channel of X on a fault");
+    /* Once by the group that undoes the refused arming, once by the feeder's stop of the instance that holds X. */
+    expect_u32(test_stop_calls[TEST_CH_X], 2U, "the channel of X is stopped by the group and by the feeder on a fault");
     expect_u32(test_wrong_axis_calls, 0U, "the feeder stops and starts the channels of X and Y only");
 
     /* The channel of Y refuses after X was armed: X must not be left waiting for a trigger. */
@@ -1239,6 +1400,7 @@ static void test_listener_and_notifications(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
 
     test_flags_set_value = 0U;
     test_stream_listener[TEST_CH_X].on_half_released(test_stream_listener[TEST_CH_X].context);
@@ -1294,6 +1456,7 @@ static void test_listener_and_notifications(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
     test_stream_listener[TEST_CH_Z].on_half_released(test_stream_listener[TEST_CH_Z].context);
     expect_u32(
         test_flags_set_value,
@@ -1350,8 +1513,9 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listener(test_limit_context, MOTION_AXIS_Y);
+    test_limit_listeners[MOTION_AXIS_Y](test_limit_contexts[MOTION_AXIS_Y], MOTION_AXIS_Y);
     /* The group halts the feeding once a channel reports that it brakes, not at the switch itself. */
     test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
     step_generator_task_get_stream_diagnostics(&stream);
@@ -1383,6 +1547,7 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
     run_group_prepared_and_started();
     test_stream_listener[TEST_CH_X].on_fault(test_stream_listener[TEST_CH_X].context, STEP_STREAM_AXIS_FAULT_DMA);
     step_generator_task_get_stream_diagnostics(&stream);
@@ -1436,10 +1601,11 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listener(test_limit_context, MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
     test_stream_listener[TEST_CH_Z].on_brake(test_stream_listener[TEST_CH_Z].context);
-    test_limit_listener(test_limit_context, MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
     step_generator_task_get_stream_diagnostics(&stream);
     expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "a switch of Z is named as the cause");
     expect_u32(stream.halt_member, 2U, "the switch of Z is member 2");
@@ -1497,13 +1663,24 @@ static void test_limit_switch_brakes_through_the_group(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
-    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 1U, "the task registers its limit listener of X once");
-    expect_u32(test_limit_listener_calls[MOTION_AXIS_Y], 1U, "the task registers its limit listener of Y once");
-    expect_u32(test_limit_listener_calls[MOTION_AXIS_Z], 1U, "the task registers its limit listener of Z once");
-    expect_true(test_limit_listener != NULL, "the limit listener is set");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 0U, "no switch listener is taken before a stream opens");
+    test_claim_print_channels();
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 1U, "the claim registers the limit listener of X once");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_Y], 1U, "the claim registers the limit listener of Y once");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_Z], 1U, "the claim registers the limit listener of Z once");
+    for (uint32_t axis = 0U; axis < MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_true(
+            test_limit_listeners[axis] == step_generator_task_limit_reached,
+            "the limit handler of the generator is installed for the axis"
+        );
+        expect_true(
+            test_limit_contexts[axis] == &step_generator_task_instance,
+            "the switch of the axis reports to the print instance"
+        );
+    }
 
     run_group_prepared_and_started();
-    test_limit_listener(test_limit_context, MOTION_AXIS_HARDWARE_COUNT);
+    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_HARDWARE_COUNT);
     expect_u32(
         test_brake_requests[TEST_CH_X] + test_brake_requests[TEST_CH_Y] + test_brake_requests[TEST_CH_Z],
         0U,
@@ -1523,7 +1700,7 @@ static void test_limit_switch_brakes_through_the_group(void) {
     );
 
     /* The group moves its axes together, so the switch of any axis brakes all channels. */
-    test_limit_listener(test_limit_context, MOTION_AXIS_X);
+    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_X);
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of X brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of X brakes the channel of Y too");
     expect_u32(test_brake_requests[TEST_CH_Z], 1U, "the switch of X brakes the channel of Z too");
@@ -1537,8 +1714,9 @@ static void test_limit_switch_brakes_through_the_group(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listener(test_limit_context, MOTION_AXIS_Y);
+    test_limit_listeners[MOTION_AXIS_Y](test_limit_contexts[MOTION_AXIS_Y], MOTION_AXIS_Y);
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of Y brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of Y brakes the channel of Y");
     expect_u32(
@@ -1551,8 +1729,9 @@ static void test_limit_switch_brakes_through_the_group(void) {
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listener(test_limit_context, MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of Z brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of Z brakes the channel of Y");
     expect_u32(test_brake_requests[TEST_CH_Z], 1U, "the switch of Z brakes the channel of Z");
@@ -1589,6 +1768,11 @@ static void test_stop_reset_clears_a_group_fault(void) {
     expect_u32(step_stream_group_get_fault(test_group()), 0U, "the reset forgets the fault");
     expect_u32(step_generator_task_instance.halted, 0U, "feeding goes on after the reset");
     expect_u32(step_generator_task_instance.diagnostics.axis_errors, 0U, "a clean reset is no error");
+    expect_u32(step_generator_task_instance.channels_held, 0U, "a clean reset lets go of the channels");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_true(test_stream_owner[channel] == NULL, "the channel is free after the reset");
+        expect_true(test_limit_contexts[channel] == NULL, "the switch is free after the reset");
+    }
 }
 
 static void test_reset_is_refused_while_a_channel_runs(void) {
@@ -1699,18 +1883,6 @@ static void test_brake_is_skipped_or_counted(void) {
         0U,
         "no feeder, no ramp"
     );
-}
-
-/* A second instance with the same tables, standing for a stream of HOME or CALIBRATE: every link of it points to
- * itself. */
-static void make_other_instance(StepGeneratorInstance_t *other) {
-    *other = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL;
-    other->group.ports.context = other;
-    other->group.listener.context = other;
-    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
-        other->member_contexts[member].instance = other;
-        other->stream_listeners[member].context = &other->member_contexts[member];
-    }
 }
 
 static void test_callbacks_act_on_their_own_instance(void) {
@@ -1878,38 +2050,650 @@ static void test_two_instances_own_different_axes(void) {
     expect_u32(first.limit_trips[0], 0U, "the first instance does not see the limit of Z");
 }
 
-/* A channel that is still running refuses a new owner: nothing stays taken and the instance cannot feed. */
-static void test_busy_channel_refuses_a_new_owner(void) {
+static int test_foreign_context;
+static void test_foreign_limit(void *context, MotionAxis_t axis) {
+    (void)context;
+    (void)axis;
+}
+
+/* Gives the one-lane instance of the axis a queue of its own in the config. */
+static void init_axis_plan_buffer(MotionAxis_t axis) {
+    expect_u32(
+        plan_buffer_init(&test_axis_plan_buffer[axis], test_axis_plan_entries[axis], PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "axis plan buffer initializes"
+    );
+    test_task_config.axis_plan_buffers[axis] = &test_axis_plan_buffer[axis];
+}
+
+/* A block of one axis alone: `steps` steps of the axis whose planner axis number is the MotionAxis_t. */
+static void push_axis_block(MotionAxis_t axis, uint32_t sequence, int64_t steps) {
+    int64_t delta[MOTION_AXIS_HARDWARE_COUNT] = {0, 0, 0};
+    delta[axis] = steps;
+    const MotionPlanBlock_t block = make_block_xyz(sequence, delta[0], delta[1], delta[2]);
+    expect_u32(
+        plan_buffer_try_push(&test_axis_plan_buffer[axis], &block),
+        PLAN_BUFFER_STATUS_OK,
+        "axis block is queued"
+    );
+}
+
+/* The task runs one pass over every instance and stops at the second wait. */
+static void run_one_service_pass(void) {
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+}
+
+/* The instances of X and Y each play a block of their own queue: X forward, Y backward. */
+static void start_streams_of_x_and_y(void) {
     reset_fixture();
-    test_busy_channel = TEST_CH_Y;
-    test_wait_script_count = 0U;
-    (void)run_task_until_jump(&test_task_config);
-    expect_u32(step_generator_task_instance.halted, 1U, "an instance that got no channel refuses all work");
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    push_axis_block(MOTION_AXIS_X, 60U, 3);
+    push_axis_block(MOTION_AXIS_Y, 61U, -3);
+    test_watched_axes = 0U;
+    run_one_service_pass();
+}
+
+/* HOME of Y: the instance of Y plays its block on one lane of planner axis 1 and touches nothing else. */
+static void test_axis_instance_plays_a_block_on_its_own_lane(void) {
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    push_axis_block(MOTION_AXIS_Y, 50U, 3);
+    test_watched_axes = 0U;
+    run_one_service_pass();
+    const StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+
+    expect_u32(test_prepare_calls[TEST_CH_Y], 1U, "the channel of Y is prepared");
+    expect_u32(test_prepare_calls[TEST_CH_X], 0U, "the channel of X is not prepared by a block of Y");
+    expect_u32(test_prepare_calls[TEST_CH_Z], 0U, "the channel of Z is not prepared by a block of Y");
+    expect_u32(test_start_calls[TEST_CH_Y], 1U, "the channel of Y starts");
+    expect_u32(test_start_calls[TEST_CH_X], 0U, "the channel of X does not start");
+    expect_u32(test_start_calls[TEST_CH_Z], 0U, "the channel of Z does not start");
+    expect_u32(test_trigger_calls, 1U, "the one-lane group triggers once");
+    expect_u32(test_trigger_axes, 1U, "the trigger covers only the channel of Y");
+    expect_u32(test_outputs_calls[MOTION_AXIS_Y], 1U, "the driver of Y is set once");
+    expect_u32(test_outputs_positive[MOTION_AXIS_Y], 1U, "a positive block sets the positive direction of Y");
+    expect_u32(test_outputs_calls[MOTION_AXIS_X], 0U, "the driver of X is not touched");
+    expect_u32(test_outputs_calls[MOTION_AXIS_Z], 0U, "the driver of Z is not touched");
+    expect_u32(test_delay_calls, 1U, "DIR setup time is waited once");
+    /* 3 steps of 10 us: the interval is 2750 ticks at 275 MHz, the record holds it minus one; the pulse is 5 us. */
+    expect_u32(test_halves[TEST_CH_Y][0][0], 2749U, "the ring of Y holds the step interval");
+    expect_u32(test_halves[TEST_CH_Y][0][2], 1375U, "the ring of Y holds the pulse");
+    expect_u32(test_halves[TEST_CH_X][0][0], 0U, "the ring of X is not written");
+    expect_u32(test_halves[TEST_CH_X][0][2], 0U, "the ring of X has no pulse");
+    expect_u32(test_halves[TEST_CH_Z][0][0], 0U, "the ring of Z is not written");
+    expect_u32(test_halves[TEST_CH_Z][0][2], 0U, "the ring of Z has no pulse");
+    expect_u32(test_watched_axes, 1U << MOTION_AXIS_Y, "only the axis of the instance is watched");
+    expect_u32(test_watched_axes_calls, 1U, "the watched state is set for the one member");
+
+    expect_u32(axis_y->diagnostics.streams_started, 1U, "the instance of Y started one stream");
+    expect_u32(axis_y->diagnostics.blocks_started, 1U, "the instance of Y started the block");
+    expect_u32(axis_y->diagnostics.blocks_completed, 1U, "the instance of Y generated the whole block");
+    expect_u32(axis_y->diagnostics.halves_filled, 2U, "both halves of the ring of Y are filled");
+    expect_u32(axis_y->diagnostics.generator_errors, 0U, "no generator error on Y");
+    expect_u32(axis_y->diagnostics.axis_errors, 0U, "no axis error on Y");
+    expect_u32(axis_y->halted, 0U, "the instance of Y feeds");
+    expect_u32(step_generator_instance_is_busy(axis_y), 1U, "the instance of Y is busy with its stream");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_axis_instances[MOTION_AXIS_X]), 0U, "X is not busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_axis_instances[MOTION_AXIS_Z]), 0U, "Z is not busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 0U, "the print instance is not busy");
+
+    PlanBufferDiagnostics_t queue = {0};
+    (void)plan_buffer_get_diagnostics(&test_axis_plan_buffer[MOTION_AXIS_Y], &queue);
+    expect_u32(queue.dequeued_total, 1U, "the block left the queue of Y");
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &queue);
+    expect_u32(queue.dequeued_total, 0U, "the print queue gave nothing");
+
+    expect_u32(step_generator_task_instance.diagnostics.streams_started, 0U, "the print instance started no stream");
+    expect_u32(
+        step_stream_feeder_get_phase(&step_generator_task_instance.feeder),
+        STEP_STREAM_FEEDER_PHASE_IDLE,
+        "the print feeder stays idle"
+    );
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the print instance holds no channel");
+    expect_true(test_stream_owner[TEST_CH_Y] == test_axis_context(MOTION_AXIS_Y), "the instance of Y owns the channel of Y");
+    expect_true(test_stream_owner[TEST_CH_X] == NULL, "the channel of X has no owner");
+    expect_true(test_stream_owner[TEST_CH_Z] == NULL, "the channel of Z has no owner");
+    expect_true(test_limit_contexts[MOTION_AXIS_Y] == axis_y, "the switch of Y reports to the instance of Y");
+    expect_true(test_limit_listeners[MOTION_AXIS_X] == NULL, "the switch of X has no listener");
+    expect_true(test_limit_listeners[MOTION_AXIS_Z] == NULL, "the switch of Z has no listener");
+    expect_u32(test_listener_calls[TEST_CH_X] + test_listener_calls[TEST_CH_Z], 0U, "X and Z are never offered a listener");
+    /* The ramp belongs to the axis and the print instance builds it for all three; the one-lane ones build none. */
+    expect_u32(test_configure_brake_calls[TEST_CH_X], 1U, "the ramp of X is built once");
+    expect_u32(test_configure_brake_calls[TEST_CH_Y], 1U, "the ramp of Y is built once, not again by its instance");
+    expect_u32(test_configure_brake_calls[TEST_CH_Z], 1U, "the ramp of Z is built once");
+}
+
+/* X and Y stream at the same time, each with its own channel, switch listener and group. */
+static void test_two_axis_instances_stream_together(void) {
+    start_streams_of_x_and_y();
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+
+    expect_u32(test_start_calls[TEST_CH_X], 1U, "the channel of X starts");
+    expect_u32(test_start_calls[TEST_CH_Y], 1U, "the channel of Y starts");
+    expect_u32(test_start_calls[TEST_CH_Z], 0U, "the channel of Z does not start");
+    expect_u32(test_trigger_calls, 2U, "each instance triggers its own group");
+    expect_u32(test_trigger_axes, 1U, "each trigger covers one channel");
+    expect_u32(test_outputs_positive[MOTION_AXIS_X], 1U, "X goes the positive way");
+    expect_u32(test_outputs_positive[MOTION_AXIS_Y], 0U, "Y goes the negative way");
+    expect_u32(test_outputs_calls[MOTION_AXIS_Z], 0U, "the driver of Z is not touched");
+    expect_u32(test_halves[TEST_CH_X][0][2], 1375U, "the ring of X holds a pulse");
+    expect_u32(test_halves[TEST_CH_Y][0][2], 1375U, "the ring of Y holds a pulse");
+    expect_u32(test_watched_axes, (1U << MOTION_AXIS_X) | (1U << MOTION_AXIS_Y), "X and Y are watched, Z is not");
+    expect_true(test_stream_owner[TEST_CH_X] == test_axis_context(MOTION_AXIS_X), "the instance of X owns its channel");
+    expect_true(test_stream_owner[TEST_CH_Y] == test_axis_context(MOTION_AXIS_Y), "the instance of Y owns its channel");
+    expect_true(test_stream_owner[TEST_CH_Z] == NULL, "the channel of Z is free");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == axis_x, "the switch of X reports to the instance of X");
+    expect_true(test_limit_contexts[MOTION_AXIS_Y] == axis_y, "the switch of Y reports to the instance of Y");
+    expect_u32(step_stream_group_get_state(&axis_x->group), STEP_STREAM_GROUP_STATE_RUNNING, "the group of X runs");
+    expect_u32(step_stream_group_get_state(&axis_y->group), STEP_STREAM_GROUP_STATE_RUNNING, "the group of Y runs");
+
+    /* A ring fault of X halts the instance of X; the member number is local to the instance. */
+    test_stream_listener[TEST_CH_X].on_fault(test_stream_listener[TEST_CH_X].context, STEP_STREAM_AXIS_FAULT_SEQUENCE);
+    expect_u32(axis_x->halted, 1U, "the fault of X halts the instance of X");
+    expect_u32(axis_x->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, "the instance of X names the fault");
+    expect_u32(axis_x->halt_member, 0U, "the channel of X is member 0 of its instance");
+    expect_u32(axis_x->halt_fault, (uint32_t)STEP_STREAM_AXIS_FAULT_SEQUENCE, "the fault code is kept");
+    expect_u32(axis_y->halted, 0U, "the fault of X does not halt the instance of Y");
+    expect_u32(step_generator_task_instance.halted, 0U, "the fault of X does not halt the print instance");
+    expect_u32(step_stream_group_get_state(&axis_x->group), STEP_STREAM_GROUP_STATE_FAULT, "the group of X faults");
+    expect_u32(step_stream_group_get_state(&axis_y->group), STEP_STREAM_GROUP_STATE_RUNNING, "the group of Y goes on");
+    expect_u32(test_stop_calls[TEST_CH_Y], 0U, "the channel of Y is not stopped for the fault of X");
+
+    /* A braking Y halts the instance of Y as its member 0 and leaves the cause of X alone. */
+    test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
+    expect_u32(axis_y->halted, 1U, "the braking of Y halts the instance of Y");
+    expect_u32(axis_y->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "the instance of Y names the limit");
+    expect_u32(axis_y->halt_member, 0U, "the channel of Y is member 0 of its instance");
+    expect_u32(axis_x->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, "the cause of X is unchanged");
+    expect_u32(step_generator_task_instance.halts_total, 0U, "the print instance counts no halt");
+}
+
+/* The switch of an axis reaches only the instance that owns the axis. */
+static void test_limit_switch_reaches_only_its_instance(void) {
+    start_streams_of_x_and_y();
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+
+    test_limit_listeners[MOTION_AXIS_Y](test_limit_contexts[MOTION_AXIS_Y], MOTION_AXIS_Y);
+    expect_u32(axis_y->limit_trips[0], 1U, "the switch of Y is counted by the instance of Y");
+    expect_u32(axis_x->limit_trips[0], 0U, "the instance of X does not see the switch of Y");
+    expect_u32(
+        step_generator_task_instance.limit_trips[0] + step_generator_task_instance.limit_trips[1] +
+            step_generator_task_instance.limit_trips[2],
+        0U,
+        "the print instance does not see the switch of Y"
+    );
+    expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the channel of Y brakes");
+    expect_u32(test_brake_requests[TEST_CH_X], 0U, "the channel of X goes on");
+    expect_u32(test_brake_requests[TEST_CH_Z], 0U, "the channel of Z is not asked to brake");
+    expect_u32(step_stream_group_get_state(&axis_y->group), STEP_STREAM_GROUP_STATE_STOPPING, "the group of Y stops");
+    expect_u32(step_stream_group_get_state(&axis_x->group), STEP_STREAM_GROUP_STATE_RUNNING, "the group of X runs on");
+
+    /* The listener of X knows only the axis of X: a report of another axis is not its member. */
+    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_Y);
+    expect_u32(axis_x->limit_trips[0], 0U, "a switch of another axis is not counted by the instance of X");
+    expect_u32(test_brake_requests[TEST_CH_X], 0U, "a switch of another axis does not brake X");
+    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_X);
+    expect_u32(axis_x->limit_trips[0], 1U, "the switch of X is counted by the instance of X");
+    expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of X brakes the channel of X");
+    expect_u32(axis_y->limit_trips[0], 1U, "the instance of Y did not count the switch of X");
+}
+
+/* A channel that another instance holds is refused: the stream cannot open and the owner keeps what it has. */
+static void test_refused_claim_fails_the_stream_and_spares_the_owner(void) {
+    /* X is held by the instance of X, which the task does not set up (no queue), so it keeps what it took. */
+    reset_fixture();
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    expect_u32(step_generator_task_claim_channels(axis_x), 1U, "the instance of X takes its channel");
+    push_block_xy(70U, 3, 3);
+    run_one_service_pass();
+
+    expect_u32(step_generator_task_instance.halted, 1U, "a refused claim halts the print instance");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        "the refusal is a feeder error"
+    );
+    expect_u32(
+        step_generator_task_instance.feeder_status,
+        (uint32_t)STEP_STREAM_FEEDER_STATUS_AXIS_ERROR,
+        "the feeder reports an axis error"
+    );
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "the refusal is one axis error");
+    expect_u32(step_generator_task_instance.diagnostics.streams_started, 0U, "no stream started");
+    expect_u32(test_listener_calls[TEST_CH_X], 2U, "the channel of X was offered by its owner and by the print instance");
+    expect_u32(test_listener_calls[TEST_CH_Y], 0U, "the members after the refused one are not asked");
+    expect_u32(test_listener_calls[TEST_CH_Z], 0U, "Z is not asked either");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 1U, "the switch of X is asked once, by its owner");
+    expect_u32(test_prepare_calls[TEST_CH_X] + test_prepare_calls[TEST_CH_Y] + test_prepare_calls[TEST_CH_Z], 0U, "no ring is prepared");
+    expect_u32(test_start_calls[TEST_CH_X] + test_start_calls[TEST_CH_Y] + test_start_calls[TEST_CH_Z], 0U, "no channel starts");
+    expect_u32(
+        test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Y] + test_outputs_calls[MOTION_AXIS_Z],
+        0U,
+        "no driver is set"
+    );
+    expect_true(test_stream_owner[TEST_CH_X] == test_axis_context(MOTION_AXIS_X), "the owner keeps the channel of X");
+    expect_true(test_stream_owner[TEST_CH_Y] == NULL, "the channel of Y stays free");
+    expect_true(test_stream_owner[TEST_CH_Z] == NULL, "the channel of Z stays free");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == axis_x, "the owner keeps the switch of X");
+    expect_true(test_limit_listeners[MOTION_AXIS_X] == step_generator_task_limit_reached, "its handler is still installed");
+    expect_u32(axis_x->channels_held, 1U, "the owner still holds its channels");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        0U,
+        "a refused instance stops no channel: they are not its own"
+    );
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the refused instance holds nothing");
+
+    /* The second member is refused: the channel of X that the print instance did take is let go, the owner of Y stays. */
+    reset_fixture();
+    StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+    expect_u32(step_generator_task_claim_channels(axis_y), 1U, "the instance of Y takes its channel");
+    push_block_xy(71U, 3, 3);
+    run_one_service_pass();
+    expect_u32(step_generator_task_instance.halted, 1U, "a refusal of the second member halts the print instance");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        "the refusal is a feeder error"
+    );
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "the refusal is one axis error");
+    expect_u32(test_listener_calls[TEST_CH_X], 1U, "X was offered once");
+    expect_u32(test_listener_calls[TEST_CH_Y], 2U, "Y was offered by its owner and by the print instance");
+    expect_u32(test_listener_calls[TEST_CH_Z], 0U, "Z is not asked after the refusal");
+    expect_true(test_stream_owner[TEST_CH_X] == NULL, "the channel of X that the print instance took is let go");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == NULL, "the switch of X that the print instance took is let go");
+    expect_true(test_limit_listeners[MOTION_AXIS_X] == NULL, "X has no switch listener after the rollback");
+    expect_u32(test_limit_releases[MOTION_AXIS_X], 1U, "the switch of X is let go once");
+    expect_true(test_stream_owner[TEST_CH_Y] == test_axis_context(MOTION_AXIS_Y), "the owner keeps the channel of Y");
+    expect_true(test_limit_contexts[MOTION_AXIS_Y] == axis_y, "the owner keeps the switch of Y");
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the refused instance holds nothing after the rollback");
+    expect_u32(axis_y->channels_held, 1U, "the owner of Y still holds its channels");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        0U,
+        "the rollback stops no channel, neither the one it let go nor the foreign one"
+    );
+
+    /* Only the switch listener of Y is held by another: the channel listener of Y that was taken is let go too. */
+    reset_fixture();
+    expect_u32(
+        motion_axis_hardware_set_stream_limit_listener(MOTION_AXIS_Y, test_foreign_limit, &test_foreign_context),
+        1U,
+        "a foreign owner takes the switch of Y"
+    );
+    push_block_xy(72U, 3, 3);
+    run_one_service_pass();
+    expect_u32(step_generator_task_instance.halted, 1U, "a refused switch listener halts the print instance");
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "the refusal is one axis error");
+    expect_u32(test_listener_calls[TEST_CH_Y], 1U, "the channel of Y was offered first");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_Y], 2U, "the switch of Y was offered by the foreign owner and by us");
+    expect_u32(test_listener_calls[TEST_CH_Z], 0U, "Z is not asked after the refusal");
+    expect_true(test_stream_owner[TEST_CH_Y] == NULL, "the channel of Y that the print instance took is let go");
+    expect_true(test_stream_owner[TEST_CH_X] == NULL, "the channel of X that the print instance took is let go");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == NULL, "the switch of X that the print instance took is let go");
+    expect_true(test_limit_contexts[MOTION_AXIS_Y] == &test_foreign_context, "the foreign owner keeps the switch of Y");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        0U,
+        "the rollback of a refused switch stops no channel"
+    );
+    expect_true(test_limit_listeners[MOTION_AXIS_Y] == test_foreign_limit, "its handler is still installed");
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the refused instance holds nothing");
+}
+
+/* A release lets go of the listeners of its own instance only; the instance that holds nothing releases nothing. */
+static void test_release_lets_go_only_of_its_own(void) {
+    reset_fixture();
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    test_claim_print_channels();
+    test_claim_print_channels();
+    expect_u32(test_listener_calls[TEST_CH_X], 2U, "the owner takes its channel again");
+    expect_u32(step_generator_task_instance.channels_held, 1U, "the print instance holds its channels");
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        expect_true(test_stream_owner[member] == test_print_context(member), "the print instance owns the channel");
+        expect_true(test_limit_contexts[member] == &step_generator_task_instance, "and the switch of its axis");
+    }
+
+    expect_u32(step_generator_task_claim_channels(axis_x), 0U, "the instance of X cannot take what the print instance holds");
+    expect_u32(test_listener_calls[TEST_CH_X], 3U, "the channel of X was offered once more");
+    expect_u32(test_listener_releases[TEST_CH_X], 1U, "the refused claim let go of its own, which was nothing");
+    expect_u32(axis_x->channels_held, 0U, "the refused instance holds nothing");
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        expect_true(test_stream_owner[member] == test_print_context(member), "the release did not take the channel away");
+        expect_true(test_limit_contexts[member] == &step_generator_task_instance, "nor the switch");
+        expect_true(test_limit_listeners[member] == step_generator_task_limit_reached, "nor its handler");
+    }
+
+    step_generator_task_release_channels(&step_generator_task_instance);
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the owner let go of everything");
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
+        expect_true(test_stream_owner[member] == NULL, "the channel is free after the release of its owner");
+        expect_true(test_limit_contexts[member] == NULL, "the switch is free after the release of its owner");
+        expect_true(test_limit_listeners[member] == NULL, "its handler is removed");
+    }
+    const uint32_t releases_before = test_listener_releases[TEST_CH_X];
+    step_generator_task_release_channels(&step_generator_task_instance);
+    expect_u32(test_listener_releases[TEST_CH_X], releases_before, "an instance that holds nothing asks nothing");
+    expect_u32(test_limit_releases[MOTION_AXIS_X], 2U, "the switch of X was let go by the refused claim and by the owner");
+}
+
+/* The channels still stream at the end of the stream: the instance keeps them and lets go on a later pass. */
+static void test_release_is_retried_while_a_channel_streams(void) {
+    reset_fixture();
+    push_block(80U, 3);
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        test_axis_stuck[channel] = 1U;
+    }
+    test_wait_script_count = 3U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED;
+    test_wait_actions[0] = TEST_ACTION_RELEASE_HALF_0;
+    test_wait_results[1] = STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED;
+    test_wait_actions[1] = TEST_ACTION_RELEASE_HALF_1;
+    test_wait_results[2] = STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED;
+    test_wait_actions[2] = TEST_ACTION_FREE_STUCK_CHANNELS;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+
+    expect_u32(step_generator_task_instance.diagnostics.streams_stopped, 1U, "the stream ended");
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the channels are let go once they are at rest");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_true(test_stream_owner[channel] == NULL, "the channel is free after the retry");
+        expect_true(test_limit_contexts[channel] == NULL, "the switch is free after the retry");
+    }
+    expect_u32(test_listener_releases[TEST_CH_X], 3U, "two refused attempts and the one that succeeded");
+
+    /* Only the switch listener refuses: the channel listener is let go but the instance still holds the axis. */
+    reset_fixture();
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    expect_u32(
+        motion_axis_hardware_set_stream_limit_listener(MOTION_AXIS_X, step_generator_task_limit_reached, axis_x),
+        1U,
+        "the instance of X owns the switch of X"
+    );
+    axis_x->channels_held = 1U;
+    test_axis_streaming[TEST_CH_X] = 1U;
+    step_generator_task_release_channels(axis_x);
+    expect_u32(axis_x->channels_held, 1U, "a refusing switch listener keeps the instance the holder");
+    expect_u32(test_limit_releases[MOTION_AXIS_X], 1U, "the switch listener was asked to let go");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == axis_x, "the owner keeps the switch while its channel streams");
+    test_axis_streaming[TEST_CH_X] = 0U;
+    step_generator_task_release_channels(axis_x);
+    expect_u32(axis_x->channels_held, 0U, "the next attempt lets go");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == NULL, "the switch is free after the next attempt");
+}
+
+/* A halt of one instance stops its channels only; STOP of all halts the four; busy follows each queue. */
+static void test_halt_and_busy_are_per_instance(void) {
+    reset_fixture();
+    StepGeneratorInstance_t *const print = &step_generator_task_instance;
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+    StepGeneratorInstance_t *const axis_z = &step_generator_task_axis_instances[MOTION_AXIS_Z];
+    for (uint32_t axis = 0U; axis < MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        init_axis_plan_buffer((MotionAxis_t)axis);
+        step_generator_task_axis_instances[axis].plan_buffer = &test_axis_plan_buffer[axis];
+    }
+
+    push_axis_block(MOTION_AXIS_Y, 90U, 3);
+    expect_u32(step_generator_instance_is_busy(axis_y), 1U, "a block in the queue of Y makes the instance of Y busy");
+    expect_u32(step_generator_instance_is_busy(axis_x), 0U, "the instance of X is not busy");
+    expect_u32(step_generator_instance_is_busy(axis_z), 0U, "the instance of Z is not busy");
+    expect_u32(step_generator_instance_is_busy(print), 0U, "the print instance is not busy");
+    axis_z->stream_busy = 1U;
+    expect_u32(step_generator_instance_is_busy(axis_z), 1U, "a running stream makes the instance of Z busy");
+    expect_u32(step_generator_instance_is_busy(axis_x), 0U, "the instance of X is still not busy");
+    axis_z->stream_busy = 0U;
+    expect_u32(plan_buffer_clear(&test_axis_plan_buffer[MOTION_AXIS_Y]), PLAN_BUFFER_STATUS_OK, "the queue of Y clears");
+    expect_u32(step_generator_instance_is_busy(axis_y), 0U, "the instance of Y is idle after the clear");
+
+    /* The three one-lane instances hold their channels; the print instance holds none. */
+    expect_u32(step_generator_task_claim_channels(axis_x), 1U, "the instance of X takes its channel");
+    expect_u32(step_generator_task_claim_channels(axis_y), 1U, "the instance of Y takes its channel");
+    expect_u32(step_generator_task_claim_channels(axis_z), 1U, "the instance of Z takes its channel");
+    step_generator_instance_halt(axis_x);
+    expect_u32(step_generator_instance_is_halted(axis_x), 1U, "the instance of X is halted");
+    expect_u32(step_generator_instance_is_halted(axis_y), 0U, "the instance of Y is not");
+    expect_u32(step_generator_instance_is_halted(axis_z), 0U, "the instance of Z is not");
+    expect_u32(step_generator_instance_is_halted(print), 0U, "the print instance is not");
+    expect_u32(axis_x->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, "the halt is a halt call");
+    expect_u32(axis_x->halts_total, 1U, "the halt is counted by the instance of X");
+    expect_u32(axis_y->halts_total + axis_z->halts_total + print->halts_total, 0U, "the others count no halt");
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "the channel of X is stopped");
+    expect_u32(test_stop_calls[TEST_CH_Y], 0U, "the channel of Y is not");
+    expect_u32(test_stop_calls[TEST_CH_Z], 0U, "the channel of Z is not");
+
+    step_generator_task_halt_all();
+    expect_u32(step_generator_instance_is_halted(axis_x), 1U, "STOP halts the instance of X");
+    expect_u32(step_generator_instance_is_halted(axis_y), 1U, "STOP halts the instance of Y");
+    expect_u32(step_generator_instance_is_halted(axis_z), 1U, "STOP halts the instance of Z");
+    expect_u32(step_generator_instance_is_halted(print), 1U, "STOP halts the print instance");
+    expect_u32(axis_x->halts_total, 2U, "X counts both halts");
+    expect_u32(axis_y->halts_total, 1U, "Y counts the STOP");
+    expect_u32(axis_z->halts_total, 1U, "Z counts the STOP");
+    expect_u32(print->halts_total, 1U, "the print instance counts the STOP");
+    /* The print instance holds nothing, so it stops nothing: X is stopped by the earlier halt and by STOP. */
+    expect_u32(test_stop_calls[TEST_CH_X], 2U, "X: the earlier halt and the STOP of the instance of X");
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "Y: the STOP of the instance of Y only");
+    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "Z: the STOP of the instance of Z only");
+
+    /* The reset is asked per instance too. */
+    step_generator_task_thread_id = TEST_THREAD_ID;
+    step_generator_instance_resume_after_stop(axis_y);
+    expect_u32(axis_y->reset_requested, 1U, "the instance of Y is marked");
+    expect_u32(axis_x->reset_requested + axis_z->reset_requested + print->reset_requested, 0U, "the others are not");
+    step_generator_task_resume_all_after_stop();
+    expect_u32(
+        axis_x->reset_requested + axis_y->reset_requested + axis_z->reset_requested + print->reset_requested,
+        4U,
+        "resume of all marks the four instances"
+    );
+}
+
+/* An instance of an axis without a queue fails alone; the others go on, and the other way round. */
+static void test_axis_instance_without_a_queue_fails_alone(void) {
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    push_axis_block(MOTION_AXIS_Y, 95U, 3);
+    run_one_service_pass();
+    const MotionAxis_t without_queue[] = {MOTION_AXIS_X, MOTION_AXIS_Z};
+    for (uint32_t index = 0U; index < sizeof(without_queue) / sizeof(without_queue[0]); ++index) {
+        const StepGeneratorInstance_t *const instance = &step_generator_task_axis_instances[without_queue[index]];
+        expect_u32(instance->ready, 0U, "an instance without a queue is not set up");
+        expect_u32(instance->halted, 1U, "an instance without a queue is halted");
+        expect_u32(instance->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_SETUP_FAILED, "the cause is a failed setup");
+        expect_u32(instance->halt_member, STEP_GENERATOR_TASK_NO_MEMBER, "no channel is to blame");
+        expect_u32(instance->diagnostics.generator_errors, 1U, "the missing queue is counted once");
+        expect_true(
+            step_generator_instance_get_plan_buffer(instance) == NULL,
+            "an instance without a queue keeps none"
+        );
+    }
+    const StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+    expect_u32(axis_y->ready, 1U, "the instance of Y is set up");
+    expect_u32(axis_y->halted, 0U, "the instance of Y feeds");
+    expect_u32(axis_y->diagnostics.generator_errors, 0U, "the instance of Y has no error");
+    expect_u32(axis_y->diagnostics.streams_started, 1U, "the instance of Y started its stream");
+    expect_u32(test_start_calls[TEST_CH_Y], 1U, "the channel of Y starts");
+    expect_u32(test_start_calls[TEST_CH_X] + test_start_calls[TEST_CH_Z], 0U, "X and Z start nothing");
+    expect_u32(step_generator_task_instance.ready, 1U, "the print instance is set up");
+    expect_u32(step_generator_task_instance.halted, 0U, "the print instance feeds");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 0U, "the print instance has no error");
+
+    /* Without the print queue the print instance fails alone. */
+    reset_fixture();
+    test_task_config.plan_buffer = NULL;
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    push_axis_block(MOTION_AXIS_Y, 96U, 3);
+    run_one_service_pass();
+    expect_u32(step_generator_task_instance.ready, 0U, "the print instance without a queue is not set up");
+    expect_u32(step_generator_task_instance.halted, 1U, "the print instance without a queue is halted");
     expect_u32(
         step_generator_task_instance.halt_cause,
         STEP_GENERATOR_TASK_HALT_CAUSE_SETUP_FAILED,
-        "the refused channel is a setup failure"
+        "the print cause is a failed setup"
     );
-    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "the refusal is counted once");
-    expect_u32(test_listener_calls[TEST_CH_Z], 0U, "the members after the refused one are not asked");
-    expect_u32(test_listener_releases[TEST_CH_X], 1U, "the channel of X that was taken is let go");
-    expect_u32(test_listener_releases[TEST_CH_Y], 1U, "the refusing channel is let go too");
-    expect_u32(test_listener_releases[TEST_CH_Z], 0U, "the channel of Z was never taken");
-    expect_u32(test_limit_releases[MOTION_AXIS_X], 1U, "the switch listener of X that was taken is let go");
-    expect_u32(test_limit_releases[MOTION_AXIS_Z], 0U, "the switch listener of Z was never taken");
-    expect_true(test_limit_listeners[MOTION_AXIS_X] == NULL, "X has no owner after the rollback");
-    expect_u32(test_prepare_calls[TEST_CH_X], 0U, "no stream is prepared without the channels");
+    expect_u32(step_generator_task_axis_instances[MOTION_AXIS_Y].halted, 0U, "the instance of Y is not affected");
+    expect_u32(test_start_calls[TEST_CH_Y], 1U, "the channel of Y starts");
 
-    /* The switch listener of the axis refuses alone: the channel listener that the first call set is let go. */
+    /* Without a config none of the four is set up. */
     reset_fixture();
-    StepGeneratorInstance_t instance;
-    make_other_instance(&instance);
-    test_busy_limit_axis = MOTION_AXIS_X;
-    expect_u32(step_generator_task_claim_channels(&instance), 0U, "a refusing switch listener of X refuses the claim");
-    expect_u32(test_listener_calls[TEST_CH_X], 1U, "the channel of X was asked first");
-    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 1U, "the switch listener of X was asked");
-    expect_u32(test_listener_releases[TEST_CH_X], 1U, "the channel of X that the first call took is let go");
-    expect_u32(test_limit_listener_calls[MOTION_AXIS_Y], 0U, "nothing is asked after the refusal");
+    test_wait_script_count = 0U;
+    expect_u32((uint32_t)run_task_until_jump(NULL), 2U, "task ends at the first wait");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "the print instance counts the missing config");
+    for (uint32_t axis = 0U; axis < MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        const StepGeneratorInstance_t *const instance = &step_generator_task_axis_instances[axis];
+        expect_u32(instance->ready, 0U, "no instance is set up without a config");
+        expect_u32(instance->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_SETUP_FAILED, "the cause is a failed setup");
+        expect_u32(instance->diagnostics.generator_errors, 1U, "the missing config is counted once per instance");
+    }
+}
+
+static void test_instance_lookup_and_queues(void) {
+    reset_fixture();
+    expect_true(
+        step_generator_task_get_axis_instance(MOTION_AXIS_X) == &step_generator_task_axis_instances[MOTION_AXIS_X],
+        "the instance of X"
+    );
+    expect_true(
+        step_generator_task_get_axis_instance(MOTION_AXIS_Y) == &step_generator_task_axis_instances[MOTION_AXIS_Y],
+        "the instance of Y"
+    );
+    expect_true(
+        step_generator_task_get_axis_instance(MOTION_AXIS_Z) == &step_generator_task_axis_instances[MOTION_AXIS_Z],
+        "the instance of Z"
+    );
+    expect_true(
+        step_generator_task_get_axis_instance(MOTION_AXIS_HARDWARE_COUNT) == NULL,
+        "an axis past Z has no instance"
+    );
+    expect_true(step_generator_task_get_axis_instance((MotionAxis_t)99) == NULL, "an unknown axis has no instance");
+    expect_true(step_generator_instance_get_plan_buffer(NULL) == NULL, "a NULL instance has no queue");
+    expect_true(
+        step_generator_instance_get_plan_buffer(step_generator_task_get_axis_instance(MOTION_AXIS_Y)) == NULL,
+        "an instance has no queue before the task starts"
+    );
+
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    init_axis_plan_buffer(MOTION_AXIS_Z);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_true(
+        step_generator_instance_get_plan_buffer(step_generator_task_get_axis_instance(MOTION_AXIS_X)) ==
+            &test_axis_plan_buffer[MOTION_AXIS_X],
+        "the instance of X plays the queue of X"
+    );
+    expect_true(
+        step_generator_instance_get_plan_buffer(step_generator_task_get_axis_instance(MOTION_AXIS_Y)) ==
+            &test_axis_plan_buffer[MOTION_AXIS_Y],
+        "the instance of Y plays the queue of Y"
+    );
+    expect_true(
+        step_generator_instance_get_plan_buffer(step_generator_task_get_axis_instance(MOTION_AXIS_Z)) ==
+            &test_axis_plan_buffer[MOTION_AXIS_Z],
+        "the instance of Z plays the queue of Z"
+    );
+    expect_true(
+        step_generator_instance_get_plan_buffer(step_generator_task_get_print_instance()) == &test_plan_buffer,
+        "the print instance plays the queue of the config"
+    );
+}
+
+/* An instance stops only the channels it holds: a halt of another instance must not cut a stream that is not its own. */
+static void test_halt_stops_only_the_channels_the_instance_holds(void) {
+    reset_fixture();
+    StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    expect_u32(step_generator_task_claim_channels(axis_x), 1U, "the instance of X takes its channel");
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(step_generator_task_instance.halted, 1U, "the print instance is halted");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        0U,
+        "the halt of the print instance stops no channel, X belongs to the instance of X"
+    );
+    expect_u32(axis_x->halted, 0U, "the instance of X is not halted by it");
+    step_generator_instance_halt(axis_x);
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "the halt of the holder stops its channel of X");
+    expect_u32(test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z], 0U, "and no other channel");
+
+    /* The instance of Y holds only Y: its halt leaves X and Z alone. */
+    reset_fixture();
+    expect_u32(
+        step_generator_task_claim_channels(&step_generator_task_axis_instances[MOTION_AXIS_Y]),
+        1U,
+        "the instance of Y takes its channel"
+    );
+    step_generator_instance_halt(&step_generator_task_axis_instances[MOTION_AXIS_Y]);
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "the instance of Y stops the channel of Y once");
+    expect_u32(test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Z], 0U, "and not the channels of X and Z");
+
+    /* A refused claim while another instance streams on X: the stream goes on, no channel is stopped. */
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    push_axis_block(MOTION_AXIS_X, 110U, 3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    test_wait_actions[0] = TEST_ACTION_PUSH_PRINT_BLOCK_XY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    const StepGeneratorInstance_t *const streaming_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    expect_u32(test_start_calls[TEST_CH_X], 1U, "the instance of X started its stream before the print block came");
+    expect_u32(step_generator_task_instance.halted, 1U, "the print instance is refused and halted");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        "the refusal is a feeder error"
+    );
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "the refusal is one axis error");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        0U,
+        "the refusal stops no channel, least of all the one that streams"
+    );
+    expect_u32(test_axis_streaming[TEST_CH_X], 1U, "the stream of X goes on");
+    expect_u32(streaming_x->halted, 0U, "the instance of X is not halted");
+    expect_u32(step_stream_group_get_state(&streaming_x->group), STEP_STREAM_GROUP_STATE_RUNNING, "its group runs on");
+    expect_true(test_stream_owner[TEST_CH_X] == test_axis_context(MOTION_AXIS_X), "the instance of X keeps its channel");
+    expect_u32(streaming_x->channels_held, 1U, "and its hold");
+}
+
+/* After a STOP reset the channels are free again, so another instance can take them; a reset that fails keeps them. */
+static void test_stop_reset_frees_the_channels(void) {
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    push_axis_block(MOTION_AXIS_X, 100U, 3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    test_wait_actions[0] = TEST_ACTION_HALT_X_AXIS_INSTANCE;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    const StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
+    expect_u32(axis_x->diagnostics.stop_resets, 1U, "the instance of X was reset");
+    expect_u32(axis_x->halted, 0U, "the reset lifts the halt");
+    expect_u32(axis_x->channels_held, 0U, "the reset lets go of the channels");
+    expect_true(test_stream_owner[TEST_CH_X] == NULL, "the channel of X is free after the reset");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == NULL, "the switch of X is free after the reset");
+    expect_true(test_limit_listeners[MOTION_AXIS_X] == NULL, "its handler is removed");
+    expect_u32(step_generator_task_claim_channels(&step_generator_task_instance), 1U, "another instance takes the channels");
+    expect_true(test_stream_owner[TEST_CH_X] == test_print_context(0U), "the print instance owns the channel of X now");
+    expect_true(test_limit_contexts[MOTION_AXIS_X] == &step_generator_task_instance, "and the switch of X");
+
+    /* A channel that still runs after STOP: the reset fails and the instance goes on holding its channels. */
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    push_axis_block(MOTION_AXIS_X, 101U, 3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    test_wait_actions[0] = TEST_ACTION_HALT_X_AXIS_INSTANCE_CHANNEL_RUNS;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(axis_x->halted, 1U, "a reset that fails leaves the instance halted");
+    expect_u32(axis_x->halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED, "the cause is the failed reset");
+    expect_u32(axis_x->diagnostics.axis_errors, 1U, "the failed reset is an axis error");
+    expect_u32(axis_x->channels_held, 1U, "the instance holds its channels while the channel runs");
+    expect_u32(test_listener_releases[TEST_CH_X], 0U, "no release is tried after a failed reset");
+    expect_true(test_stream_owner[TEST_CH_X] == test_axis_context(MOTION_AXIS_X), "the owner keeps the channel of X");
 }
 
 int main(void) {
@@ -1941,7 +2725,17 @@ int main(void) {
     test_config_without_plan_buffer_halts_the_task();
     test_ports_read_the_queue_of_the_config();
     test_two_instances_own_different_axes();
-    test_busy_channel_refuses_a_new_owner();
+    test_axis_instance_plays_a_block_on_its_own_lane();
+    test_two_axis_instances_stream_together();
+    test_limit_switch_reaches_only_its_instance();
+    test_refused_claim_fails_the_stream_and_spares_the_owner();
+    test_release_lets_go_only_of_its_own();
+    test_release_is_retried_while_a_channel_streams();
+    test_halt_and_busy_are_per_instance();
+    test_axis_instance_without_a_queue_fails_alone();
+    test_instance_lookup_and_queues();
+    test_halt_stops_only_the_channels_the_instance_holds();
+    test_stop_reset_frees_the_channels();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Step generator task unit tests failed: %u\n", (unsigned int)test_failures);

@@ -2,6 +2,7 @@
 #define FM_V3_STEP_GENERATOR_TASK_H
 
 #include "motion/plan_buffer.h"
+#include "motion_axis_hardware.h"
 
 #include <stdint.h>
 
@@ -74,6 +75,9 @@ typedef struct {
     StepGeneratorTaskMemberDiagnostics_t members[STEP_GENERATOR_TASK_STREAM_MEMBERS];
 } StepGeneratorTaskStreamDiagnostics_t;
 
+/* Instances with one lane each (X, Y, Z) that play the moves of HOME and CALIBRATE. */
+#define STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT 3U
+
 /* Step timing of the driver in nanoseconds; the task turns it into timer ticks of the stream axis. */
 typedef struct {
     uint32_t step_pulse_width_ns;
@@ -82,6 +86,9 @@ typedef struct {
     uint32_t limit_deceleration_steps_per_s2;
     /* The queue of plan blocks the task plays; it outlives the task. Without it the task only reports an error. */
     PlanBuffer_t *plan_buffer;
+    /* The queues of the one-lane instances, indexed by MotionAxis_t; they outlive the task. Without one the instance of
+     * that axis only reports an error. */
+    PlanBuffer_t *axis_plan_buffers[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT];
 } StepGeneratorTaskConfig_t;
 
 /* Turns plan blocks into ring records of the X stream axis, keeps its ring filled and starts and stops the stream.
@@ -92,6 +99,11 @@ typedef struct StepGeneratorInstance StepGeneratorInstance_t;
 
 /* The instance of the printing stream (X, Y, Z); its diagnostics go into the diagnostic frame. */
 StepGeneratorInstance_t *step_generator_task_get_print_instance(void);
+/* The one-lane instance of an axis: it plays the homing and calibration moves of that axis, so the axes of one command
+ * run at the same time, each with its own plan queue. NULL for an axis outside MotionAxis_t. */
+StepGeneratorInstance_t *step_generator_task_get_axis_instance(MotionAxis_t axis);
+/* The queue of plan blocks the instance plays; NULL for a NULL instance and before the task has started. */
+PlanBuffer_t *step_generator_instance_get_plan_buffer(const StepGeneratorInstance_t *instance);
 /* Called by MotionTask after it pushes a block into PlanBuffer. */
 void step_generator_task_notify_block_ready(void);
 /* Called from the axis DMA interrupt when a ring half has been played and needs refilling. */
@@ -104,8 +116,6 @@ void step_generator_task_halt_all(void);
  * instance). Homing and calibration use the same timers as the stream, so they must not start while this is set. A
  * NULL instance is not busy. */
 uint8_t step_generator_instance_is_busy(const StepGeneratorInstance_t *instance);
-/* 1 if any instance is busy. */
-uint8_t step_generator_task_any_busy(void);
 /* 1 while the instance does not feed its channels: after STOP, a stop on a limit switch or a fault, until the reset
  * below. A NULL instance reads as not halted. */
 uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instance);
