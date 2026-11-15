@@ -1437,17 +1437,47 @@ motion_axis_pending_limit_reason(const Ctx_t *c, uint32_t pending_lines, uint8_t
     return MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
 }
 
-static MotionAxisHardwareStreamLimitListener_t volatile motion_axis_stream_limit_listener;
-static void *volatile motion_axis_stream_limit_listener_context;
+/* Who owns the planned stream of each axis: the listener of its switches and whether the stream reacts to them. The
+ * table is read in the switch interrupt only while the channel of the axis is STREAMING, and written only while it is
+ * not, so the owner cannot change under a running stream. */
+typedef struct {
+    MotionAxisHardwareStreamLimitListener_t volatile listener;
+    void *volatile context;
+    volatile uint8_t watched;
+} MotionAxisStreamOwner_t;
 
-void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimitListener_t listener, void *context) {
-    motion_axis_stream_limit_listener_context = context;
-    motion_axis_stream_limit_listener = listener;
+static MotionAxisStreamOwner_t motion_axis_stream_owners[MOTION_AXIS_HARDWARE_COUNT] = {
+    [MOTION_AXIS_X] = {.watched = 1U},
+    [MOTION_AXIS_Y] = {.watched = 1U},
+    [MOTION_AXIS_Z] = {.watched = 1U},
+};
+
+uint8_t motion_axis_hardware_set_stream_limit_listener(
+    MotionAxis_t axis,
+    MotionAxisHardwareStreamLimitListener_t listener,
+    void *context
+) {
+    if ((uint32_t)axis >= (uint32_t)MOTION_AXIS_HARDWARE_COUNT) {
+        return 0U;
+    }
+    const StepStreamAxis_t *stream_axis = step_stream_axis_get(axis);
+    MotionAxisStreamOwner_t *owner = &motion_axis_stream_owners[axis];
+    const uint32_t primask = motion_axis_enter_critical();
+    const uint8_t idle =
+        (uint8_t)(stream_axis == NULL || step_stream_axis_get_state(stream_axis) == STEP_STREAM_AXIS_STATE_IDLE);
+    if (idle != 0U) {
+        owner->context = context;
+        owner->listener = listener;
+    }
+    motion_axis_exit_critical(primask);
+    return idle;
 }
 
-static volatile uint8_t motion_axis_stream_watched_axes = 0xFFU;
-
-void motion_axis_hardware_set_stream_watched_axes(uint8_t axes_mask) { motion_axis_stream_watched_axes = axes_mask; }
+void motion_axis_hardware_set_stream_axis_watched(MotionAxis_t axis, uint8_t watched) {
+    if ((uint32_t)axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT) {
+        motion_axis_stream_owners[axis].watched = watched != 0U ? 1U : 0U;
+    }
+}
 
 /* A planned stream drives the X timer without a hardware status of its own. A switch that it moves toward records the
  * switch point and starts the braking, which the stream axis runs in its DMA interrupt. The start switch turning off
@@ -1462,7 +1492,8 @@ static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
         return;
     }
     /* An axis the blocks do not move has no meaningful direction; its parked switch would stop the other axes. */
-    if (((motion_axis_stream_watched_axes >> (uint32_t)axis) & 1U) == 0U) {
+    const MotionAxisStreamOwner_t *owner = &motion_axis_stream_owners[axis];
+    if (owner->watched == 0U) {
         return;
     }
     const uint8_t toward_end = motion_axis_direction_toward_end(c, c->current_direction_positive);
@@ -1480,9 +1511,9 @@ static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
     if (c->stop_reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
         c->stop_reason = reason;
     }
-    const MotionAxisHardwareStreamLimitListener_t listener = motion_axis_stream_limit_listener;
+    const MotionAxisHardwareStreamLimitListener_t listener = owner->listener;
     if (listener != NULL) {
-        listener(motion_axis_stream_limit_listener_context, axis);
+        listener(owner->context, axis);
         return;
     }
     /* Safety net for a stream that runs with no owner registered: the axis brakes itself. */

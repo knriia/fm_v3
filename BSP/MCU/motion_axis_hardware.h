@@ -144,13 +144,21 @@ void motion_axis_hardware_poll_stream_limit(void);
 
 /* Who decides what a limit switch does to a running planned stream. The listener runs in the switch interrupt with the
  * axis that reached the switch, after the switch point is latched; it must not block and must start the braking.
- * Without a listener the axis brakes itself. Set it once, before the first stream starts. */
+ * Without a listener the axis brakes itself. */
 typedef void (*MotionAxisHardwareStreamLimitListener_t)(void *context, MotionAxis_t axis);
-void motion_axis_hardware_set_stream_limit_listener(MotionAxisHardwareStreamLimitListener_t listener, void *context);
+/* Makes the listener the owner of the stream channel of one axis: its switch reaches only this listener, so streams of
+ * different axes can have different owners at the same time. The owner changes only while the channel is IDLE (timer
+ * stopped, braking played): returns 1 when taken, 0 when the channel is busy (the old owner stays) or the axis is
+ * unknown. NULL as listener releases the channel to the self-braking safety net. */
+uint8_t motion_axis_hardware_set_stream_limit_listener(
+    MotionAxis_t axis,
+    MotionAxisHardwareStreamLimitListener_t listener,
+    void *context
+);
 
-/* The axes (bit = MotionAxis_t) whose switches the running stream reacts to: those that its blocks move. An axis that
- * only idles in the stream, e.g. X while Y homes, may stand on its start switch; that must neither stop the stream nor
- * leave a stop reason on it. Set before each stream starts; every axis is watched until it is set. */
-void motion_axis_hardware_set_stream_watched_axes(uint8_t axes_mask);
+/* Whether the running stream of the axis reacts to its switches: the axes that the blocks move. An axis that only idles
+ * in the stream, e.g. X while Y homes, may stand on its start switch; that must neither stop the stream nor leave a
+ * stop reason on it. Set before each stream starts; the axis is watched until it is set. */
+void motion_axis_hardware_set_stream_axis_watched(MotionAxis_t axis, uint8_t watched);
 
 #endif /* FM_V3_MOTION_AXIS_HARDWARE_H */

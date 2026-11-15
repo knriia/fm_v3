@@ -30,9 +30,6 @@
 /* DIR setup before the first STEP is at least this long; the shortest RTOS delay covers it. */
 #define STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS 1U
 
-/* Axes mask of motion_axis_hardware_set_stream_watched_axes that watches every axis. */
-#define STEP_GENERATOR_TASK_ALL_AXES_WATCHED 0xFFU
-
 #define STEP_GENERATOR_TASK_FLAG_BLOCK_READY (1UL << 0)
 #define STEP_GENERATOR_TASK_FLAG_STOP_RESET (1UL << 1)
 #define STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED (1UL << 2)
@@ -179,13 +176,17 @@ static StepStreamFeederAxisResult_t step_generator_task_group_result(StepStreamG
  * the stream may stand on its switch; its limit must not stop the axes that move. */
 static void step_generator_task_watch_moving_axes(StepGeneratorInstance_t *self) {
     const uint8_t moving_planner_axes = step_stream_feeder_get_moving_axes(&self->feeder);
-    uint8_t watched = 0U;
     for (uint32_t member = 0U; member < self->member_count; ++member) {
-        if (((moving_planner_axes >> self->member_planner_axes[member]) & 1U) != 0U) {
-            watched = (uint8_t)(watched | (1U << (uint32_t)self->member_axes[member]));
-        }
+        const uint8_t moves = (uint8_t)((moving_planner_axes >> self->member_planner_axes[member]) & 1U);
+        motion_axis_hardware_set_stream_axis_watched(self->member_axes[member], moves);
     }
-    motion_axis_hardware_set_stream_watched_axes(watched);
+}
+
+/* No stream runs: the axes of the instance are watched again until the next stream narrows them to those it moves. */
+static void step_generator_task_watch_all_axes(const StepGeneratorInstance_t *self) {
+    for (uint32_t member = 0U; member < self->member_count; ++member) {
+        motion_axis_hardware_set_stream_axis_watched(self->member_axes[member], 1U);
+    }
 }
 
 static StepStreamFeederAxisResult_t step_generator_task_port_prepare(void *context) {
@@ -528,12 +529,38 @@ step_generator_task_setup_feeder(StepGeneratorInstance_t *self, const StepGenera
     return (uint8_t)(step_stream_feeder_init(&self->feeder, &config, &ports) == STEP_STREAM_FEEDER_STATUS_OK);
 }
 
+/* Takes the channels of the members and the switch listeners of their axes for this instance. A channel that is not
+ * IDLE refuses and nothing stays taken: the member that refused and those before it are let go. */
+static uint8_t step_generator_task_claim_channels(StepGeneratorInstance_t *self) {
+    for (uint32_t member = 0U; member < self->member_count; ++member) {
+        const uint8_t taken = (uint8_t)(step_stream_axis_set_listener(
+                                            step_generator_task_member_axis(self, member),
+                                            &self->stream_listeners[member]
+                                        ) == STEP_STREAM_AXIS_STATUS_OK &&
+                                        motion_axis_hardware_set_stream_limit_listener(
+                                            self->member_axes[member],
+                                            step_generator_task_limit_reached,
+                                            self
+                                        ) != 0U);
+        if (taken == 0U) {
+            for (uint32_t claimed = 0U; claimed <= member; ++claimed) {
+                (void)step_stream_axis_set_listener(step_generator_task_member_axis(self, claimed), NULL);
+                (void)motion_axis_hardware_set_stream_limit_listener(self->member_axes[claimed], NULL, NULL);
+            }
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
 void StepGeneratorTask(void *argument) {
     StepGeneratorInstance_t *const self = &step_generator_task_instance;
     step_generator_task_thread_id = osThreadGetId();
-    const uint8_t feeder_ready = step_generator_task_setup_feeder(self, argument);
+    const uint8_t channels_ready = step_generator_task_claim_channels(self);
+    const uint8_t feeder_ready =
+        (uint8_t)(channels_ready != 0U && step_generator_task_setup_feeder(self, argument) != 0U);
     if (feeder_ready == 0U) {
-        /* No usable timing: the task cannot feed the axis, so it refuses all work instead of guessing. */
+        /* No channel or no usable timing: the task cannot feed the axis, so it refuses all work instead of guessing. */
         step_generator_counter_increment(&self->diagnostics.generator_errors);
         step_generator_task_set_halted(
             self,
@@ -542,13 +569,6 @@ void StepGeneratorTask(void *argument) {
             0U
         );
     }
-    for (uint32_t member = 0U; member < self->member_count; ++member) {
-        (void)step_stream_axis_set_listener(
-            step_generator_task_member_axis(self, member),
-            &self->stream_listeners[member]
-        );
-    }
-    motion_axis_hardware_set_stream_limit_listener(step_generator_task_limit_reached, self);
 
     uint32_t flags = 0U;
     for (;;) {
@@ -556,8 +576,7 @@ void StepGeneratorTask(void *argument) {
             /* The axis has stopped and this task is not filling, so the feeder owns no running stream. */
             /* Lift the halt first: a STOP that arrives during the reset then stays in force. */
             self->halted = 0U;
-            /* No stream runs: watch every axis again until the next one narrows it to the axes it moves. */
-            motion_axis_hardware_set_stream_watched_axes(STEP_GENERATOR_TASK_ALL_AXES_WATCHED);
+            step_generator_task_watch_all_axes(self);
             step_stream_feeder_reset(&self->feeder);
             if (step_stream_group_reset(&self->group) != STEP_STREAM_GROUP_STATUS_OK) {
                 /* A channel still runs after STOP: nothing may be fed until the next STOP. */
