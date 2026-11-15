@@ -90,6 +90,11 @@ static StepGeneratorTaskConfig_t step_generator_task_config;
 /* The queue of the printing stream: MotionTask pushes into it, StepGeneratorTask plays it, DiagnosticTask reports it. */
 static PlanBuffer_t print_plan_buffer;
 static MotionPlanBlock_t print_plan_buffer_entries[PLAN_BUFFER_CAPACITY];
+/* The queues of the HOME and CALIBRATE streams, one per axis (X, Y, Z): a homing move is a single block, and the next one
+ * is queued only after the stream has been flushed, so two entries are enough. */
+#define AXIS_PLAN_BUFFER_CAPACITY 2U
+static PlanBuffer_t axis_plan_buffers[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT];
+static MotionPlanBlock_t axis_plan_buffer_entries[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT][AXIS_PLAN_BUFFER_CAPACITY];
 static const osThreadAttr_t motion_task_attr = {
   .name = MOTION_TASK_NAME,
   .stack_size = MOTION_TASK_STACK_SIZE_BYTES,
@@ -131,6 +136,16 @@ void MX_FREERTOS_Init(void)
   if (plan_buffer_init(&print_plan_buffer, print_plan_buffer_entries, PLAN_BUFFER_CAPACITY) != PLAN_BUFFER_STATUS_OK)
   {
     Error_Handler();
+  }
+
+  for (uint32_t axis = 0U; axis < STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT; ++axis)
+  {
+    if (plan_buffer_init(&axis_plan_buffers[axis], axis_plan_buffer_entries[axis], AXIS_PLAN_BUFFER_CAPACITY) !=
+        PLAN_BUFFER_STATUS_OK)
+    {
+      Error_Handler();
+    }
+    step_generator_task_config.axis_plan_buffers[axis] = &axis_plan_buffers[axis];
   }
 
   motion_task_context.plan_buffer = &print_plan_buffer;

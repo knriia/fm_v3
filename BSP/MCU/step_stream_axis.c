@@ -674,7 +674,11 @@ StepStreamAxisStatus_t step_stream_axis_set_listener(StepStreamAxis_t *axis, con
         return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
     }
     const uint32_t primask = step_stream_axis_enter_critical();
-    if (axis->state == STEP_STREAM_AXIS_STATE_STREAMING) {
+    /* A channel that has an owner refuses another one: the second owner would silently take over the interrupts. The
+     * owner may set its listener again. */
+    const uint8_t owned_by_other =
+        (uint8_t)(listener != NULL && axis->listener_context != NULL && axis->listener_context != listener->context);
+    if (axis->state == STEP_STREAM_AXIS_STATE_STREAMING || owned_by_other != 0U) {
         step_stream_axis_exit_critical(primask);
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
@@ -682,6 +686,28 @@ StepStreamAxisStatus_t step_stream_axis_set_listener(StepStreamAxis_t *axis, con
     axis->on_fault = listener != NULL ? listener->on_fault : NULL;
     axis->on_brake = listener != NULL ? listener->on_brake : NULL;
     axis->listener_context = listener != NULL ? listener->context : NULL;
+    step_stream_axis_exit_critical(primask);
+    return STEP_STREAM_AXIS_STATUS_OK;
+}
+
+StepStreamAxisStatus_t step_stream_axis_release_listener(StepStreamAxis_t *axis, const void *context) {
+    if (axis == NULL || context == NULL) {
+        return STEP_STREAM_AXIS_STATUS_INVALID_ARGUMENT;
+    }
+    const uint32_t primask = step_stream_axis_enter_critical();
+    if (axis->listener_context != context) {
+        /* Not the owner: the listener of another owner stays, and there is nothing of this one to let go. */
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_OK;
+    }
+    if (axis->state == STEP_STREAM_AXIS_STATE_STREAMING) {
+        step_stream_axis_exit_critical(primask);
+        return STEP_STREAM_AXIS_STATUS_BUSY;
+    }
+    axis->on_half_released = NULL;
+    axis->on_fault = NULL;
+    axis->on_brake = NULL;
+    axis->listener_context = NULL;
     step_stream_axis_exit_critical(primask);
     return STEP_STREAM_AXIS_STATUS_OK;
 }

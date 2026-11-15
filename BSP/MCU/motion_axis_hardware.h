@@ -148,8 +148,10 @@ void motion_axis_hardware_poll_stream_limit(void);
 typedef void (*MotionAxisHardwareStreamLimitListener_t)(void *context, MotionAxis_t axis);
 /* Makes the listener the owner of the stream channel of one axis: its switch reaches only this listener, so streams of
  * different axes can have different owners at the same time. The owner changes only while the channel is IDLE (timer
- * stopped, braking played): returns 1 when taken, 0 when the channel is busy (the old owner stays) or the axis is
- * unknown. NULL as listener releases the channel to the self-braking safety net. */
+ * stopped, braking played): returns 1 when taken, 0 when the channel is busy (the old owner stays), another owner
+ * already holds it (a listener with another context), or the axis is unknown; the owner may take it again. NULL as
+ * listener lets go of the channel (back to the self-braking safety net) only when `context` is the owner's; it returns
+ * 1 for a channel the caller does not own too, because there is nothing of the caller's to let go of. */
 uint8_t motion_axis_hardware_set_stream_limit_listener(
     MotionAxis_t axis,
     MotionAxisHardwareStreamLimitListener_t listener,

@@ -57,8 +57,13 @@ typedef struct {
     void *context;
 } StepStreamAxisListener_t;
 
-/* Pass NULL to remove the callbacks. Returns BUSY while the axis is STREAMING. */
+/* Makes the listener the owner of the channel. Returns BUSY while the axis is STREAMING and while another owner (a
+ * listener with another context) holds the channel; the owner itself may call it again. Pass NULL to remove the
+ * callbacks whoever holds them: use step_stream_axis_release_listener to let go of one's own. */
 StepStreamAxisStatus_t step_stream_axis_set_listener(StepStreamAxis_t *axis, const StepStreamAxisListener_t *listener);
+/* Lets go of the channel when `context` is its owner; the listener of another owner stays and the call returns OK.
+ * Returns BUSY while the owner's axis is STREAMING (the owner stays), INVALID_ARGUMENT for a NULL axis or context. */
+StepStreamAxisStatus_t step_stream_axis_release_listener(StepStreamAxis_t *axis, const void *context);
 /* Sticky: set by a ring fault, cleared by the next successful start. */
 StepStreamAxisFault_t step_stream_axis_get_fault(const StepStreamAxis_t *axis);
 /* After an UNDERRUN stop, steps_done counts only the valid ones up to the half boundary; the stale records the DMA

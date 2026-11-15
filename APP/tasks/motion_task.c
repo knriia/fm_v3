@@ -32,8 +32,8 @@ static volatile MotionTaskDiagnostics motion_task_diagnostics = {
 
 /* The planned step stream of each axis. */
 static StepExecutor_t motion_task_stream_executors[MOTION_AXIS_HARDWARE_COUNT];
-/* The queue the plans, the homing moves and the calibration moves go into. Set once when the task starts; the moves of
- * the calibration procedure carry no context, so the file keeps it. */
+/* The queue of the planned moves (the printing stream). Set once when the task starts. The homing and calibration moves
+ * go into the queue of the generator instance of their axis instead. */
 static PlanBuffer_t *motion_task_plan_buffer;
 
 /* The three homing moves; the switches, not step counts, end them. */
@@ -306,17 +306,18 @@ static uint8_t motion_task_limits_conflict(MotionAxis_t axis) {
                : 0U;
 }
 
-/* The generator instance that plays the moves of an axis: for now every stream axis belongs to the printing one. */
+/* The generator instance that plays the homing and calibration moves of an axis: one lane on that axis, with its own
+ * queue, so the axes of one command move independently. The planned moves of the print go through the printing
+ * instance, which this file reaches only through the plan buffer of its context. */
 static StepGeneratorInstance_t *motion_task_generator_for_axis(MotionAxis_t axis) {
-    (void)axis;
-    return step_generator_task_get_print_instance();
+    return step_generator_task_get_axis_instance(axis);
 }
 
-/* Returns the generator instance to its idle state: stops its stream, drops the queued blocks and waits until the task
+/* Returns the generator instance to its idle state: stops its stream, drops its queued blocks and waits until the task
  * has reset it. Returns 0 when it does not reset in time; the instance then stays halted until the next STOP. */
 static uint8_t motion_task_stream_flush(StepGeneratorInstance_t *generator) {
     step_generator_instance_halt(generator);
-    (void)plan_buffer_clear(motion_task_plan_buffer);
+    (void)plan_buffer_clear(step_generator_instance_get_plan_buffer(generator));
     step_generator_instance_resume_after_stop(generator);
     for (uint32_t waited_ms = 0U; step_generator_instance_is_busy(generator) != 0U; ++waited_ms) {
         if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
@@ -377,7 +378,8 @@ static uint8_t motion_task_stream_start_move(
     }
     /* The stop of the previous move is still recorded; the next poll must wait for the stop of this one. */
     motion_axis_hardware_clear_stop_reason(axis);
-    if (plan_buffer_try_push(motion_task_plan_buffer, &block) != PLAN_BUFFER_STATUS_OK) {
+    PlanBuffer_t *const queue = step_generator_instance_get_plan_buffer(motion_task_generator_for_axis(axis));
+    if (plan_buffer_try_push(queue, &block) != PLAN_BUFFER_STATUS_OK) {
         return 0U;
     }
     step_generator_task_notify_block_ready();
@@ -431,13 +433,14 @@ static void motion_task_home_begin(MotionTaskAxisState_t *state, MotionTaskConte
     if (context == NULL) {
         return;
     }
+    /* The axis is no longer where its zero was, whether or not the homing can start now. */
+    const uint8_t axis_mask = motion_task_axis_mask(state->axis);
+    context->machine_state.homed_axes_mask &= (uint8_t)~axis_mask;
     if (motion_task_hardware_is_active(motion_axis_hardware_get_status(state->axis)) != 0U) {
         return;
     }
 
-    const uint8_t axis_mask = motion_task_axis_mask(state->axis);
     state->home_phase = MOTION_TASK_HOME_IDLE;
-    context->machine_state.homed_axes_mask &= (uint8_t)~axis_mask;
     /* Queued blocks were planned from the old position of this axis. */
     (void)plan_buffer_clear(motion_task_plan_buffer);
     if (motion_task_limits_conflict(state->axis) != 0U) {
@@ -688,17 +691,42 @@ static uint8_t motion_task_busy_axes(const MotionTaskAxisState_t *states) {
     return busy_mask;
 }
 
-/* The axes share one plan buffer and one generator, so only one of them can home or calibrate at a time until the
- * group runs its axes independently. */
-static uint8_t motion_task_axes_are_single(uint8_t axes_mask) {
-    const uint8_t stream_axes = (uint8_t)(axes_mask & MOTION_TASK_STREAM_AXES_MASK);
-    return (stream_axes & (uint8_t)(stream_axes - 1U)) == 0U ? 1U : 0U;
+/* The axes whose single-axis generator instance is busy: it plays a homing or calibration move, or has not been reset
+ * after one yet. */
+static uint8_t motion_task_axis_streams_busy_axes(void) {
+    uint8_t busy_mask = 0U;
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        if (step_generator_instance_is_busy(motion_task_generator_for_axis((MotionAxis_t)axis)) != 0U) {
+            busy_mask |= motion_task_axis_mask((MotionAxis_t)axis);
+        }
+    }
+    return busy_mask;
+}
+
+/* The axes whose hardware moves right now; a command that names one of them is refused as a whole, so it never starts
+ * only some of its axes. */
+static uint8_t motion_task_active_hardware_axes(void) {
+    uint8_t active_mask = 0U;
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        if (motion_task_hardware_is_active(motion_axis_hardware_get_status((MotionAxis_t)axis)) != 0U) {
+            active_mask |= motion_task_axis_mask((MotionAxis_t)axis);
+        }
+    }
+    return active_mask;
+}
+
+/* The axes whose stream channels a generator instance holds: all of them while the printing stream is busy, plus the
+ * axes of the busy single-axis instances. HOME and CALIBRATE of other axes are not held up by the latter. */
+static uint8_t motion_task_stream_busy_axes(void) {
+    const uint8_t print_busy_mask = step_generator_instance_is_busy(step_generator_task_get_print_instance()) != 0U
+                                        ? MOTION_TASK_STREAM_AXES_MASK
+                                        : 0U;
+    return (uint8_t)(print_busy_mask | motion_task_axis_streams_busy_axes());
 }
 
 /* HOME and CALIBRATE name axes that can home and are idle; anything else refuses the whole command. */
 static uint8_t motion_task_axes_can_start(uint8_t axes_mask, uint8_t busy_mask) {
-    return axes_mask != 0U && (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) == 0U &&
-                   (axes_mask & busy_mask) == 0U && motion_task_axes_are_single(axes_mask) != 0U
+    return axes_mask != 0U && (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) == 0U && (axes_mask & busy_mask) == 0U
                ? 1U
                : 0U;
 }
@@ -759,6 +787,9 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
 static void motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
     (void)plan_buffer_clear(motion_task_plan_buffer);
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        /* The homing and calibration moves still queued were cut short as well. */
+        const StepGeneratorInstance_t *const generator = motion_task_generator_for_axis((MotionAxis_t)axis);
+        (void)plan_buffer_clear(step_generator_instance_get_plan_buffer(generator));
         motion_task_calibration_cancel(&states[axis]);
         motion_task_stop_axis(&states[axis], context);
     }
@@ -843,12 +874,10 @@ void MotionTask(void *argument) {
             continue;
         }
 
-        /* The planned stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE
-         * are refused meanwhile like any other command that finds the axis busy. */
-        const uint8_t stream_in_use =
-            (uint8_t)(step_generator_task_any_busy() != 0U || (busy_mask & MOTION_TASK_STREAM_AXES_MASK) != 0U);
+        /* A stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE are
+         * refused for those axes meanwhile like any other command that finds the axis busy. */
         const uint8_t start_busy_mask =
-            (uint8_t)(busy_mask | (stream_in_use != 0U ? MOTION_TASK_STREAM_AXES_MASK : 0U));
+            (uint8_t)(busy_mask | motion_task_stream_busy_axes() | motion_task_active_hardware_axes());
         if (command.code == COMMAND_CODE_HOME) {
             if (motion_task_axes_can_start(command.parameters.home.axes, start_busy_mask) != 0U) {
                 motion_task_start_axes(axes, context, command.parameters.home.axes, 0U);
@@ -857,7 +886,7 @@ void MotionTask(void *argument) {
             if (motion_task_axes_can_start(command.parameters.calibrate.axes, start_busy_mask) != 0U) {
                 motion_task_start_axes(axes, context, command.parameters.calibrate.axes, 1U);
             }
-        } else if (motion_task_is_xyz_move(&command) && busy_mask == 0U) {
+        } else if (motion_task_is_xyz_move(&command) && busy_mask == 0U && motion_task_axis_streams_busy_axes() == 0U) {
             motion_task_queue_xyz_move(context, &command);
         }
 
