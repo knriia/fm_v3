@@ -7,6 +7,7 @@
 #include "motion/step_executor.h"
 #include "motion_axis_hardware.h"
 #include "motion_task.h"
+#include "step_generator_task.h"
 
 #include <assert.h>
 #include <setjmp.h>
@@ -224,23 +225,57 @@ void step_generator_task_notify_block_ready(void) {
 
 static uint32_t test_generator_halts;
 static uint32_t test_generator_resumes;
+/* The part of the two counters above that came from STOP of all instances, not from one instance. */
+static uint32_t test_generator_all_halts;
+static uint32_t test_generator_all_resumes;
 static uint32_t test_queue_discards;
 /* After this many 1 ms waits the X axis reports READY; 0 keeps it moving. */
 static uint32_t test_axis_settles_after_delays;
 
-uint8_t step_generator_task_is_busy(void) { return test_generator_busy; }
+static char test_print_instance_token;
+static StepGeneratorInstance_t *const test_print_instance = (StepGeneratorInstance_t *)&test_print_instance_token;
 
-uint8_t step_generator_task_is_halted(void) { return test_generator_halted; }
+StepGeneratorInstance_t *step_generator_task_get_print_instance(void) { return test_print_instance; }
 
-void step_generator_task_halt(void) { ++test_generator_halts; }
+uint8_t step_generator_instance_is_busy(const StepGeneratorInstance_t *instance) {
+    return instance == test_print_instance ? test_generator_busy : 0U;
+}
+
+uint8_t step_generator_task_any_busy(void) { return test_generator_busy; }
+
+uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instance) {
+    return instance == test_print_instance ? test_generator_halted : 0U;
+}
+
+void step_generator_instance_halt(StepGeneratorInstance_t *instance) {
+    if (instance == test_print_instance) {
+        ++test_generator_halts;
+    }
+}
+
+void step_generator_task_halt_all(void) {
+    ++test_generator_halts;
+    ++test_generator_all_halts;
+}
 
 /* The reset of the real task leaves the generator idle. */
-void step_generator_task_resume_after_stop(void) {
+static void test_generator_reset(void) {
     ++test_generator_resumes;
     if (test_generator_reset_keeps_busy == 0U) {
         test_generator_busy = 0U;
     }
     test_generator_halted = 0U;
+}
+
+void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance) {
+    if (instance == test_print_instance) {
+        test_generator_reset();
+    }
+}
+
+void step_generator_task_resume_all_after_stop(void) {
+    ++test_generator_all_resumes;
+    test_generator_reset();
 }
 
 void command_queue_discard_all(void) { ++test_queue_discards; }
@@ -489,6 +524,8 @@ static void reset_receive_script(void) {
     test_block_ready_notifications = 0U;
     test_generator_halts = 0U;
     test_generator_resumes = 0U;
+    test_generator_all_halts = 0U;
+    test_generator_all_resumes = 0U;
     test_queue_discards = 0U;
     test_axis_settles_after_delays = 0U;
     test_calibration_load_status = CALIBRATION_STORE_STATUS_EMPTY;
@@ -1544,6 +1581,7 @@ static void test_stop_request_and_pipeline_reset(void) {
     reset_receive_script();
     motion_task_request_stop();
     expect_u32(test_generator_halts, 1U, "STOP halts the step generator at once");
+    expect_u32(test_generator_all_halts, 1U, "STOP halts every generator instance, not only one");
     expect_u32(fake_x_stop_requests, 1U, "STOP stops the pulses at once");
     expect_u32(test_queue_discards, 1U, "STOP drops the commands accepted before it");
 
@@ -1553,6 +1591,7 @@ static void test_stop_request_and_pipeline_reset(void) {
     fake_encoder_x_um = -1234;
     run_single_stop(&context, MOTION_AXIS_HARDWARE_STATUS_READY);
     expect_u32(test_generator_resumes, 1U, "STOP restarts the generator once the axis is at rest");
+    expect_u32(test_generator_all_resumes, 1U, "STOP resets every generator instance, not only one");
     expect_i64(context.machine_state.position_um[0], 1234, "after STOP X continues from the scale reading");
 
     reset_receive_script();
@@ -1734,6 +1773,8 @@ static void test_x_homing_through_the_stream(void) {
     expect_u32(fake_axes[MOTION_AXIS_X].release_stop_disarms, 1U, "the release stop is disarmed before the approach");
     expect_u32(test_generator_halts, 3U, "each stop of the homing stream halts the generator");
     expect_u32(test_generator_resumes, 3U, "each stop of the homing stream resets the generator");
+    expect_u32(test_generator_all_halts, 0U, "a homing stop halts the instance of the axis only");
+    expect_u32(test_generator_all_resumes, 0U, "a homing stop resets the instance of the axis only");
     expect_u32(test_block_ready_notifications, 3U, "each homing move is one block for the generator");
     expect_u32(fake_axes[MOTION_AXIS_X].bench_last_target_rate_hz, 100U, "the approach plays at the approach rate");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "X is homed");

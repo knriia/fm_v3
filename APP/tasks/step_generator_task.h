@@ -87,19 +87,33 @@ typedef struct {
 /* Turns plan blocks into ring records of the X stream axis, keeps its ring filled and starts and stops the stream.
  * argument is a const StepGeneratorTaskConfig_t * that outlives the task; without it the task only reports an error. */
 void StepGeneratorTask(void *argument);
+/* One stream: its feeder, channels, halt state and diagnostics. The task serves all instances; the type is opaque. */
+typedef struct StepGeneratorInstance StepGeneratorInstance_t;
+
+/* The instance of the printing stream (X, Y, Z); its diagnostics go into the diagnostic frame. */
+StepGeneratorInstance_t *step_generator_task_get_print_instance(void);
 /* Called by MotionTask after it pushes a block into PlanBuffer. */
 void step_generator_task_notify_block_ready(void);
 /* Called from the axis DMA interrupt when a ring half has been played and needs refilling. */
 void step_generator_task_notify_ring_half_released(void);
-/* STOP: stops the stream axis and feeding right away; callable from any task. */
-void step_generator_task_halt(void);
+/* Stops the instance's channels and feeding right away; callable from any task. A NULL instance does nothing. */
+void step_generator_instance_halt(StepGeneratorInstance_t *instance);
+/* STOP: halts every instance. */
+void step_generator_task_halt_all(void);
 /* 1 from the moment a planned block is queued until its stream has ended (also after a fault, until STOP resets the
- * task). Homing and calibration use the same timer as the stream, so they must not start while this is set. */
-uint8_t step_generator_task_is_busy(void);
-/* 1 while the task does not feed the axis: after STOP, a stop on a limit switch or a fault, until the reset below. */
-uint8_t step_generator_task_is_halted(void);
-/* After STOP, once the axis no longer moves: drop the started block and the held one, then go on. */
-void step_generator_task_resume_after_stop(void);
+ * instance). Homing and calibration use the same timers as the stream, so they must not start while this is set. A
+ * NULL instance is not busy. */
+uint8_t step_generator_instance_is_busy(const StepGeneratorInstance_t *instance);
+/* 1 if any instance is busy. */
+uint8_t step_generator_task_any_busy(void);
+/* 1 while the instance does not feed its channels: after STOP, a stop on a limit switch or a fault, until the reset
+ * below. A NULL instance reads as not halted. */
+uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instance);
+/* After STOP, once the channels no longer move: drop the started block and the held one of this instance, then go on.
+ * Other instances keep streaming. */
+void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance);
+/* The reset of every instance after STOP. */
+void step_generator_task_resume_all_after_stop(void);
 void step_generator_task_get_diagnostics(StepGeneratorTaskDiagnostics *diagnostics);
 void step_generator_task_get_stream_diagnostics(StepGeneratorTaskStreamDiagnostics_t *diagnostics);
 

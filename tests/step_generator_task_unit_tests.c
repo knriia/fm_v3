@@ -34,6 +34,10 @@ static void reset_test_plan_buffer(void) {
 /* Defined by the task source included below, where `static` is switched off for the tests. */
 /* Defined after the include: the group of the one instance. */
 static StepStreamGroup_t *test_group(void);
+/* Same value as STEP_GENERATOR_TASK_FLAG_STOP_RESET, which the file under test defines after the mocks. */
+#define TEST_FLAG_STOP_RESET (1UL << 1)
+/* Asks the instance under test to reset, through its real resume function. */
+static void test_request_reset(void);
 
 typedef enum {
     TEST_ACTION_NONE = 0,
@@ -287,7 +291,7 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
         test_axis_streaming[TEST_CH_X] = 0U;
         test_axis_streaming[TEST_CH_Y] = 0U;
         test_axis_streaming[TEST_CH_Z] = 0U;
-        step_generator_task_halt();
+        step_generator_task_halt_all();
         expect_u32(
             step_stream_group_get_state(test_group()),
             STEP_STREAM_GROUP_STATE_FAULT,
@@ -297,6 +301,10 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
     case TEST_ACTION_NONE:
     default:
         break;
+    }
+    /* The reset flag a wait returns is the one the real resume sets, so the request goes through the real function. */
+    if ((test_wait_results[index] & TEST_FLAG_STOP_RESET) != 0U) {
+        test_request_reset();
     }
     return test_wait_results[index];
 }
@@ -466,6 +474,10 @@ MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t 
 
 #define static
 #include "../APP/tasks/step_generator_task.c"
+
+_Static_assert(TEST_FLAG_STOP_RESET == STEP_GENERATOR_TASK_FLAG_STOP_RESET, "the mock returns the reset flag of the task");
+
+static void test_request_reset(void) { step_generator_instance_resume_after_stop(&step_generator_task_instance); }
 #undef static
 
 static StepStreamGroup_t *test_group(void) { return &step_generator_task_instance.group; }
@@ -823,14 +835,14 @@ static void test_channels_on_different_clocks_disable_feeding(void) {
 static void test_stop_halts_and_resets(void) {
     reset_fixture();
     push_block(5U, 3);
-    expect_u32(step_generator_task_is_halted(), 0U, "a fresh task is not halted");
-    step_generator_task_halt();
+    expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 0U, "a fresh task is not halted");
+    step_generator_task_halt_all();
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP stops the channel of X at once");
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP stops the channel of Y at once");
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP stops the channel of Z at once");
     expect_u32(test_wrong_axis_calls, 0U, "STOP reaches the channels of X, Y and Z only");
     expect_u32(step_generator_task_instance.halted, 1U, "STOP halts feeding");
-    expect_u32(step_generator_task_is_halted(), 1U, "the halt is visible to MotionTask");
+    expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 1U, "the halt is visible to MotionTask");
     test_wait_script_count = 1U;
     test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
     expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "halted task only waits");
@@ -839,7 +851,7 @@ static void test_stop_halts_and_resets(void) {
 
     reset_fixture();
     push_block(6U, 3);
-    step_generator_task_halt();
+    step_generator_task_halt_all();
     test_wait_script_count = 1U;
     test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
     expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task resets on the STOP reset flag");
@@ -848,11 +860,119 @@ static void test_stop_halts_and_resets(void) {
     expect_u32(test_start_calls[TEST_CH_X], 1U, "feeding goes on after the reset");
 
     reset_fixture();
-    step_generator_task_resume_after_stop();
+    step_generator_instance_resume_after_stop(&step_generator_task_instance);
     expect_u32(test_flags_set_calls, 0U, "resume before the task starts is ignored");
+    expect_u32(step_generator_task_instance.reset_requested, 0U, "resume before the task starts leaves no request");
     step_generator_task_thread_id = TEST_THREAD_ID;
-    step_generator_task_resume_after_stop();
+    step_generator_instance_resume_after_stop(&step_generator_task_instance);
     expect_u32(test_flags_set_value, STEP_GENERATOR_TASK_FLAG_STOP_RESET, "resume sets the reset flag");
+    expect_u32(step_generator_task_instance.reset_requested, 1U, "resume marks the instance for the reset");
+}
+
+static void test_instance_api(void) {
+    reset_fixture();
+    expect_true(
+        step_generator_task_get_print_instance() == &step_generator_task_instance,
+        "the print instance is the one the task serves"
+    );
+
+    /* A NULL instance is idle and ignores every request. */
+    step_generator_instance_halt(NULL);
+    step_generator_instance_resume_after_stop(NULL);
+    expect_u32(step_generator_instance_is_busy(NULL), 0U, "NULL instance is not busy");
+    expect_u32(step_generator_instance_is_halted(NULL), 0U, "NULL instance is not halted");
+    expect_u32(step_generator_task_instance.halts_total, 0U, "NULL halt touches no instance");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_stop_calls[channel], 0U, "NULL halt stops no channel");
+    }
+    expect_u32(step_generator_task_instance.reset_requested, 0U, "NULL resume touches no instance");
+    expect_u32(test_flags_set_calls, 0U, "NULL resume signals nothing");
+
+    /* One instance: halt stops its channels and records the cause. */
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "instance halt stops the channel of X");
+    expect_u32(step_generator_task_instance.halted, 1U, "instance halt halts feeding");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL,
+        "instance halt records a halt call"
+    );
+
+    /* STOP of all instances reaches the same channels. */
+    reset_fixture();
+    step_generator_task_halt_all();
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP of all stops the channel of X");
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP of all stops the channel of Y");
+    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP of all stops the channel of Z");
+    expect_u32(step_generator_task_instance.halts_total, 1U, "STOP of all halts the instance once");
+
+    /* Resume marks the instance, then wakes the task. */
+    reset_fixture();
+    step_generator_task_thread_id = TEST_THREAD_ID;
+    step_generator_task_resume_all_after_stop();
+    expect_u32(step_generator_task_instance.reset_requested, 1U, "resume of all marks the instance");
+    expect_u32(test_flags_set_value, STEP_GENERATOR_TASK_FLAG_STOP_RESET, "resume of all wakes the task");
+
+    /* The task takes the mark when it resets the instance. */
+    reset_fixture();
+    push_block(8U, 3);
+    step_generator_task_halt_all();
+    step_generator_task_thread_id = TEST_THREAD_ID;
+    step_generator_instance_resume_after_stop(&step_generator_task_instance);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_task_instance.reset_requested, 0U, "the reset consumes the request");
+    expect_u32(step_generator_task_instance.diagnostics.stop_resets, 1U, "one request resets once");
+
+    /* Without a request the halt stays. */
+    reset_fixture();
+    push_block(9U, 3);
+    step_generator_task_halt_all();
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_task_instance.diagnostics.stop_resets, 0U, "no request, no reset");
+    expect_u32(step_generator_task_instance.halted, 1U, "the halt stays without a request");
+
+    /* Two instances: a STOP, a request and the busy flag of one do not reach the other. */
+    reset_fixture();
+    static StepGeneratorInstance_t other;
+    other = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL;
+    other.plan_buffer = &test_plan_buffer;
+    StepGeneratorInstance_t *const pair[] = {&step_generator_task_instance, &other};
+    step_generator_task_halt_list(&pair[0], 1U);
+    expect_u32(step_generator_task_instance.halted, 1U, "the halted instance is halted");
+    expect_u32(other.halted, 0U, "the other instance keeps feeding");
+    step_generator_task_thread_id = TEST_THREAD_ID;
+    step_generator_task_resume_list(&pair[1], 1U);
+    expect_u32(other.reset_requested, 1U, "the other instance is marked for reset");
+    expect_u32(step_generator_task_instance.reset_requested, 0U, "the first instance is not marked");
+    step_generator_task_halt_list(pair, 2U);
+    expect_u32(other.halted, 1U, "STOP of the list halts the second instance");
+    expect_u32(other.halts_total, 1U, "the second instance counts its halt once");
+    expect_u32(step_generator_task_instance.halts_total, 2U, "the first instance counts both halts");
+    expect_u32(step_generator_task_any_busy_in_list(pair, 2U), 0U, "no instance of the list is busy");
+    other.stream_busy = 1U;
+    expect_u32(step_generator_task_any_busy_in_list(pair, 2U), 1U, "the busy second instance is found");
+    expect_u32(step_generator_task_any_busy_in_list(pair, 1U), 0U, "the first instance alone is not busy");
+    step_generator_task_resume_list(pair, 2U);
+    expect_u32(step_generator_task_instance.reset_requested, 1U, "resume of the list marks the first instance");
+
+    /* A channel claimed by an instance that could not be set up is let go. */
+    reset_fixture();
+    test_task_config.plan_buffer = NULL;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_listener_releases[channel], 1U, "the channel of a failed setup is released once");
+    }
+
+    /* Busy of all instances follows the queue of the instance. */
+    reset_fixture();
+    expect_u32(step_generator_task_any_busy(), 0U, "idle instances are not busy");
+    push_block(10U, 3);
+    expect_u32(step_generator_task_any_busy(), 1U, "a queued block makes the task busy");
 }
 
 static void test_start_is_refused_while_halted(void) {
@@ -930,10 +1050,10 @@ static void test_direction_goes_to_the_axis_of_the_lane(void) {
 
 static void test_busy_covers_queue_and_stream(void) {
     reset_fixture();
-    expect_u32(step_generator_task_is_busy(), 0U, "idle task with an empty plan is not busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 0U, "idle task with an empty plan is not busy");
 
     push_block(20U, 3);
-    expect_u32(step_generator_task_is_busy(), 1U, "a queued block makes the task busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 1U, "a queued block makes the task busy");
 
     /* Looking at the block takes nothing; giving it back is what the busy flag has to survive. */
     const uint32_t epoch = step_generator_task_port_plan_epoch(&step_generator_task_instance);
@@ -960,7 +1080,7 @@ static void test_busy_covers_queue_and_stream(void) {
         1U,
         "giving a block back marks the stream before the plan is empty"
     );
-    expect_u32(step_generator_task_is_busy(), 1U, "a block taken from the plan keeps the task busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 1U, "a block taken from the plan keeps the task busy");
     expect_u32(
         step_generator_task_port_peek_block(&step_generator_task_instance, epoch, 0U, &seen),
         STEP_STREAM_FEEDER_PLAN_NONE,
@@ -998,13 +1118,13 @@ static void test_busy_covers_queue_and_stream(void) {
     test_wait_results[1] = STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED;
     test_wait_actions[1] = TEST_ACTION_RELEASE_HALF_1;
     (void)run_task_until_jump(&test_task_config);
-    expect_u32(step_generator_task_is_busy(), 0U, "an ended stream is not busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 0U, "an ended stream is not busy");
 
     reset_fixture();
     push_block(22U, 3);
     test_fail_start_channel = TEST_CH_X;
     (void)run_task_until_jump(&test_task_config);
-    expect_u32(step_generator_task_is_busy(), 1U, "a faulted stream stays busy until STOP");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 1U, "a faulted stream stays busy until STOP");
 
     reset_fixture();
     step_generator_task_instance.stream_busy = 1U;
@@ -1012,7 +1132,7 @@ static void test_busy_covers_queue_and_stream(void) {
     test_wait_script_count = 1U;
     test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
     (void)run_task_until_jump(&test_task_config);
-    expect_u32(step_generator_task_is_busy(), 0U, "STOP reset clears the busy flag");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 0U, "STOP reset clears the busy flag");
 }
 
 static void test_faults_halt_the_task(void) {
@@ -1220,7 +1340,7 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     expect_u32(stream.halt_member, STEP_GENERATOR_TASK_NO_MEMBER, "no halt, no member");
     expect_u32(stream.halts_total, 0U, "no halt is counted");
 
-    step_generator_task_halt();
+    step_generator_task_halt_all();
     step_generator_task_get_stream_diagnostics(&stream);
     expect_u32(stream.halted, 1U, "STOP halts");
     expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, "STOP is named as the cause");
@@ -1242,7 +1362,7 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     expect_u32(stream.members[2].limit_trips, 0U, "Z reported no switch");
 
     /* MotionTask ends the move after the switch stopped it: that second halt must not hide the switch. */
-    step_generator_task_halt();
+    step_generator_task_halt_all();
     step_generator_task_get_stream_diagnostics(&stream);
     expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "a later halt keeps the first cause");
     expect_u32(stream.halt_member, 1U, "a later halt keeps the first member");
@@ -1250,7 +1370,7 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
 
     /* After the reset the next halt records its own cause. */
     step_generator_task_instance.halted = 0U;
-    step_generator_task_halt();
+    step_generator_task_halt_all();
     step_generator_task_get_stream_diagnostics(&stream);
     expect_u32(
         stream.halt_cause,
@@ -1674,7 +1794,7 @@ static void test_config_without_plan_buffer_halts_the_task(void) {
     );
     expect_true(step_generator_task_instance.plan_buffer == NULL, "the task keeps no queue the config did not name");
     /* The task has no queue to look at, so the block of the fixture's buffer is not its work. */
-    expect_u32(step_generator_task_is_busy(), 0U, "a task without a queue is not busy");
+    expect_u32(step_generator_instance_is_busy(&step_generator_task_instance), 0U, "a task without a queue is not busy");
     PlanBufferDiagnostics_t plan_diagnostics = {0};
     (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_diagnostics);
     expect_u32(plan_diagnostics.queued, 1U, "the block of the other queue stays untouched");
@@ -1797,6 +1917,7 @@ int main(void) {
         test_axis_markers[channel] = (int)channel;
     }
     test_task_streams_a_block();
+    test_instance_api();
     test_y_and_xy_blocks_reach_their_channels();
     test_z_and_xyz_blocks_reach_their_channels();
     test_idle_stream_stops();
