@@ -12,6 +12,15 @@
 #include <stdio.h>
 #include <string.h>
 
+/* The queue of the stream under test. */
+static PlanBuffer_t test_plan_buffer;
+static MotionPlanBlock_t test_plan_buffer_entries[PLAN_BUFFER_CAPACITY];
+
+static void reset_test_plan_buffer(void) {
+    (void)memset(&test_plan_buffer, 0, sizeof(test_plan_buffer));
+    (void)memset(test_plan_buffer_entries, 0, sizeof(test_plan_buffer_entries));
+}
+
 #define TEST_THREAD_ID ((osThreadId_t)(uintptr_t)0x5678U)
 #define TEST_WAIT_SCRIPT_LENGTH 4U
 #define TEST_TIMER_CLOCK_HZ 275000000U
@@ -151,7 +160,7 @@ static MotionPlanBlock_t make_block(uint32_t sequence, int64_t x_steps, int64_t 
 
 static void push_block_xyz(uint32_t sequence, int64_t x_steps, int64_t y_steps, int64_t z_steps) {
     const MotionPlanBlock_t block = make_block_xyz(sequence, x_steps, y_steps, z_steps);
-    expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "test block is queued");
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "test block is queued");
 }
 
 static void push_block_xy(uint32_t sequence, int64_t x_steps, int64_t y_steps) {
@@ -426,11 +435,15 @@ MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t 
 static StepStreamGroup_t *test_group(void) { return &step_generator_task_instance.group; }
 
 static StepGeneratorTaskConfig_t test_task_config;
-
 static void reset_fixture(void) {
-    plan_buffer_test_reset();
-    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_OK, "plan buffer initializes");
+    reset_test_plan_buffer();
+    expect_u32(
+        plan_buffer_init(&test_plan_buffer, test_plan_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "plan buffer initializes"
+    );
     step_generator_task_instance = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL;
+    step_generator_task_instance.plan_buffer = &test_plan_buffer;
     step_generator_task_thread_id = NULL;
     test_watched_axes = 0xFFU;
     test_watched_axes_calls = 0U;
@@ -481,6 +494,7 @@ static void reset_fixture(void) {
         .step_pulse_width_ns = 5000U,
         .step_low_time_ns = 2500U,
         .limit_deceleration_steps_per_s2 = 600000U,
+        .plan_buffer = &test_plan_buffer,
     };
     for (uint32_t index = 0U; index < TEST_WAIT_SCRIPT_LENGTH; ++index) {
         test_wait_results[index] = 0U;
@@ -700,7 +714,7 @@ static void test_unusable_timing_disables_feeding(void) {
     expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "missing config is counted");
     expect_u32(step_generator_task_instance.halted, 1U, "task is halted without a config");
     PlanBufferDiagnostics_t plan_diagnostics;
-    (void)plan_buffer_get_diagnostics(&plan_diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_diagnostics);
     expect_u32(plan_diagnostics.queued, 1U, "the block stays in the plan buffer");
 
     /* A STOP reset does not revive a task that has no feeder. */
@@ -915,7 +929,7 @@ static void test_busy_covers_queue_and_stream(void) {
         STEP_STREAM_FEEDER_PLAN_ERROR,
         "more blocks than queued cannot be given back"
     );
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(&test_plan_buffer);
     expect_u32(
         step_generator_task_port_peek_block(&step_generator_task_instance, epoch, 0U, &seen),
         STEP_STREAM_FEEDER_PLAN_STALE,
@@ -1038,7 +1052,7 @@ static void test_faults_halt_the_task(void) {
     reset_fixture();
     MotionPlanBlock_t invalid = make_block(13U, 3, 0);
     invalid.master_step_count = 0U;
-    expect_u32(plan_buffer_try_push(&invalid), PLAN_BUFFER_STATUS_OK, "invalid block is queued");
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &invalid), PLAN_BUFFER_STATUS_OK, "invalid block is queued");
     (void)run_task_until_jump(&test_task_config);
     expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "a rejected block is a generator error");
     expect_u32(step_generator_task_instance.halted, 1U, "a rejected block halts feeding");
@@ -1597,6 +1611,70 @@ static void test_callbacks_act_on_their_own_instance(void) {
     expect_u32(step_generator_task_instance.halts_total, 0U, "the printing instance counts no halt");
 }
 
+/* The config names the queue; the task reads that one and no other. */
+static void test_config_without_plan_buffer_halts_the_task(void) {
+    reset_fixture();
+    push_block(5U, 3);
+    test_task_config.plan_buffer = NULL;
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(test_prepare_calls[TEST_CH_X], 0U, "no stream without a queue");
+    expect_u32(test_start_calls[TEST_CH_X], 0U, "no channel starts without a queue");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "the missing queue is counted");
+    expect_u32(step_generator_task_instance.halted, 1U, "the task is halted without a queue");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_SETUP_FAILED,
+        "the missing queue is named as a failed setup"
+    );
+    expect_true(step_generator_task_instance.plan_buffer == NULL, "the task keeps no queue the config did not name");
+    /* The task has no queue to look at, so the block of the fixture's buffer is not its work. */
+    expect_u32(step_generator_task_is_busy(), 0U, "a task without a queue is not busy");
+    PlanBufferDiagnostics_t plan_diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_diagnostics);
+    expect_u32(plan_diagnostics.queued, 1U, "the block of the other queue stays untouched");
+    expect_u32(plan_diagnostics.dequeued_total, 0U, "nothing is taken from the other queue");
+}
+
+static void test_ports_read_the_queue_of_the_config(void) {
+    static PlanBuffer_t config_buffer;
+    static MotionPlanBlock_t config_buffer_entries[4];
+    reset_fixture();
+    (void)memset(&config_buffer, 0, sizeof(config_buffer));
+    expect_u32(
+        plan_buffer_init(&config_buffer, config_buffer_entries, 4U),
+        PLAN_BUFFER_STATUS_OK,
+        "the queue of the config initializes"
+    );
+    /* One clear gives it epoch 1; the fixture's queue stays at epoch 0. */
+    expect_u32(plan_buffer_clear(&config_buffer), PLAN_BUFFER_STATUS_OK, "the queue of the config clears");
+    const MotionPlanBlock_t config_block = make_block(6U, 3, 0);
+    expect_u32(plan_buffer_try_push(&config_buffer, &config_block), PLAN_BUFFER_STATUS_OK, "a block queues in the config queue");
+    push_block(7U, 3);
+
+    test_task_config.plan_buffer = &config_buffer;
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+
+    expect_true(step_generator_task_instance.plan_buffer == &config_buffer, "the task takes the queue of the config");
+    expect_u32(step_generator_task_port_plan_epoch(&step_generator_task_instance), 1U, "the epoch port reads the config queue");
+    expect_u32(plan_buffer_get_epoch(&test_plan_buffer), 0U, "the other queue was never cleared");
+    expect_u32(test_start_calls[TEST_CH_X], 1U, "the block of the config queue is streamed");
+    expect_u32(step_generator_task_instance.diagnostics.blocks_started, 1U, "exactly one block was started");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 0U, "a queue in the config is no error");
+
+    PlanBufferDiagnostics_t config_diagnostics = {0};
+    PlanBufferDiagnostics_t other_diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&config_buffer, &config_diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &other_diagnostics);
+    expect_u32(config_diagnostics.queued, 0U, "the streamed block left the config queue");
+    expect_u32(config_diagnostics.dequeued_total, 1U, "the config queue gave exactly its block");
+    expect_u32(other_diagnostics.queued, 1U, "the block of the other queue is not taken");
+    expect_u32(other_diagnostics.dequeued_total, 0U, "nothing is discarded from the other queue");
+}
+
 int main(void) {
     for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         test_axis_markers[channel] = (int)channel;
@@ -1622,6 +1700,8 @@ int main(void) {
     test_brake_ramp_is_built_from_the_driver_timing();
     test_brake_is_skipped_or_counted();
     test_callbacks_act_on_their_own_instance();
+    test_config_without_plan_buffer_halts_the_task();
+    test_ports_read_the_queue_of_the_config();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Step generator task unit tests failed: %u\n", (unsigned int)test_failures);

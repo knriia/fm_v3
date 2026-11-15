@@ -178,6 +178,15 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
 /* The plan buffer mutex is exercised in its own tests; here it only has to succeed. */
 static uint8_t test_plan_buffer_mutex;
 
+/* The queue every test context points to; the file keeps one, like the firmware does for printing. */
+static PlanBuffer_t test_plan_buffer;
+static MotionPlanBlock_t test_plan_buffer_entries[PLAN_BUFFER_CAPACITY];
+
+static void reset_test_plan_buffer(void) {
+    (void)memset(&test_plan_buffer, 0, sizeof(test_plan_buffer));
+    (void)memset(test_plan_buffer_entries, 0, sizeof(test_plan_buffer_entries));
+}
+
 osMutexId_t osMutexNew(const osMutexAttr_t *attr) {
     (void)attr;
     return &test_plan_buffer_mutex;
@@ -475,8 +484,8 @@ static void reset_receive_script(void) {
     motion_task_test_seed_diagnostics(NULL);
     motion_task_test_seed_diagnostics(&diagnostics);
     motion_task_test_reset_planner();
-    plan_buffer_test_reset();
-    (void)plan_buffer_init();
+    reset_test_plan_buffer();
+    (void)plan_buffer_init(&test_plan_buffer, test_plan_buffer_entries, PLAN_BUFFER_CAPACITY);
     test_block_ready_notifications = 0U;
     test_generator_halts = 0U;
     test_generator_resumes = 0U;
@@ -515,6 +524,7 @@ static MotionTaskContext_t valid_motion_context(void) {
             {
                 .max_step_event_rate_hz = 50000U,
             },
+        .plan_buffer = &test_plan_buffer,
     };
     for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
         context.planner_config.axis[axis] = (MotionPlannerAxisConfig_t){
@@ -592,7 +602,7 @@ static void test_successful_receive_marks_dequeue(void) {
 
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
     expect_u32(
-        plan_buffer_get_diagnostics(&plan_buffer_diagnostics),
+        plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics),
         PLAN_BUFFER_STATUS_OK,
         "plan buffer diagnostics are available"
     );
@@ -604,7 +614,7 @@ static void test_successful_receive_marks_dequeue(void) {
     expect_u32((uint32_t)context.machine_state.position_um[2], 0U, "planned Z is unchanged");
     MotionPlanBlock_t buffered_block = {0};
     expect_u32(
-        plan_buffer_try_pop(&buffered_block),
+        plan_buffer_try_pop(&test_plan_buffer, &buffered_block),
         PLAN_BUFFER_STATUS_OK,
         "plan is available to the next pipeline block"
     );
@@ -617,7 +627,7 @@ static void test_successful_receive_marks_dequeue(void) {
 static void test_fifo_commands_are_dequeued_once(void) {
     reset_receive_script();
     const MotionPlanBlock_t pending_plan = {.sequence = 90U};
-    expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before STOP");
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before STOP");
     const CommandDTO_t commands[] = {
         {.sequence = 102U, .code = COMMAND_CODE_HOME, .parameters.home = {.axes = 0x08U}},
         {.sequence = 103U, .code = COMMAND_CODE_STOP},
@@ -634,7 +644,7 @@ static void test_fifo_commands_are_dequeued_once(void) {
     }
     test_block_when_empty = 1U;
 
-    MotionTaskContext_t context = {0};
+    MotionTaskContext_t context = {.plan_buffer = &test_plan_buffer};
     expect_u32(
         (uint32_t)run_motion_task_until_scripted_stop(&context),
         2U,
@@ -653,14 +663,14 @@ static void test_fifo_commands_are_dequeued_once(void) {
     expect_u32(motion_task_test_get_planner_call_count(), 0U, "non-XYZ commands do not invoke MotionPlanner");
     expect_u32(diagnostics.planner_calls, 0U, "non-XYZ commands do not increment planner calls");
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, 0U, "STOP clears pending plans");
     expect_u32(plan_buffer_diagnostics.cancelled_blocks, 1U, "STOP counts cancelled plans");
 }
 
 static void test_receive_error_does_not_count_as_dequeue(void) {
     reset_receive_script();
-    MotionTaskContext_t context = {0};
+    MotionTaskContext_t context = {.plan_buffer = &test_plan_buffer};
     script_read(0U, osErrorResource, NULL);
     test_jump_on_delay = 1U;
 
@@ -715,8 +725,8 @@ static void test_diagnostic_counters_saturate(void) {
 static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     reset_receive_script();
     const MotionPlanBlock_t pending_plan = {.sequence = 91U};
-    expect_u32(plan_buffer_try_push(&pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before planner error");
-    MotionTaskContext_t context = {0};
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending_plan), PLAN_BUFFER_STATUS_OK, "pending plan exists before planner error");
+    MotionTaskContext_t context = {.plan_buffer = &test_plan_buffer};
     const CommandDTO_t command = {
         .sequence = 108U,
         .code = COMMAND_CODE_MOTION_OPERATION,
@@ -757,7 +767,7 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     );
     expect_u32(diagnostics.last_planner_sequence, 108U, "failed planner sequence is recorded");
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, 0U, "planner error clears pending plans");
     expect_u32(plan_buffer_diagnostics.cancelled_blocks, 1U, "planner error counts cancelled plans");
 }
@@ -766,7 +776,7 @@ static void test_xyz_command_without_position_change_counts_no_motion(void) {
     reset_receive_script();
     const MotionPlanBlock_t pending_plan = {.sequence = 92U};
     expect_u32(
-        plan_buffer_try_push(&pending_plan),
+        plan_buffer_try_push(&test_plan_buffer, &pending_plan),
         PLAN_BUFFER_STATUS_OK,
         "pending plan exists before no-motion command"
     );
@@ -797,7 +807,7 @@ static void test_xyz_command_without_position_change_counts_no_motion(void) {
     expect_u32(diagnostics.last_planner_status, MOTION_PLANNER_STATUS_NO_MOVEMENT, "no-movement status is recorded");
     expect_u32(diagnostics.last_planner_sequence, 111U, "no-movement sequence is recorded");
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, 1U, "no-motion result preserves earlier plans");
 }
 
@@ -805,7 +815,7 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
     reset_receive_script();
     for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
         const MotionPlanBlock_t block = {.sequence = sequence};
-        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "plan buffer fills before integration check");
+        expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "plan buffer fills before integration check");
     }
 
     MotionTaskContext_t context = valid_motion_context();
@@ -830,7 +840,7 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
     motion_task_get_diagnostics(&motion_diagnostics);
     expect_u32(motion_diagnostics.planner_blocks_created, 1U, "planner output remains distinct from buffer acceptance");
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&plan_buffer_diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, PLAN_BUFFER_CAPACITY, "full buffer retains existing plans");
     expect_u32(
         plan_buffer_diagnostics.enqueued_total,
@@ -842,7 +852,7 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
 
     MotionPlanBlock_t first_block = {0};
     expect_u32(
-        plan_buffer_try_pop(&first_block),
+        plan_buffer_try_pop(&test_plan_buffer, &first_block),
         PLAN_BUFFER_STATUS_OK,
         "existing plans remain consumable after full rejection"
     );
@@ -1226,7 +1236,7 @@ static void test_calibration_moves_play_through_the_stream(void) {
     expect_u32(mover->start(MOTION_AXIS_Y, &hardware, AXIS_BENCH_TOWARD_END, 777U, &profile), 1U, "Y move starts");
     expect_i64(fake_y.bench_last_signed_steps, 777, "the move of Y has the requested length");
     expect_u32(fake_y.bench_last_target_rate_hz, 2000U, "the move of Y runs at the target rate");
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(&test_plan_buffer);
 
     /* The same for Z: its own block, its own length and its own rate. */
     const uint32_t x_starts_before_z = fake_x_bench_starts;
@@ -1234,7 +1244,7 @@ static void test_calibration_moves_play_through_the_stream(void) {
     expect_i64(fake_z.bench_last_signed_steps, -555, "the move of Z has the requested length and direction");
     expect_u32(fake_z.bench_last_target_rate_hz, 2000U, "the move of Z runs at the target rate");
     expect_u32(fake_x_bench_starts, x_starts_before_z, "the move of Z does not move X");
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(&test_plan_buffer);
 
     fake_z.failing_start = fake_z.bench_starts + 1U;
     expect_u32(
@@ -1258,7 +1268,7 @@ static void test_calibration_moves_play_through_the_stream(void) {
     expect_i64(fake_x_bench_last_signed_steps, 12345, "the move has the requested length");
     expect_u32(fake_axes[MOTION_AXIS_X].bench_last_target_rate_hz, 2000U, "the move runs at the target rate");
     expect_u32(test_block_ready_notifications, notifications + 1U, "the generator is told about the block");
-    plan_buffer_test_reset();
+    reset_test_plan_buffer();
 
     test_generator_busy = 1U;
     test_generator_halted = 0U;
@@ -1702,7 +1712,7 @@ static void test_home_start_failures(void) {
 
     /* The plan buffer refuses the block (here: it is not initialized): homing aborts. */
     reset_receive_script();
-    plan_buffer_test_reset();
+    reset_test_plan_buffer();
     context = valid_motion_context();
     script_home_polls(0U);
     (void)run_motion_task_until_scripted_stop(&context);
@@ -2503,7 +2513,7 @@ static void test_planned_move_of_z_is_queued(void) {
     expect_i64(context.machine_state.position_um[0], 0, "X keeps its position");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "planning unhomes nothing");
     PlanBufferDiagnostics_t plan = {0};
-    (void)plan_buffer_get_diagnostics(&plan);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan);
     expect_u32(plan.queued, 1U, "the Z block is in the plan buffer");
 
     /* An XYZ move that includes Z is one block too. */
@@ -2651,7 +2661,7 @@ static void test_home_and_calibrate_are_refused_while_the_hardware_is_active(voi
             test_receive_keeps_generator_idle = 1U;
             MotionTaskContext_t context = valid_motion_context();
             const MotionPlanBlock_t pending = {.sequence = 90U};
-            expect_u32(plan_buffer_try_push(&pending), PLAN_BUFFER_STATUS_OK, "a block is queued before HOME");
+            expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending), PLAN_BUFFER_STATUS_OK, "a block is queued before HOME");
             script_axis_state(
                 (MotionAxis_t)axis,
                 0U,
@@ -2673,7 +2683,7 @@ static void test_home_and_calibrate_are_refused_while_the_hardware_is_active(voi
                 "a refused HOME leaves the axis homed"
             );
             PlanBufferDiagnostics_t plan = {0};
-            (void)plan_buffer_get_diagnostics(&plan);
+            (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan);
             expect_u32(plan.queued, 1U, "a refused HOME does not clear the plan buffer");
             expect_u32(test_block_ready_notifications, 0U, "a refused HOME queues no block");
             expect_u32(test_last_receive_timeout, osWaitForever, "a refused HOME leaves no homing to poll");
@@ -2762,7 +2772,59 @@ static void test_stop_waits_for_active_hardware_of_any_axis(void) {
     }
 }
 
+static void test_move_goes_to_the_queue_of_the_context(void) {
+    static PlanBuffer_t own_buffer;
+    static MotionPlanBlock_t own_buffer_entries[4];
+    reset_receive_script();
+    (void)memset(&own_buffer, 0, sizeof(own_buffer));
+    expect_u32(plan_buffer_init(&own_buffer, own_buffer_entries, 4U), PLAN_BUFFER_STATUS_OK, "the queue of the context initializes");
+
+    MotionTaskContext_t context = valid_motion_context();
+    context.plan_buffer = &own_buffer;
+    script_read(0U, osOK, &test_xyz_move_command);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+
+    PlanBufferDiagnostics_t own = {0};
+    PlanBufferDiagnostics_t shared = {0};
+    (void)plan_buffer_get_diagnostics(&own_buffer, &own);
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &shared);
+    expect_u32(own.queued, 1U, "the move is queued in the queue of the context");
+    expect_u32(own.enqueued_total, 1U, "the queue of the context counts the push");
+    expect_u32(shared.queued, 0U, "the other queue gets no block");
+    expect_u32(shared.enqueued_total, 0U, "the other queue counts no push");
+    expect_u32(test_block_ready_notifications, 1U, "the generator is woken for the block");
+    expect_i64(context.machine_state.position_um[0], 1000, "the next move starts at the target");
+
+    MotionPlanBlock_t block = {0};
+    expect_u32(plan_buffer_try_pop(&own_buffer, &block), PLAN_BUFFER_STATUS_OK, "the block is in the queue of the context");
+    expect_u32(block.sequence, 141U, "the block carries the sequence of the command");
+    expect_i64(block.step_delta[0], 80, "the block has the steps of 1000 um at 80 per 1000 um");
+}
+
+static void test_move_without_a_queue_is_dropped(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.plan_buffer = NULL;
+    script_read(0U, osOK, &test_xyz_move_command);
+    test_block_when_empty = 1U;
+    expect_u32((uint32_t)run_motion_task_until_scripted_stop(&context), 2U, "the task survives a context without a queue");
+
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.planner_blocks_created, 1U, "the planner still builds the block");
+    expect_u32(motion_task_get_last_planner_status(), MOTION_PLANNER_STATUS_OK, "the planner accepts the move");
+    expect_u32(test_block_ready_notifications, 0U, "no block is queued, so the generator is not woken");
+    expect_i64(context.machine_state.position_um[0], 0, "a dropped block does not move the planned position");
+    PlanBufferDiagnostics_t shared = {0};
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &shared);
+    expect_u32(shared.queued, 0U, "the other queue gets no block");
+    expect_u32(shared.enqueued_total, 0U, "the other queue counts no push");
+}
+
 int main(void) {
+    test_move_goes_to_the_queue_of_the_context();
+    test_move_without_a_queue_is_dropped();
     test_stored_calibration_sets_planner_limits();
     test_calibration_runs_after_homing_and_applies_result();
     test_calibration_failures();

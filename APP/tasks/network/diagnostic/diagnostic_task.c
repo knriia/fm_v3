@@ -149,9 +149,9 @@ static void diagnostic_task_collect_command_channel(CommandChannelDiagnosticsDTO
     };
 }
 
-static void diagnostic_task_collect_buffers(DiagnosticPayloadDTO_t *payload) {
+static void diagnostic_task_collect_buffers(DiagnosticPayloadDTO_t *payload, PlanBuffer_t *plan_buffer) {
     command_queue_get_diagnostics(&payload->command_queue);
-    (void)plan_buffer_get_diagnostics(&payload->plan_buffer);
+    (void)plan_buffer_get_diagnostics(plan_buffer, &payload->plan_buffer);
 
     payload->execution_buffer = (ExecutionBufferDiagnosticsDTO_t){
         .level = execution_buffer_count(),
@@ -184,7 +184,8 @@ static void diagnostic_task_collect_ethernet(EthernetDiagnosticsDTO_t *diagnosti
     diagnostics->rx_read_errors = rx.hal_read_data_errors;
 }
 
-static void diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePercentTracker *tracker) {
+static void
+diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePercentTracker *tracker, PlanBuffer_t *plan_buffer) {
     const uint32_t total_runtime_ticks = system_diagnostics_collect(&payload->system);
     diagnostic_task_collect_tasks(payload->tasks, tracker, total_runtime_ticks);
     diagnostic_task_collect_command_channel(&payload->command_channel);
@@ -193,7 +194,7 @@ static void diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePerc
     motion_task_get_axis_diagnostics(MOTION_AXIS_X, &payload->x_axis);
     motion_task_get_axis_diagnostics(MOTION_AXIS_Y, &payload->y_axis);
     motion_task_get_axis_diagnostics(MOTION_AXIS_Z, &payload->z_axis);
-    diagnostic_task_collect_buffers(payload);
+    diagnostic_task_collect_buffers(payload, plan_buffer);
     diagnostic_task_collect_ethernet(&payload->ethernet);
     lwip_diagnostics_collect(&payload->lwip);
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
@@ -203,14 +204,14 @@ static void diagnostic_task_collect(DiagnosticPayloadDTO_t *payload, RuntimePerc
 }
 
 void DiagnosticTask(void *argument) {
-    NetworkTaskContext *context = argument;
+    DiagnosticTaskContext *context = argument;
     RuntimePercentTracker runtime_tracker = {0};
 
     configASSERT(context != NULL);
-    configASSERT(context->lwip_flags != NULL);
+    configASSERT(context->network.lwip_flags != NULL);
 
     const uint32_t wait_result =
-        osEventFlagsWait(context->lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll | osFlagsNoClear, osWaitForever);
+        osEventFlagsWait(context->network.lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll | osFlagsNoClear, osWaitForever);
     configASSERT((wait_result & osFlagsError) == 0U);
 
     DiagnosticFrameDTO_t diagnostic_frame = {
@@ -245,7 +246,7 @@ void DiagnosticTask(void *argument) {
             for (;;) {
                 ++sequence;
                 diagnostic_frame.payload.sequence = sequence;
-                diagnostic_task_collect(&diagnostic_frame.payload, &runtime_tracker);
+                diagnostic_task_collect(&diagnostic_frame.payload, &runtime_tracker, context->plan_buffer);
 
                 size_t bytes_written = 0U;
                 const err_t write_error = netconn_write_partly(

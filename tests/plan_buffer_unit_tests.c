@@ -4,6 +4,15 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+
+static PlanBuffer_t test_buffer;
+static MotionPlanBlock_t test_buffer_entries[PLAN_BUFFER_CAPACITY];
+
+static void reset_test_buffer(void) {
+    (void)memset(&test_buffer, 0, sizeof(test_buffer));
+    (void)memset(test_buffer_entries, 0, sizeof(test_buffer_entries));
+}
 
 static uint32_t test_failures;
 static uint8_t test_mutex_object;
@@ -124,7 +133,7 @@ static void expect_block_equal(const MotionPlanBlock_t *actual, uint32_t sequenc
 }
 
 static void reset_buffer(void) {
-    plan_buffer_test_reset();
+    reset_test_buffer();
     test_mutex_new_fails = 0U;
     test_mutex_new_calls = 0U;
     test_mutex_attr_bits = 0U;
@@ -142,28 +151,28 @@ static void reset_buffer(void) {
 static void test_mutex_guards_every_operation(void) {
     reset_buffer();
     test_mutex_new_fails = 1U;
-    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_NO_MEMORY, "missing mutex fails initialization");
+    expect_u32(plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY), PLAN_BUFFER_STATUS_NO_MEMORY, "missing mutex fails initialization");
     PlanBufferDiagnostics_t diagnostics = {0};
-    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "buffer stays uninitialized without a mutex");
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "buffer stays uninitialized without a mutex");
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(test_mutex_acquire_calls, 0U, "uninitialized buffer does not lock");
 
     test_mutex_new_fails = 0U;
-    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_OK, "buffer initializes once the mutex is created");
+    expect_u32(plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY), PLAN_BUFFER_STATUS_OK, "buffer initializes once the mutex is created");
     expect_u32(test_mutex_new_calls, 2U, "mutex creation is retried on the next init");
     expect_u32(test_mutex_attr_bits, osMutexPrioInherit, "mutex uses priority inheritance");
 
     MotionPlanBlock_t block = make_block(1U);
     MotionPlanBlock_t output = {0};
-    (void)plan_buffer_try_push(&block);
-    (void)plan_buffer_try_push(NULL);
-    (void)plan_buffer_try_pop(&output);
-    (void)plan_buffer_try_pop(&output);
-    (void)plan_buffer_try_pop(NULL);
-    (void)plan_buffer_try_peek(plan_buffer_get_epoch(), 0U, &output);
-    (void)plan_buffer_discard(plan_buffer_get_epoch(), 0U);
-    (void)plan_buffer_clear();
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_try_push(&test_buffer, &block);
+    (void)plan_buffer_try_push(&test_buffer, NULL);
+    (void)plan_buffer_try_pop(&test_buffer, &output);
+    (void)plan_buffer_try_pop(&test_buffer, &output);
+    (void)plan_buffer_try_pop(&test_buffer, NULL);
+    (void)plan_buffer_try_peek(&test_buffer, plan_buffer_get_epoch(&test_buffer), 0U, &output);
+    (void)plan_buffer_discard(&test_buffer, plan_buffer_get_epoch(&test_buffer), 0U);
+    (void)plan_buffer_clear(&test_buffer);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(test_mutex_acquire_calls, 9U, "every operation on an initialized buffer locks");
     expect_u32(test_mutex_release_calls, 9U, "every lock is released");
     expect_u32(test_mutex_max_depth, 1U, "operations never nest locks");
@@ -172,11 +181,11 @@ static void test_mutex_guards_every_operation(void) {
     expect_u32(test_error_handler_calls, 0U, "successful locking raises no fault");
 
     test_mutex_acquire_result = osErrorParameter;
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(&test_buffer);
     expect_u32(test_error_handler_calls, 1U, "failed lock is a fatal error");
     test_mutex_acquire_result = osOK;
     test_mutex_release_result = osErrorResource;
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(&test_buffer);
     expect_u32(test_error_handler_calls, 2U, "failed unlock is a fatal error");
 }
 
@@ -186,47 +195,47 @@ static void test_initialization_and_preinit_results(void) {
     MotionPlanBlock_t output = {0};
     PlanBufferDiagnostics_t diagnostics = {0};
 
-    expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "push before init is rejected");
-    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "pop before init is rejected");
-    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "clear before init is rejected");
-    expect_u32(plan_buffer_try_push(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null push before init is rejected");
-    expect_u32(plan_buffer_try_pop(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null pop before init is rejected");
-    plan_buffer_get_diagnostics(NULL);
-    expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "preinit diagnostics are available");
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "push before init is rejected");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "pop before init is rejected");
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "clear before init is rejected");
+    expect_u32(plan_buffer_try_push(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null push before init is rejected");
+    expect_u32(plan_buffer_try_pop(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null pop before init is rejected");
+    plan_buffer_get_diagnostics(&test_buffer, NULL);
+    expect_u32(plan_buffer_get_diagnostics(&test_buffer, &diagnostics), PLAN_BUFFER_STATUS_OK, "preinit diagnostics are available");
     expect_u32(diagnostics.queued, 0U, "uninitialized buffer reports no queued blocks");
 
-    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_OK, "buffer initializes");
-    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_ALREADY_INITIALIZED, "buffer cannot be initialized twice");
-    expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "initialized diagnostics are available");
+    expect_u32(plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY), PLAN_BUFFER_STATUS_OK, "buffer initializes");
+    expect_u32(plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY), PLAN_BUFFER_STATUS_ALREADY_INITIALIZED, "buffer cannot be initialized twice");
+    expect_u32(plan_buffer_get_diagnostics(&test_buffer, &diagnostics), PLAN_BUFFER_STATUS_OK, "initialized diagnostics are available");
     expect_u32(diagnostics.queued, 0U, "new buffer starts empty");
 }
 
 static void test_fifo_full_wraparound_and_copy(void) {
     reset_buffer();
-    expect_u32(plan_buffer_init(), PLAN_BUFFER_STATUS_OK, "buffer initializes for FIFO test");
+    expect_u32(plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY), PLAN_BUFFER_STATUS_OK, "buffer initializes for FIFO test");
 
     for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
         MotionPlanBlock_t block = make_block(sequence);
-        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "buffer accepts every block while space remains");
+        expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "buffer accepts every block while space remains");
         if (sequence == 1U) {
             block = make_block(999U);
         }
     }
     MotionPlanBlock_t overflow = make_block(PLAN_BUFFER_CAPACITY + 1U);
-    expect_u32(plan_buffer_try_push(&overflow), PLAN_BUFFER_STATUS_FULL, "full buffer rejects without waiting");
+    expect_u32(plan_buffer_try_push(&test_buffer, &overflow), PLAN_BUFFER_STATUS_FULL, "full buffer rejects without waiting");
 
     MotionPlanBlock_t output = {0};
     for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY / 2U; ++sequence) {
-        expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_OK, "buffer returns head while populated");
+        expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "buffer returns head while populated");
         expect_block_equal(&output, sequence);
     }
     for (uint32_t sequence = PLAN_BUFFER_CAPACITY + 1U; sequence <= PLAN_BUFFER_CAPACITY + PLAN_BUFFER_CAPACITY / 2U; ++sequence) {
         const MotionPlanBlock_t block = make_block(sequence);
-        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "buffer reuses wrapped slots");
+        expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "buffer reuses wrapped slots");
     }
 
     PlanBufferDiagnostics_t diagnostics = {0};
-    expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "full-buffer diagnostics are available");
+    expect_u32(plan_buffer_get_diagnostics(&test_buffer, &diagnostics), PLAN_BUFFER_STATUS_OK, "full-buffer diagnostics are available");
     expect_u32(diagnostics.queued, PLAN_BUFFER_CAPACITY, "buffer reports full occupancy after wraparound");
     expect_u32(diagnostics.max_queued, PLAN_BUFFER_CAPACITY, "buffer records maximum occupancy");
     expect_u32(diagnostics.enqueued_total, PLAN_BUFFER_CAPACITY + PLAN_BUFFER_CAPACITY / 2U, "buffer counts successful pushes");
@@ -236,124 +245,124 @@ static void test_fifo_full_wraparound_and_copy(void) {
     for (uint32_t sequence = PLAN_BUFFER_CAPACITY / 2U + 1U;
          sequence <= PLAN_BUFFER_CAPACITY + PLAN_BUFFER_CAPACITY / 2U;
          ++sequence) {
-        expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_OK, "wrapped FIFO retains all remaining blocks");
+        expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "wrapped FIFO retains all remaining blocks");
         expect_block_equal(&output, sequence);
     }
-    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_EMPTY, "empty buffer reports empty result");
-    expect_u32(plan_buffer_get_diagnostics(&diagnostics), PLAN_BUFFER_STATUS_OK, "drained diagnostics are available");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_EMPTY, "empty buffer reports empty result");
+    expect_u32(plan_buffer_get_diagnostics(&test_buffer, &diagnostics), PLAN_BUFFER_STATUS_OK, "drained diagnostics are available");
     expect_u32(diagnostics.queued, 0U, "drained buffer reports zero occupancy");
 }
 
 static void test_clear_cancels_only_pending_blocks(void) {
     reset_buffer();
-    (void)plan_buffer_init();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
     MotionPlanBlock_t first = make_block(10U);
     MotionPlanBlock_t second = make_block(11U);
-    expect_u32(plan_buffer_try_push(&first), PLAN_BUFFER_STATUS_OK, "first block queues before clear");
-    expect_u32(plan_buffer_try_push(&second), PLAN_BUFFER_STATUS_OK, "second block queues before clear");
-    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_OK, "clear cancels queued blocks");
+    expect_u32(plan_buffer_try_push(&test_buffer, &first), PLAN_BUFFER_STATUS_OK, "first block queues before clear");
+    expect_u32(plan_buffer_try_push(&test_buffer, &second), PLAN_BUFFER_STATUS_OK, "second block queues before clear");
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "clear cancels queued blocks");
 
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.queued, 0U, "clear empties the buffer");
     expect_u32(diagnostics.cancelled_blocks, 2U, "clear counts cancelled blocks");
 
     const MotionPlanBlock_t after_clear = make_block(12U);
     MotionPlanBlock_t output = {0};
-    expect_u32(plan_buffer_try_push(&after_clear), PLAN_BUFFER_STATUS_OK, "buffer accepts plans after clear");
-    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_OK, "new plan can be read after clear");
+    expect_u32(plan_buffer_try_push(&test_buffer, &after_clear), PLAN_BUFFER_STATUS_OK, "buffer accepts plans after clear");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "new plan can be read after clear");
     expect_block_equal(&output, 12U);
-    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_OK, "clearing an empty buffer succeeds");
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "clearing an empty buffer succeeds");
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.cancelled_blocks, 2U, "empty clear cancels no additional blocks");
 }
 
 static void test_peek_reads_ahead_without_taking(void) {
     reset_buffer();
-    (void)plan_buffer_init();
-    const uint32_t epoch = plan_buffer_get_epoch();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    const uint32_t epoch = plan_buffer_get_epoch(&test_buffer);
     MotionPlanBlock_t output = {0};
     expect_u32(
-        plan_buffer_try_peek(epoch, 0U, &output),
+        plan_buffer_try_peek(&test_buffer, epoch, 0U, &output),
         PLAN_BUFFER_STATUS_EMPTY,
         "an empty buffer has nothing to peek"
     );
 
     for (uint32_t sequence = 1U; sequence <= 3U; ++sequence) {
         const MotionPlanBlock_t block = make_block(sequence);
-        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "buffer accepts blocks for the peek test");
+        expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "buffer accepts blocks for the peek test");
     }
     for (uint32_t offset = 0U; offset < 3U; ++offset) {
-        expect_u32(plan_buffer_try_peek(epoch, offset, &output), PLAN_BUFFER_STATUS_OK, "peek reads a queued block");
+        expect_u32(plan_buffer_try_peek(&test_buffer, epoch, offset, &output), PLAN_BUFFER_STATUS_OK, "peek reads a queued block");
         expect_block_equal(&output, offset + 1U);
     }
     expect_u32(
-        plan_buffer_try_peek(epoch, 3U, &output),
+        plan_buffer_try_peek(&test_buffer, epoch, 3U, &output),
         PLAN_BUFFER_STATUS_EMPTY,
         "peek behind the last block finds none"
     );
-    expect_u32(plan_buffer_try_peek(epoch, UINT32_MAX, &output), PLAN_BUFFER_STATUS_EMPTY, "a huge offset finds none");
+    expect_u32(plan_buffer_try_peek(&test_buffer, epoch, UINT32_MAX, &output), PLAN_BUFFER_STATUS_EMPTY, "a huge offset finds none");
 
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.queued, 3U, "peek takes nothing");
     expect_u32(diagnostics.dequeued_total, 0U, "peek is not a dequeue");
 
-    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_OK, "the front is still there after the peeks");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the front is still there after the peeks");
     expect_block_equal(&output, 1U);
 }
 
 static void test_discard_drops_the_front(void) {
     reset_buffer();
-    (void)plan_buffer_init();
-    const uint32_t epoch = plan_buffer_get_epoch();
-    expect_u32(plan_buffer_discard(epoch, 0U), PLAN_BUFFER_STATUS_OK, "discarding nothing is fine");
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    const uint32_t epoch = plan_buffer_get_epoch(&test_buffer);
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 0U), PLAN_BUFFER_STATUS_OK, "discarding nothing is fine");
     for (uint32_t sequence = 1U; sequence <= 5U; ++sequence) {
         const MotionPlanBlock_t block = make_block(sequence);
-        (void)plan_buffer_try_push(&block);
+        (void)plan_buffer_try_push(&test_buffer, &block);
     }
-    expect_u32(plan_buffer_discard(epoch, 2U), PLAN_BUFFER_STATUS_OK, "discard drops the first blocks");
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 2U), PLAN_BUFFER_STATUS_OK, "discard drops the first blocks");
 
     MotionPlanBlock_t output = {0};
-    expect_u32(plan_buffer_try_peek(epoch, 0U, &output), PLAN_BUFFER_STATUS_OK, "the front moved");
+    expect_u32(plan_buffer_try_peek(&test_buffer, epoch, 0U, &output), PLAN_BUFFER_STATUS_OK, "the front moved");
     expect_block_equal(&output, 3U);
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.queued, 3U, "discard shrinks the queue");
     expect_u32(diagnostics.dequeued_total, 2U, "discarded blocks count as dequeued");
 
-    expect_u32(plan_buffer_discard(epoch, 4U), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "more than queued is refused");
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 4U), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "more than queued is refused");
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.queued, 3U, "a refused discard changes nothing");
     expect_u32(diagnostics.rejected_operations, 1U, "a refused discard is counted");
-    expect_u32(plan_buffer_discard(epoch, 3U), PLAN_BUFFER_STATUS_OK, "everything queued can be discarded");
-    expect_u32(plan_buffer_try_peek(epoch, 0U, &output), PLAN_BUFFER_STATUS_EMPTY, "nothing is left after it");
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 3U), PLAN_BUFFER_STATUS_OK, "everything queued can be discarded");
+    expect_u32(plan_buffer_try_peek(&test_buffer, epoch, 0U, &output), PLAN_BUFFER_STATUS_EMPTY, "nothing is left after it");
 }
 
 static void test_peek_and_discard_wrap_around(void) {
     reset_buffer();
-    (void)plan_buffer_init();
-    const uint32_t epoch = plan_buffer_get_epoch();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    const uint32_t epoch = plan_buffer_get_epoch(&test_buffer);
     for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
         const MotionPlanBlock_t block = make_block(sequence);
-        (void)plan_buffer_try_push(&block);
+        (void)plan_buffer_try_push(&test_buffer, &block);
     }
     expect_u32(
-        plan_buffer_discard(epoch, PLAN_BUFFER_CAPACITY - 2U),
+        plan_buffer_discard(&test_buffer, epoch, PLAN_BUFFER_CAPACITY - 2U),
         PLAN_BUFFER_STATUS_OK,
         "discard nearly everything"
     );
     for (uint32_t sequence = PLAN_BUFFER_CAPACITY + 1U; sequence <= PLAN_BUFFER_CAPACITY + 3U; ++sequence) {
         const MotionPlanBlock_t block = make_block(sequence);
-        expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "the queue wraps");
+        expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "the queue wraps");
     }
     MotionPlanBlock_t output = {0};
     for (uint32_t offset = 0U; offset < 5U; ++offset) {
-        expect_u32(plan_buffer_try_peek(epoch, offset, &output), PLAN_BUFFER_STATUS_OK, "peek follows the wrap");
+        expect_u32(plan_buffer_try_peek(&test_buffer, epoch, offset, &output), PLAN_BUFFER_STATUS_OK, "peek follows the wrap");
         expect_block_equal(&output, PLAN_BUFFER_CAPACITY - 1U + offset);
     }
     expect_u32(
-        plan_buffer_try_peek(epoch, 5U, &output),
+        plan_buffer_try_peek(&test_buffer, epoch, 5U, &output),
         PLAN_BUFFER_STATUS_EMPTY,
         "the queue ends where it was pushed"
     );
@@ -361,27 +370,27 @@ static void test_peek_and_discard_wrap_around(void) {
 
 static void test_clear_makes_old_positions_stale(void) {
     reset_buffer();
-    (void)plan_buffer_init();
-    const uint32_t old_epoch = plan_buffer_get_epoch();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    const uint32_t old_epoch = plan_buffer_get_epoch(&test_buffer);
     const MotionPlanBlock_t first = make_block(1U);
-    (void)plan_buffer_try_push(&first);
-    (void)plan_buffer_clear();
-    const uint32_t new_epoch = plan_buffer_get_epoch();
+    (void)plan_buffer_try_push(&test_buffer, &first);
+    (void)plan_buffer_clear(&test_buffer);
+    const uint32_t new_epoch = plan_buffer_get_epoch(&test_buffer);
     expect_u32(new_epoch != old_epoch, 1U, "a clear changes the epoch");
-    (void)plan_buffer_clear();
-    expect_u32(plan_buffer_get_epoch() != new_epoch, 1U, "even a clear of an empty buffer changes it");
+    (void)plan_buffer_clear(&test_buffer);
+    expect_u32(plan_buffer_get_epoch(&test_buffer) != new_epoch, 1U, "even a clear of an empty buffer changes it");
 
     const MotionPlanBlock_t second = make_block(2U);
-    (void)plan_buffer_try_push(&second);
+    (void)plan_buffer_try_push(&test_buffer, &second);
     MotionPlanBlock_t output = {0};
-    expect_u32(plan_buffer_try_peek(old_epoch, 0U, &output), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot peek");
-    expect_u32(plan_buffer_discard(old_epoch, 1U), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot discard");
+    expect_u32(plan_buffer_try_peek(&test_buffer, old_epoch, 0U, &output), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot peek");
+    expect_u32(plan_buffer_discard(&test_buffer, old_epoch, 1U), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot discard");
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.queued, 1U, "a stale discard changes nothing");
     expect_u32(diagnostics.rejected_operations, 2U, "stale calls are counted");
     expect_u32(
-        plan_buffer_try_peek(plan_buffer_get_epoch(), 0U, &output),
+        plan_buffer_try_peek(&test_buffer, plan_buffer_get_epoch(&test_buffer), 0U, &output),
         PLAN_BUFFER_STATUS_OK,
         "the new epoch works"
     );
@@ -392,47 +401,47 @@ static void test_peek_and_discard_before_init_and_with_bad_arguments(void) {
     reset_buffer();
     MotionPlanBlock_t output = {0};
     expect_u32(
-        plan_buffer_try_peek(0U, 0U, &output),
+        plan_buffer_try_peek(&test_buffer, 0U, 0U, &output),
         PLAN_BUFFER_STATUS_NOT_INITIALIZED,
         "peek before init is rejected"
     );
     expect_u32(
-        plan_buffer_try_peek(0U, 0U, NULL),
+        plan_buffer_try_peek(&test_buffer, 0U, 0U, NULL),
         PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
         "null peek before init is rejected"
     );
-    expect_u32(plan_buffer_discard(0U, 0U), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "discard before init is rejected");
-    expect_u32(plan_buffer_get_epoch(), 0U, "the epoch starts at zero");
+    expect_u32(plan_buffer_discard(&test_buffer, 0U, 0U), PLAN_BUFFER_STATUS_NOT_INITIALIZED, "discard before init is rejected");
+    expect_u32(plan_buffer_get_epoch(&test_buffer), 0U, "the epoch starts at zero");
 
-    (void)plan_buffer_init();
-    expect_u32(plan_buffer_try_peek(0U, 0U, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null peek output is rejected");
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    expect_u32(plan_buffer_try_peek(&test_buffer, 0U, 0U, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null peek output is rejected");
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.rejected_operations, 1U, "the null peek is counted");
 }
 
 static void test_invalid_arguments_are_reported(void) {
     reset_buffer();
-    (void)plan_buffer_init();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
     MotionPlanBlock_t block = make_block(1U);
-    expect_u32(plan_buffer_try_push(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null block is rejected");
-    expect_u32(plan_buffer_try_pop(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null output is rejected");
-    expect_u32(plan_buffer_get_diagnostics(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null diagnostics output is rejected");
-    plan_buffer_test_seed_counters(NULL);
+    expect_u32(plan_buffer_try_push(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null block is rejected");
+    expect_u32(plan_buffer_try_pop(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null output is rejected");
+    expect_u32(plan_buffer_get_diagnostics(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "null diagnostics output is rejected");
+    plan_buffer_test_seed_counters(&test_buffer, NULL);
 
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.rejected_operations, 2U, "invalid mutating operations are counted");
-    expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "valid operation succeeds after invalid arguments");
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "valid operation succeeds after invalid arguments");
 }
 
 static void test_diagnostic_counters_saturate(void) {
     reset_buffer();
-    (void)plan_buffer_init();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
     MotionPlanBlock_t block = make_block(1U);
-    expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "buffer accepts first block before saturation test");
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "buffer accepts first block before saturation test");
     block = make_block(2U);
-    expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_OK, "buffer accepts second block before saturation test");
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "buffer accepts second block before saturation test");
 
     const PlanBufferDiagnostics_t saturated = {
         .max_queued = 2U,
@@ -442,24 +451,24 @@ static void test_diagnostic_counters_saturate(void) {
         .rejected_operations = UINT32_MAX,
         .cancelled_blocks = UINT32_MAX - 1U,
     };
-    plan_buffer_test_seed_counters(&saturated);
+    plan_buffer_test_seed_counters(&test_buffer, &saturated);
 
     for (uint32_t sequence = 3U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
         block = make_block(sequence);
-        (void)plan_buffer_try_push(&block);
+        (void)plan_buffer_try_push(&test_buffer, &block);
     }
     block = make_block(PLAN_BUFFER_CAPACITY + 1U);
-    expect_u32(plan_buffer_try_push(&block), PLAN_BUFFER_STATUS_FULL, "saturated full counter does not change result");
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_FULL, "saturated full counter does not change result");
 
     MotionPlanBlock_t output = {0};
-    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_OK, "saturated dequeue counter does not change result");
-    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_OK, "saturated cancellation counters do not change clear result");
-    expect_u32(plan_buffer_try_pop(&output), PLAN_BUFFER_STATUS_EMPTY, "saturated empty counter does not change result");
-    expect_u32(plan_buffer_try_push(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "saturated error counter does not change result");
-    expect_u32(plan_buffer_clear(), PLAN_BUFFER_STATUS_OK, "clear succeeds when no blocks remain");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "saturated dequeue counter does not change result");
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "saturated cancellation counters do not change clear result");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_EMPTY, "saturated empty counter does not change result");
+    expect_u32(plan_buffer_try_push(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "saturated error counter does not change result");
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "clear succeeds when no blocks remain");
 
     PlanBufferDiagnostics_t diagnostics = {0};
-    (void)plan_buffer_get_diagnostics(&diagnostics);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
     expect_u32(diagnostics.enqueued_total, UINT32_MAX, "enqueued counter saturates");
     expect_u32(diagnostics.dequeued_total, UINT32_MAX, "dequeued counter saturates");
     expect_u32(diagnostics.full_rejections, UINT32_MAX, "full counter saturates");
@@ -467,7 +476,230 @@ static void test_diagnostic_counters_saturate(void) {
     expect_u32(diagnostics.cancelled_blocks, UINT32_MAX, "cancelled block counter saturates");
 }
 
+#define SECOND_BUFFER_CAPACITY 3U
+
+static PlanBuffer_t second_buffer;
+static MotionPlanBlock_t second_buffer_entries[SECOND_BUFFER_CAPACITY];
+
+static void reset_second_buffer(void) {
+    (void)memset(&second_buffer, 0, sizeof(second_buffer));
+    (void)memset(second_buffer_entries, 0, sizeof(second_buffer_entries));
+}
+
+static void test_init_rejects_bad_arguments(void) {
+    reset_buffer();
+    const MotionPlanBlock_t block = make_block(1U);
+    test_buffer_entries[0].sequence = 0xA5A5A5A5U;
+
+    expect_u32(
+        plan_buffer_init(NULL, test_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "init without an object is rejected"
+    );
+    expect_u32(
+        plan_buffer_init(&test_buffer, NULL, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "init without storage is rejected"
+    );
+    expect_u32(
+        plan_buffer_init(&test_buffer, test_buffer_entries, 0U),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "init with zero capacity is rejected"
+    );
+    expect_u32(test_mutex_new_calls, 0U, "a rejected init creates no mutex");
+    expect_u32(test_buffer_entries[0].sequence, 0xA5A5A5A5U, "a rejected init leaves the storage alone");
+    expect_u32(
+        plan_buffer_try_push(&test_buffer, &block),
+        PLAN_BUFFER_STATUS_NOT_INITIALIZED,
+        "an object whose init was rejected stays uninitialized"
+    );
+}
+
+static void test_null_object_is_rejected_by_every_call(void) {
+    reset_buffer();
+    const MotionPlanBlock_t block = make_block(1U);
+    MotionPlanBlock_t output = {0};
+    PlanBufferDiagnostics_t diagnostics = {.queued = 77U};
+
+    expect_u32(plan_buffer_try_push(NULL, &block), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "push to no object is rejected");
+    expect_u32(plan_buffer_try_pop(NULL, &output), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "pop from no object is rejected");
+    expect_u32(
+        plan_buffer_try_peek(NULL, 0U, 0U, &output),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "peek into no object is rejected"
+    );
+    expect_u32(plan_buffer_discard(NULL, 0U, 0U), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "discard from no object is rejected");
+    expect_u32(plan_buffer_clear(NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "clear of no object is rejected");
+    expect_u32(
+        plan_buffer_get_diagnostics(NULL, &diagnostics),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "diagnostics of no object are rejected"
+    );
+    expect_u32(diagnostics.queued, 77U, "diagnostics of no object write nothing");
+    expect_u32(plan_buffer_get_epoch(NULL), 0U, "no object has epoch zero");
+    expect_u32(test_mutex_acquire_calls, 0U, "calls on no object take no lock");
+}
+
+static void test_objects_are_independent(void) {
+    reset_buffer();
+    reset_second_buffer();
+    expect_u32(
+        plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "first object initializes"
+    );
+    expect_u32(
+        plan_buffer_init(&second_buffer, second_buffer_entries, SECOND_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "second object initializes with its own storage"
+    );
+
+    MotionPlanBlock_t output = {0};
+    PlanBufferDiagnostics_t first = {0};
+    PlanBufferDiagnostics_t second = {0};
+    const MotionPlanBlock_t block = make_block(1U);
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "a block queues in the first object");
+    expect_u32(
+        plan_buffer_try_pop(&second_buffer, &output),
+        PLAN_BUFFER_STATUS_EMPTY,
+        "the block of the first object is not in the second"
+    );
+    (void)plan_buffer_get_diagnostics(&second_buffer, &second);
+    expect_u32(second.queued, 0U, "the second object queued nothing");
+    expect_u32(second.enqueued_total, 0U, "the second object counted no push");
+    expect_u32(second.max_queued, 0U, "the second object recorded no occupancy");
+
+    const MotionPlanBlock_t other = make_block(2U);
+    expect_u32(plan_buffer_try_push(&second_buffer, &other), PLAN_BUFFER_STATUS_OK, "a block queues in the second object");
+    (void)plan_buffer_get_diagnostics(&test_buffer, &first);
+    expect_u32(first.queued, 1U, "the push to the second object does not reach the first");
+    expect_u32(first.enqueued_total, 1U, "the first object counts only its own push");
+
+    /* A clear of the first object leaves the second one's blocks, epoch and counters alone. */
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "the first object clears");
+    expect_u32(plan_buffer_get_epoch(&test_buffer), 1U, "the clear moves the epoch of the first object");
+    expect_u32(plan_buffer_get_epoch(&second_buffer), 0U, "the epoch of the second object does not move");
+    (void)plan_buffer_get_diagnostics(&test_buffer, &first);
+    (void)plan_buffer_get_diagnostics(&second_buffer, &second);
+    expect_u32(first.cancelled_blocks, 1U, "the first object cancelled its block");
+    expect_u32(second.cancelled_blocks, 0U, "the second object cancelled nothing");
+    expect_u32(second.queued, 1U, "the block of the second object survives the clear of the first");
+    expect_u32(
+        plan_buffer_try_pop(&second_buffer, &output),
+        PLAN_BUFFER_STATUS_OK,
+        "the second object still gives its block"
+    );
+    expect_block_equal(&output, 2U);
+
+    /* A position of the second object's epoch is not valid for the first one after its clear. */
+    expect_u32(
+        plan_buffer_try_peek(&test_buffer, plan_buffer_get_epoch(&second_buffer), 0U, &output),
+        PLAN_BUFFER_STATUS_STALE,
+        "the epoch of one object does not fit the other"
+    );
+}
+
+static void test_object_with_own_capacity_fills_and_wraps(void) {
+    reset_buffer();
+    reset_second_buffer();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    expect_u32(
+        plan_buffer_init(&second_buffer, second_buffer_entries, SECOND_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "the object with a small capacity initializes"
+    );
+
+    for (uint32_t sequence = 1U; sequence <= SECOND_BUFFER_CAPACITY; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        expect_u32(plan_buffer_try_push(&second_buffer, &block), PLAN_BUFFER_STATUS_OK, "the small buffer takes blocks up to its capacity");
+    }
+    const MotionPlanBlock_t overflow = make_block(4U);
+    expect_u32(plan_buffer_try_push(&second_buffer, &overflow), PLAN_BUFFER_STATUS_FULL, "the fourth block does not fit three slots");
+
+    MotionPlanBlock_t output = {0};
+    for (uint32_t sequence = 1U; sequence <= 2U; ++sequence) {
+        expect_u32(plan_buffer_try_pop(&second_buffer, &output), PLAN_BUFFER_STATUS_OK, "the small buffer gives the front");
+        expect_block_equal(&output, sequence);
+    }
+    for (uint32_t sequence = 4U; sequence <= 5U; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        expect_u32(plan_buffer_try_push(&second_buffer, &block), PLAN_BUFFER_STATUS_OK, "the small buffer reuses slots over its ring end");
+    }
+    for (uint32_t sequence = 3U; sequence <= 5U; ++sequence) {
+        expect_u32(plan_buffer_try_pop(&second_buffer, &output), PLAN_BUFFER_STATUS_OK, "the wrapped small buffer keeps the order");
+        expect_block_equal(&output, sequence);
+    }
+    expect_u32(plan_buffer_try_pop(&second_buffer, &output), PLAN_BUFFER_STATUS_EMPTY, "the small buffer drains");
+
+    PlanBufferDiagnostics_t second = {0};
+    PlanBufferDiagnostics_t first = {0};
+    (void)plan_buffer_get_diagnostics(&second_buffer, &second);
+    (void)plan_buffer_get_diagnostics(&test_buffer, &first);
+    expect_u32(second.max_queued, SECOND_BUFFER_CAPACITY, "the small buffer peaks at its own capacity");
+    expect_u32(second.full_rejections, 1U, "the small buffer counts its full rejection");
+    expect_u32(second.enqueued_total, 5U, "the small buffer counts five accepted blocks");
+    expect_u32(second.dequeued_total, 5U, "the small buffer counts five given blocks");
+    expect_u32(first.enqueued_total, 0U, "the large buffer saw none of it");
+    expect_u32(first.full_rejections, 0U, "the large buffer counts no rejection of the small one");
+}
+
+static void test_init_clears_storage_and_counters(void) {
+    reset_buffer();
+    for (uint32_t index = 0U; index < PLAN_BUFFER_CAPACITY; ++index) {
+        (void)memset(&test_buffer_entries[index], 0xA5, sizeof(test_buffer_entries[index]));
+    }
+    const PlanBufferDiagnostics_t stale = {
+        .queued = 0U,
+        .max_queued = 9U,
+        .enqueued_total = 8U,
+        .dequeued_total = 7U,
+        .full_rejections = 6U,
+        .rejected_operations = 5U,
+        .cancelled_blocks = 4U,
+    };
+    plan_buffer_test_seed_counters(&test_buffer, &stale);
+
+    expect_u32(
+        plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "init succeeds over dirty storage"
+    );
+    for (uint32_t index = 0U; index < PLAN_BUFFER_CAPACITY; ++index) {
+        expect_u32(test_buffer_entries[index].sequence, 0U, "init clears the sequence of every slot");
+        expect_u64(test_buffer_entries[index].path_length_um, 0U, "init clears the path of every slot");
+    }
+
+    PlanBufferDiagnostics_t diagnostics = {.queued = 1U, .max_queued = 1U, .enqueued_total = 1U};
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
+    expect_u32(diagnostics.queued, 0U, "init starts empty");
+    expect_u32(diagnostics.max_queued, 0U, "init clears the peak");
+    expect_u32(diagnostics.enqueued_total, 0U, "init clears the push counter");
+    expect_u32(diagnostics.dequeued_total, 0U, "init clears the pop counter");
+    expect_u32(diagnostics.full_rejections, 0U, "init clears the full counter");
+    expect_u32(diagnostics.rejected_operations, 0U, "init clears the rejection counter");
+    expect_u32(diagnostics.cancelled_blocks, 0U, "init clears the cancel counter");
+
+    MotionPlanBlock_t output = {.sequence = 123U};
+    expect_u32(
+        plan_buffer_try_peek(&test_buffer, plan_buffer_get_epoch(&test_buffer), 0U, &output),
+        PLAN_BUFFER_STATUS_EMPTY,
+        "no old data is visible after init"
+    );
+    expect_u32(output.sequence, 123U, "an empty peek leaves the output alone");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_EMPTY, "no old data is popped after init");
+
+    const MotionPlanBlock_t block = make_block(7U);
+    expect_u32(plan_buffer_try_push(&test_buffer, &block), PLAN_BUFFER_STATUS_OK, "a block queues after init");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the block is popped");
+    expect_block_equal(&output, 7U);
+}
+
 int main(void) {
+    test_init_rejects_bad_arguments();
+    test_null_object_is_rejected_by_every_call();
+    test_objects_are_independent();
+    test_object_with_own_capacity_fills_and_wraps();
+    test_init_clears_storage_and_counters();
     test_initialization_and_preinit_results();
     test_fifo_full_wraparound_and_copy();
     test_clear_cancels_only_pending_blocks();

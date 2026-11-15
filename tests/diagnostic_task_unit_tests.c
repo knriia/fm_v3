@@ -52,6 +52,8 @@ static MotionTaskDiagnostics test_motion_task_diagnostics;
 static StepGeneratorTaskDiagnostics test_step_generator_diagnostics;
 static CommandQueueDiagnostics_t test_command_queue_diagnostics;
 static PlanBufferDiagnostics_t test_plan_buffer_diagnostics;
+static PlanBuffer_t test_plan_buffer_object;
+static const PlanBuffer_t *test_plan_buffer_requested;
 static uint32_t test_execution_buffer_level;
 static uint32_t test_underruns;
 
@@ -160,7 +162,8 @@ void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     *diagnostics = test_command_queue_diagnostics;
 }
 
-PlanBufferStatus_t plan_buffer_get_diagnostics(PlanBufferDiagnostics_t *diagnostics) {
+PlanBufferStatus_t plan_buffer_get_diagnostics(PlanBuffer_t *self, PlanBufferDiagnostics_t *diagnostics) {
+    test_plan_buffer_requested = self;
     *diagnostics = test_plan_buffer_diagnostics;
     return PLAN_BUFFER_STATUS_OK;
 }
@@ -474,11 +477,12 @@ static void reset_network_fixture(void) {
     test_step_generator_diagnostics = (StepGeneratorTaskDiagnostics){0};
     test_command_queue_diagnostics = (CommandQueueDiagnostics_t){0};
     test_plan_buffer_diagnostics = (PlanBufferDiagnostics_t){0};
+    test_plan_buffer_requested = NULL;
     test_execution_buffer_level = 0U;
     test_underruns = 0U;
 }
 
-static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
+static int run_diagnostic_task_until_jump(DiagnosticTaskContext *context) {
     test_jump_active = 1U;
     const int jumped = setjmp(test_jump_buffer);
     if (jumped == 0) {
@@ -489,7 +493,10 @@ static int run_diagnostic_task_until_jump(NetworkTaskContext *context) {
 }
 
 static void test_diagnostic_frame_contents(void) {
-    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    DiagnosticTaskContext context = {
+        .network = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U},
+        .plan_buffer = &test_plan_buffer_object,
+    };
 
     reset_network_fixture();
     test_stop_on_delay = 1U;
@@ -540,6 +547,11 @@ static void test_diagnostic_frame_contents(void) {
     expect_u32(payload->command_queue.enqueue_errors, 5U, "command queue errors");
     expect_u32(payload->motion.commands_dequeued, 14U, "MotionTask counters");
     expect_u32(payload->motion.last_sequence, 104U, "MotionTask last sequence");
+    expect_u32(
+        (uint32_t)(test_plan_buffer_requested == &test_plan_buffer_object),
+        1U,
+        "plan buffer diagnostics come from the buffer of the context"
+    );
     expect_u32(payload->plan_buffer.queued, 37U, "plan buffer occupancy");
     expect_u32(payload->plan_buffer.max_queued, 80U, "plan buffer maximum");
     expect_u32(payload->plan_buffer.enqueued_total, 1234U, "plan buffer accepted total");
@@ -590,8 +602,11 @@ static void test_diagnostic_frame_contents(void) {
 }
 
 static void test_diagnostic_task_network_paths(void) {
-    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    NetworkTaskContext context_without_lwip_flags = {.lwip_flags = NULL};
+    DiagnosticTaskContext context = {
+        .network = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U},
+        .plan_buffer = &test_plan_buffer_object,
+    };
+    DiagnosticTaskContext context_without_lwip_flags = {.network = {.lwip_flags = NULL}};
 
     reset_network_fixture();
     test_stop_on_delay = 1U;

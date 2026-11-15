@@ -87,6 +87,9 @@ static const osThreadAttr_t command_task_attr = {
 static osThreadId_t motion_task_handle;
 static MotionTaskContext_t motion_task_context;
 static StepGeneratorTaskConfig_t step_generator_task_config;
+/* The queue of the printing stream: MotionTask pushes into it, StepGeneratorTask plays it, DiagnosticTask reports it. */
+static PlanBuffer_t print_plan_buffer;
+static MotionPlanBlock_t print_plan_buffer_entries[PLAN_BUFFER_CAPACITY];
 static const osThreadAttr_t motion_task_attr = {
   .name = MOTION_TASK_NAME,
   .stack_size = MOTION_TASK_STACK_SIZE_BYTES,
@@ -102,7 +105,7 @@ static const osThreadAttr_t step_generator_task_attr = {
 };
 
 static osEventFlagsId_t lwip_ready_flags;
-static NetworkTaskContext diagnostic_task_context;
+static DiagnosticTaskContext diagnostic_task_context;
 static NetworkTaskContext telemetry_task_context;
 static NetworkTaskContext command_task_context;
 
@@ -125,11 +128,12 @@ void MX_FREERTOS_Init(void)
     Error_Handler();
   }
 
-  if (plan_buffer_init() != PLAN_BUFFER_STATUS_OK)
+  if (plan_buffer_init(&print_plan_buffer, print_plan_buffer_entries, PLAN_BUFFER_CAPACITY) != PLAN_BUFFER_STATUS_OK)
   {
     Error_Handler();
   }
 
+  motion_task_context.plan_buffer = &print_plan_buffer;
   motion_task_context.planner_config.max_step_event_rate_hz = MOTION_TASK_MAX_STEP_RATE_HZ;
   motion_task_handle = osThreadNew(MotionTask, &motion_task_context, &motion_task_attr);
   if (motion_task_handle == NULL)
@@ -142,6 +146,7 @@ void MX_FREERTOS_Init(void)
   /* 0 turns the braking ramp off: the stream stops at once on a limit switch. For the ramp, pass
    * motion_task_get_limit_deceleration(MOTION_AXIS_X) here. */
   step_generator_task_config.limit_deceleration_steps_per_s2 = 0U;
+  step_generator_task_config.plan_buffer = &print_plan_buffer;
   step_generator_task_handle = osThreadNew(StepGeneratorTask, &step_generator_task_config, &step_generator_task_attr);
   if (step_generator_task_handle == NULL)
   {
@@ -160,7 +165,8 @@ void MX_FREERTOS_Init(void)
     Error_Handler();
   }
 
-  diagnostic_task_context.lwip_flags = lwip_ready_flags;
+  diagnostic_task_context.network.lwip_flags = lwip_ready_flags;
+  diagnostic_task_context.plan_buffer = &print_plan_buffer;
   diagnostic_task_handle = osThreadNew(DiagnosticTask, &diagnostic_task_context, &diagnostic_task_attr);
   if (diagnostic_task_handle == NULL)
   {
