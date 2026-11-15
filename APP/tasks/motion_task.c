@@ -306,13 +306,19 @@ static uint8_t motion_task_limits_conflict(MotionAxis_t axis) {
                : 0U;
 }
 
-/* Returns the step generator to its idle state: stops the stream, drops the queued blocks and waits until the task
- * has reset. Returns 0 when it does not reset in time; the generator then stays halted until the next STOP. */
-static uint8_t motion_task_stream_flush(void) {
-    step_generator_task_halt();
+/* The generator instance that plays the moves of an axis: for now every stream axis belongs to the printing one. */
+static StepGeneratorInstance_t *motion_task_generator_for_axis(MotionAxis_t axis) {
+    (void)axis;
+    return step_generator_task_get_print_instance();
+}
+
+/* Returns the generator instance to its idle state: stops its stream, drops the queued blocks and waits until the task
+ * has reset it. Returns 0 when it does not reset in time; the instance then stays halted until the next STOP. */
+static uint8_t motion_task_stream_flush(StepGeneratorInstance_t *generator) {
+    step_generator_instance_halt(generator);
     (void)plan_buffer_clear(motion_task_plan_buffer);
-    step_generator_task_resume_after_stop();
-    for (uint32_t waited_ms = 0U; step_generator_task_is_busy() != 0U; ++waited_ms) {
+    step_generator_instance_resume_after_stop(generator);
+    for (uint32_t waited_ms = 0U; step_generator_instance_is_busy(generator) != 0U; ++waited_ms) {
         if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
             return 0U;
         }
@@ -337,7 +343,7 @@ static void motion_task_home_cancel(MotionTaskAxisState_t *state, MotionTaskCont
 
 static void motion_task_home_abort(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
     /* A move still in the stream would run on without anyone watching its switches. */
-    (void)motion_task_stream_flush();
+    (void)motion_task_stream_flush(motion_task_generator_for_axis(state->axis));
     motion_task_home_cancel(state, context);
 }
 
@@ -450,15 +456,20 @@ static void motion_task_home_begin(MotionTaskAxisState_t *state, MotionTaskConte
  * the generator stopped on a fault, or the stream did not reset. The axis is also made ready for the next move
  * here, because a stop on a switch leaves its generator halted. A stream that does not reset blocks MotionTask for the
  * settle timeout here and for another one in the abort that follows. */
-static uint8_t motion_task_move_has_ended(MotionAxis_t axis, MotionAxisHardwareStopReason_t *stop_reason) {
+static uint8_t motion_task_move_has_ended(
+    StepGeneratorInstance_t *generator,
+    MotionAxis_t axis,
+    MotionAxisHardwareStopReason_t *stop_reason
+) {
     *stop_reason = motion_axis_hardware_get_last_stop_reason(axis);
     if (*stop_reason != MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
-        if (motion_task_stream_flush() == 0U) {
+        if (motion_task_stream_flush(generator) == 0U) {
             *stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
         }
         return 1U;
     }
-    return step_generator_task_is_halted() != 0U || step_generator_task_is_busy() == 0U ? 1U : 0U;
+    return step_generator_instance_is_halted(generator) != 0U || step_generator_instance_is_busy(generator) == 0U ? 1U
+                                                                                                                  : 0U;
 }
 
 /* The moves of the calibration procedure for an axis: one plan block each, like the homing moves. */
@@ -479,18 +490,19 @@ static uint8_t motion_task_stream_mover_start(
  * flushed here, because nothing else resets it after a failed calibration. */
 static AxisCalibrationRunMoveState_t motion_task_stream_mover_poll(MotionAxis_t axis, uint32_t steps) {
     (void)steps;
+    StepGeneratorInstance_t *const generator = motion_task_generator_for_axis(axis);
     MotionAxisHardwareStopReason_t stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
-    if (motion_task_move_has_ended(axis, &stop_reason) == 0U) {
+    if (motion_task_move_has_ended(generator, axis, &stop_reason) == 0U) {
         return AXIS_CALIBRATION_RUN_MOVE_RUNNING;
     }
     if (stop_reason == MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT) {
         return AXIS_CALIBRATION_RUN_MOVE_END_LIMIT;
     }
     if (stop_reason == MOTION_AXIS_HARDWARE_STOP_REASON_NONE) {
-        if (step_generator_task_is_halted() == 0U) {
+        if (step_generator_instance_is_halted(generator) == 0U) {
             return AXIS_CALIBRATION_RUN_MOVE_COMPLETED;
         }
-        (void)motion_task_stream_flush();
+        (void)motion_task_stream_flush(generator);
     }
     motion_task_home_forget_stream_stop(axis);
     return AXIS_CALIBRATION_RUN_MOVE_FAILED;
@@ -499,7 +511,7 @@ static AxisCalibrationRunMoveState_t motion_task_stream_mover_poll(MotionAxis_t 
 /* Like the cancel of a homing, this leaves the reset of the generator to whoever aborts: STOP resets it in
  * motion_task_finish_stop once every axis is at rest. */
 static void motion_task_stream_mover_abort(MotionAxis_t axis) {
-    step_generator_task_halt();
+    step_generator_instance_halt(motion_task_generator_for_axis(axis));
     motion_task_home_forget_stream_stop(axis);
 }
 
@@ -516,7 +528,7 @@ static void motion_task_home_poll(MotionTaskAxisState_t *state, MotionTaskContex
     /* Every homing move is meant to end on the start switch; running out of steps or any other stop is a
      * failure. */
     MotionAxisHardwareStopReason_t stop_reason = MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
-    if (motion_task_move_has_ended(state->axis, &stop_reason) == 0U) {
+    if (motion_task_move_has_ended(motion_task_generator_for_axis(state->axis), state->axis, &stop_reason) == 0U) {
         return;
     }
 
@@ -692,7 +704,7 @@ static uint8_t motion_task_axes_can_start(uint8_t axes_mask, uint8_t busy_mask) 
 }
 
 void motion_task_request_stop(void) {
-    step_generator_task_halt();
+    step_generator_task_halt_all();
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         motion_axis_hardware_request_stop((MotionAxis_t)axis);
     }
@@ -725,7 +737,7 @@ static void motion_task_finish_stop(MotionTaskContext_t *context) {
             context->machine_state.position_um[axis] = scale_um < 0 ? -scale_um : scale_um;
         }
     }
-    step_generator_task_resume_after_stop();
+    step_generator_task_resume_all_after_stop();
 }
 
 static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
@@ -763,7 +775,7 @@ static void motion_task_abort_axes(MotionTaskAxisState_t *states, MotionTaskCont
         motion_task_calibration_cancel(&states[axis]);
         if (calibrating != 0U) {
             /* No STOP follows this abort, so the halted generator is reset here, as in the homing abort. */
-            (void)motion_task_stream_flush();
+            (void)motion_task_stream_flush(motion_task_generator_for_axis(states[axis].axis));
         }
     }
 }
@@ -834,7 +846,7 @@ void MotionTask(void *argument) {
         /* The planned stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE
          * are refused meanwhile like any other command that finds the axis busy. */
         const uint8_t stream_in_use =
-            (uint8_t)(step_generator_task_is_busy() != 0U || (busy_mask & MOTION_TASK_STREAM_AXES_MASK) != 0U);
+            (uint8_t)(step_generator_task_any_busy() != 0U || (busy_mask & MOTION_TASK_STREAM_AXES_MASK) != 0U);
         const uint8_t start_busy_mask =
             (uint8_t)(busy_mask | (stream_in_use != 0U ? MOTION_TASK_STREAM_AXES_MASK : 0U));
         if (command.code == COMMAND_CODE_HOME) {

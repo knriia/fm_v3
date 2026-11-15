@@ -73,6 +73,10 @@ typedef struct StepGeneratorInstance {
     uint32_t member_count;
     StepGeneratorMemberContext_t member_contexts[STEP_GENERATOR_TASK_MEMBER_COUNT];
     StepStreamAxisListener_t stream_listeners[STEP_GENERATOR_TASK_MEMBER_COUNT];
+    /* 1 once the channels are claimed and the feeder is built; an instance that is not ready only stays halted. */
+    uint8_t ready;
+    /* Set by step_generator_instance_resume_after_stop, cleared by the task when it resets this instance. */
+    volatile uint8_t reset_requested;
     /* From the moment a block leaves the plan buffer until the stream has ended; STOP resets it. */
     volatile uint8_t stream_busy;
     /* Set by STOP in another task or by a ring fault in the DMA interrupt; cleared by this task once it is reset. */
@@ -94,8 +98,12 @@ typedef struct StepGeneratorInstance {
     volatile uint32_t limit_trips[STEP_GENERATOR_TASK_MEMBER_COUNT];
 } StepGeneratorInstance_t;
 
-/* The only instance for now: the printing stream of X, Y and Z. */
+/* The printing stream of X, Y and Z. */
 static StepGeneratorInstance_t step_generator_task_instance;
+/* Every instance the task serves; STOP and the service loop walk it. */
+static StepGeneratorInstance_t *const step_generator_task_instances[] = {&step_generator_task_instance};
+#define STEP_GENERATOR_TASK_INSTANCE_COUNT                                                                             \
+    (sizeof(step_generator_task_instances) / sizeof(step_generator_task_instances[0]))
 /* Written once at task start and read by MotionTask and the DMA interrupt to wake the task. */
 static osThreadId_t volatile step_generator_task_thread_id;
 
@@ -143,24 +151,80 @@ void step_generator_task_notify_ring_half_released(void) {
     step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED);
 }
 
-void step_generator_task_halt(void) {
-    StepGeneratorInstance_t *const self = &step_generator_task_instance;
-    step_generator_task_set_halted(self, STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, STEP_GENERATOR_TASK_NO_MEMBER, 0U);
+StepGeneratorInstance_t *step_generator_task_get_print_instance(void) { return &step_generator_task_instance; }
+
+void step_generator_instance_halt(StepGeneratorInstance_t *instance) {
+    if (instance == NULL) {
+        return;
+    }
+    step_generator_task_set_halted(
+        instance,
+        STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL,
+        STEP_GENERATOR_TASK_NO_MEMBER,
+        0U
+    );
     /* The axes stop themselves even if the task is in the middle of a fill: the start port checks the flag with task
      * switching paused, so a stream cannot begin after this stop. */
-    step_stream_group_stop(&self->group);
+    step_stream_group_stop(&instance->group);
 }
 
-uint8_t step_generator_task_is_busy(void) {
+/* The list walks take the table as an argument, so a test can walk a table of two instances. */
+static void step_generator_task_halt_list(StepGeneratorInstance_t *const *list, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        step_generator_instance_halt(list[index]);
+    }
+}
+
+static uint8_t step_generator_task_any_busy_in_list(StepGeneratorInstance_t *const *list, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        if (step_generator_instance_is_busy(list[index]) != 0U) {
+            return 1U;
+        }
+    }
+    return 0U;
+}
+
+void step_generator_task_halt_all(void) {
+    step_generator_task_halt_list(step_generator_task_instances, STEP_GENERATOR_TASK_INSTANCE_COUNT);
+}
+
+uint8_t step_generator_instance_is_busy(const StepGeneratorInstance_t *instance) {
+    if (instance == NULL) {
+        return 0U;
+    }
     PlanBufferDiagnostics_t plan = {0};
     /* Only a null pointer (no queue yet) makes this fail, and the zeroed struct then reads as an empty plan. */
-    (void)plan_buffer_get_diagnostics(step_generator_task_instance.plan_buffer, &plan);
-    return (uint8_t)(step_generator_task_instance.stream_busy != 0U || plan.queued != 0U);
+    (void)plan_buffer_get_diagnostics(instance->plan_buffer, &plan);
+    return (uint8_t)(instance->stream_busy != 0U || plan.queued != 0U);
 }
 
-uint8_t step_generator_task_is_halted(void) { return step_generator_task_instance.halted; }
+uint8_t step_generator_task_any_busy(void) {
+    return step_generator_task_any_busy_in_list(step_generator_task_instances, STEP_GENERATOR_TASK_INSTANCE_COUNT);
+}
 
-void step_generator_task_resume_after_stop(void) { step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_STOP_RESET); }
+uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instance) {
+    return instance == NULL ? 0U : instance->halted;
+}
+
+void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance) {
+    /* Before the task starts nothing runs yet and the task has not set the instance up, so there is nothing to reset; a
+     * request kept from then would reset the instance on the first pass and lift a STOP that came in between. */
+    if (instance == NULL || step_generator_task_thread_id == NULL) {
+        return;
+    }
+    instance->reset_requested = 1U;
+    step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_STOP_RESET);
+}
+
+static void step_generator_task_resume_list(StepGeneratorInstance_t *const *list, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        step_generator_instance_resume_after_stop(list[index]);
+    }
+}
+
+void step_generator_task_resume_all_after_stop(void) {
+    step_generator_task_resume_list(step_generator_task_instances, STEP_GENERATOR_TASK_INSTANCE_COUNT);
+}
 
 /* The ports below adapt the feeder to the stream axis and the plan buffer. */
 
@@ -529,6 +593,14 @@ step_generator_task_setup_feeder(StepGeneratorInstance_t *self, const StepGenera
     return (uint8_t)(step_stream_feeder_init(&self->feeder, &config, &ports) == STEP_STREAM_FEEDER_STATUS_OK);
 }
 
+/* Lets go of the listeners of the first `count` members. */
+static void step_generator_task_release_channels(const StepGeneratorInstance_t *self, uint32_t count) {
+    for (uint32_t member = 0U; member < count; ++member) {
+        (void)step_stream_axis_set_listener(step_generator_task_member_axis(self, member), NULL);
+        (void)motion_axis_hardware_set_stream_limit_listener(self->member_axes[member], NULL, NULL);
+    }
+}
+
 /* Takes the channels of the members and the switch listeners of their axes for this instance. A channel that is not
  * IDLE refuses and nothing stays taken: the member that refused and those before it are let go. */
 static uint8_t step_generator_task_claim_channels(StepGeneratorInstance_t *self) {
@@ -543,24 +615,23 @@ static uint8_t step_generator_task_claim_channels(StepGeneratorInstance_t *self)
                                             self
                                         ) != 0U);
         if (taken == 0U) {
-            for (uint32_t claimed = 0U; claimed <= member; ++claimed) {
-                (void)step_stream_axis_set_listener(step_generator_task_member_axis(self, claimed), NULL);
-                (void)motion_axis_hardware_set_stream_limit_listener(self->member_axes[claimed], NULL, NULL);
-            }
+            step_generator_task_release_channels(self, member + 1U);
             return 0U;
         }
     }
     return 1U;
 }
 
-void StepGeneratorTask(void *argument) {
-    StepGeneratorInstance_t *const self = &step_generator_task_instance;
-    step_generator_task_thread_id = osThreadGetId();
+/* Claims the channels and builds the feeder of the instance; one that cannot do either refuses all work instead of
+ * guessing. */
+static void step_generator_task_setup_instance(StepGeneratorInstance_t *self, const StepGeneratorTaskConfig_t *config) {
     const uint8_t channels_ready = step_generator_task_claim_channels(self);
-    const uint8_t feeder_ready =
-        (uint8_t)(channels_ready != 0U && step_generator_task_setup_feeder(self, argument) != 0U);
-    if (feeder_ready == 0U) {
-        /* No channel or no usable timing: the task cannot feed the axis, so it refuses all work instead of guessing. */
+    self->ready = (uint8_t)(channels_ready != 0U && step_generator_task_setup_feeder(self, config) != 0U);
+    if (self->ready == 0U) {
+        /* An instance that never feeds must not hold channels another one could use. */
+        if (channels_ready != 0U) {
+            step_generator_task_release_channels(self, self->member_count);
+        }
         step_generator_counter_increment(&self->diagnostics.generator_errors);
         step_generator_task_set_halted(
             self,
@@ -569,51 +640,73 @@ void StepGeneratorTask(void *argument) {
             0U
         );
     }
+}
 
-    uint32_t flags = 0U;
-    for (;;) {
-        if (feeder_ready != 0U && (flags & STEP_GENERATOR_TASK_FLAG_STOP_RESET) != 0U) {
-            /* The axis has stopped and this task is not filling, so the feeder owns no running stream. */
-            /* Lift the halt first: a STOP that arrives during the reset then stays in force. */
+/* One pass over an instance: the reset requested after STOP, then the feeding. */
+static void step_generator_task_run_instance(StepGeneratorInstance_t *self) {
+    uint8_t reset_requested = 0U;
+    if (self->ready != 0U) {
+        /* Take the request and lift the halt in one step: a request that arrives meanwhile is kept for the next pass,
+         * and a STOP that arrives after this stays in force. */
+        const uint32_t primask = step_stream_axis_enter_critical();
+        reset_requested = self->reset_requested;
+        if (reset_requested != 0U) {
+            self->reset_requested = 0U;
             self->halted = 0U;
-            step_generator_task_watch_all_axes(self);
-            step_stream_feeder_reset(&self->feeder);
-            if (step_stream_group_reset(&self->group) != STEP_STREAM_GROUP_STATUS_OK) {
-                /* A channel still runs after STOP: nothing may be fed until the next STOP. */
-                step_generator_counter_increment(&self->reset_failures);
-                step_generator_task_set_halted(
-                    self,
-                    STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED,
-                    STEP_GENERATOR_TASK_NO_MEMBER,
-                    0U
-                );
-            }
+        }
+        step_stream_axis_exit_critical(primask);
+    }
+    if (reset_requested != 0U) {
+        /* The axis has stopped and this task is not filling, so the feeder owns no running stream. */
+        step_generator_task_watch_all_axes(self);
+        step_stream_feeder_reset(&self->feeder);
+        if (step_stream_group_reset(&self->group) != STEP_STREAM_GROUP_STATUS_OK) {
+            /* A channel still runs after STOP: nothing may be fed until the next STOP. */
+            step_generator_counter_increment(&self->reset_failures);
+            step_generator_task_set_halted(
+                self,
+                STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED,
+                STEP_GENERATOR_TASK_NO_MEMBER,
+                0U
+            );
+        }
+        self->stream_busy = 0U;
+        step_generator_counter_increment(&self->diagnostics.stop_resets);
+    }
+    if (self->ready != 0U && self->halted == 0U) {
+        const StepStreamFeederStatus_t feeder_status = step_stream_feeder_service(&self->feeder);
+        if (feeder_status != STEP_STREAM_FEEDER_STATUS_OK) {
+            /* The feeder has stopped the axis; the plan is untrustworthy until STOP. */
+            self->feeder_status = (uint32_t)feeder_status;
+            step_generator_task_set_halted(
+                self,
+                STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+                STEP_GENERATOR_TASK_NO_MEMBER,
+                0U
+            );
+        }
+        (void)step_stream_group_service(&self->group);
+        if (step_stream_feeder_get_phase(&self->feeder) == STEP_STREAM_FEEDER_PHASE_IDLE) {
             self->stream_busy = 0U;
-            step_generator_counter_increment(&self->diagnostics.stop_resets);
         }
-        if (feeder_ready != 0U && self->halted == 0U) {
-            const StepStreamFeederStatus_t feeder_status = step_stream_feeder_service(&self->feeder);
-            if (feeder_status != STEP_STREAM_FEEDER_STATUS_OK) {
-                /* The feeder has stopped the axis; the plan is untrustworthy until STOP. */
-                self->feeder_status = (uint32_t)feeder_status;
-                step_generator_task_set_halted(
-                    self,
-                    STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
-                    STEP_GENERATOR_TASK_NO_MEMBER,
-                    0U
-                );
-            }
-            (void)step_stream_group_service(&self->group);
-            if (step_stream_feeder_get_phase(&self->feeder) == STEP_STREAM_FEEDER_PHASE_IDLE) {
-                self->stream_busy = 0U;
-            }
-        }
-        /* Also while halted: the counters of the stream that was cut off must reach the diagnostics. */
-        if (feeder_ready != 0U) {
-            step_generator_task_publish_diagnostics(self);
+    }
+    /* Also while halted: the counters of the stream that was cut off must reach the diagnostics. */
+    if (self->ready != 0U) {
+        step_generator_task_publish_diagnostics(self);
+    }
+}
+
+void StepGeneratorTask(void *argument) {
+    step_generator_task_thread_id = osThreadGetId();
+    /* The config belongs to the printing instance. */
+    step_generator_task_setup_instance(&step_generator_task_instance, argument);
+
+    for (;;) {
+        for (uint32_t index = 0U; index < STEP_GENERATOR_TASK_INSTANCE_COUNT; ++index) {
+            step_generator_task_run_instance(step_generator_task_instances[index]);
         }
         /* Flags set while filling stay pending, so a block or a released half that arrives meanwhile is not missed. */
-        flags = osThreadFlagsWait(STEP_GENERATOR_TASK_FLAGS_ALL, osFlagsWaitAny, osWaitForever);
+        const uint32_t flags = osThreadFlagsWait(STEP_GENERATOR_TASK_FLAGS_ALL, osFlagsWaitAny, osWaitForever);
         configASSERT((flags & osFlagsError) == 0U);
     }
 }
