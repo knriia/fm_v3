@@ -176,40 +176,6 @@ static void test_calibrate_command_validation_and_decode(void) {
     expect_u32(result.error_code, COMMAND_ERROR_INVALID_PARAMETER, "CALIBRATE rejects an empty axis mask");
 }
 
-static CommandRequestDTO_t make_x_jog_request(uint32_t sequence, int32_t delta_um, uint32_t speed_um_per_s) {
-    uint8_t payload[9] = {0};
-    payload[0] = COMMAND_CODE_X_JOG;
-    write_u32_le(&payload[1], (uint32_t)delta_um);
-    write_u32_le(&payload[5], speed_um_per_s);
-    return make_request(COMMAND_MESSAGE_TYPE_COMMAND, sequence, payload, sizeof(payload));
-}
-
-static void test_x_jog_validation_and_decode(void) {
-    reset_decoder();
-    CommandRequestDTO_t request = make_x_jog_request(211U, -1500, 20000U);
-    expect_u32(command_decoder_validate_command(&request), 0U, "X_JOG accepts a relative move");
-    const CommandDTO_t command = command_decoder_decode_command(&request);
-    expect_u32(command.code, COMMAND_CODE_X_JOG, "X_JOG preserves command code");
-    expect_u32((uint32_t)command.parameters.x_jog.delta_um, (uint32_t)-1500, "X_JOG decodes the signed distance");
-    expect_u32(command.parameters.x_jog.speed_um_per_s, 20000U, "X_JOG decodes the speed");
-
-    request = make_x_jog_request(212U, INT32_MIN, UINT32_MAX);
-    expect_u32(
-        command_decoder_validate_command(&request),
-        0U,
-        "X_JOG leaves travel and speed limits to the planner"
-    );
-
-    request = make_x_jog_request(213U, 1, 0U);
-    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_PARAMETER, "X_JOG rejects zero speed");
-
-    request = make_x_jog_request(214U, 0, 100U);
-    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_PARAMETER, "X_JOG rejects zero distance");
-
-    request.header.payload_length = 8U;
-    expect_u32(command_decoder_validate_command(&request), COMMAND_ERROR_INVALID_LENGTH, "X_JOG requires 9 bytes");
-}
-
 static CommandRequestDTO_t make_motion_request(uint32_t sequence) {
     uint8_t payload[30] = {0};
     payload[0] = COMMAND_CODE_MOTION_OPERATION;
@@ -257,7 +223,7 @@ static void test_motion_operation_validation_and_decode(void) {
         "motion operation rejects an empty flag set"
     );
 
-    request.payload[1] = 0x10U;
+    request.payload[1] = 0x20U;
     expect_u32(
         command_decoder_validate_command(&request),
         COMMAND_ERROR_INVALID_PARAMETER,
@@ -304,6 +270,72 @@ static void test_motion_operation_validation_and_decode(void) {
         command_decoder_validate_command(&request),
         0U,
         "unused motion axes do not require speed values"
+    );
+}
+
+static void test_motion_operation_relative_flag(void) {
+    reset_decoder();
+    CommandRequestDTO_t request = make_motion_request(311U);
+    request.payload[1] = 0x11U;
+    write_u32_le(&request.payload[2], (uint32_t)-1500);
+    write_u32_le(&request.payload[6], 2000U);
+    write_u32_le(&request.payload[10], (uint32_t)-7);
+    expect_u32(
+        command_decoder_validate_command(&request),
+        0U,
+        "relative XYZ move with nonzero speed is accepted"
+    );
+    CommandDecoderResult_t result = command_decoder_decode_request(&request);
+    expect_u32(result.type, COMMAND_DECODER_RESULT_COMMAND_READY, "relative motion operation decodes");
+    expect_u32(result.command.parameters.motion_operation.operation_flags, 0x11U, "relative flag is preserved");
+    expect_u32((uint32_t)result.command.parameters.motion_operation.x, (uint32_t)-1500, "relative X stays signed");
+    expect_u32((uint32_t)result.command.parameters.motion_operation.y, 2000U, "relative Y decodes");
+    expect_u32((uint32_t)result.command.parameters.motion_operation.z, (uint32_t)-7, "relative Z stays signed");
+
+    request = make_motion_request(312U);
+    request.payload[1] = 0x10U;
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "relative flag alone is rejected"
+    );
+
+    request.payload[1] = 0x12U;
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "relative flag with doser but without XYZ move is rejected"
+    );
+
+    request.payload[1] = 0x11U;
+    write_u32_le(&request.payload[14], 0U);
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "relative XYZ move requires nonzero speed"
+    );
+
+    request = make_motion_request(313U);
+    request.payload[1] = 0x21U;
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "reserved flag 0x20 is rejected with XYZ move"
+    );
+
+    request.payload[1] = 0x81U;
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "reserved flag 0x80 is rejected with XYZ move"
+    );
+
+    request = make_motion_request(314U);
+    request.payload[1] = 0x1BU;
+    expect_u32(
+        command_decoder_validate_command(&request),
+        0U,
+        "all four actions with relative flag are accepted"
     );
 }
 
@@ -420,8 +452,8 @@ int main(void) {
     test_ping_and_protocol_errors();
     test_home_command_validation_and_decode();
     test_calibrate_command_validation_and_decode();
-    test_x_jog_validation_and_decode();
     test_motion_operation_validation_and_decode();
+    test_motion_operation_relative_flag();
     test_temperature_output_tool_and_stop_commands();
     test_decoder_diagnostics();
 

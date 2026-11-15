@@ -1768,10 +1768,15 @@ static void test_x_homing_through_the_stream(void) {
     expect_u32(test_last_receive_timeout, osWaitForever, "a fault of the generator ends the homing");
 }
 
-static const CommandDTO_t test_x_jog_command = {
+static const CommandDTO_t test_relative_move_command = {
     .sequence = 140U,
-    .code = COMMAND_CODE_X_JOG,
-    .parameters.x_jog = {.delta_um = 2000, .speed_um_per_s = 1000U},
+    .code = COMMAND_CODE_MOTION_OPERATION,
+    .parameters.motion_operation =
+        {
+            .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE | COMMAND_MOTION_OPERATION_FLAG_RELATIVE,
+            .x = 2000,
+            .speed = 1000U,
+        },
 };
 
 static const CommandDTO_t test_xyz_move_command = {
@@ -1808,9 +1813,9 @@ static void test_commands_during_home(void) {
     expect_u32(fake_x_bench_starts, 1U, "repeated HOME does not restart an active homing");
     expect_u32(test_last_receive_timeout, 1U, "repeated HOME keeps homing active");
 
-    run_command_during_home(&context, &test_x_jog_command);
-    expect_u32(motion_task_test_get_planner_call_count(), 0U, "X_JOG is ignored while homing");
-    expect_u32(test_last_receive_timeout, 1U, "X_JOG does not interrupt homing");
+    run_command_during_home(&context, &test_relative_move_command);
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "a relative move is ignored while homing");
+    expect_u32(test_last_receive_timeout, 1U, "a relative move does not interrupt homing");
 
     run_command_during_home(&context, &test_xyz_move_command);
     expect_u32(motion_task_test_get_planner_call_count(), 0U, "XYZ move is not planned while homing");
@@ -1910,69 +1915,94 @@ static void test_limit_deceleration_comes_from_the_axis_config(void) {
     expect_u32(motion_task_get_limit_deceleration(MOTION_AXIS_HARDWARE_COUNT), 0U, "unknown axis has none");
 }
 
-static void run_x_jog(MotionTaskContext_t *context, int32_t delta_um) {
-    CommandDTO_t jog = test_x_jog_command;
-    jog.parameters.x_jog.delta_um = delta_um;
-    script_read(0U, osOK, &jog);
+static void run_relative_move(MotionTaskContext_t *context, int32_t delta_x_um) {
+    CommandDTO_t move = test_relative_move_command;
+    move.parameters.motion_operation.x = delta_x_um;
+    script_read(0U, osOK, &move);
     test_block_when_empty = 1U;
     (void)run_motion_task_until_scripted_stop(context);
 }
 
-static void test_x_jog_is_a_relative_planned_move(void) {
+static void test_relative_move_is_planned_from_the_current_position(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
     context.machine_state.position_um[0] = 1000;
     context.machine_state.position_um[1] = 500;
-    run_x_jog(&context, 2000);
+    run_relative_move(&context, 2000);
     MotionPlannerResult_t result = motion_task_test_get_last_planner_result();
-    expect_u32(result.status, MOTION_PLANNER_STATUS_OK, "X_JOG is planned like any other move");
-    expect_u32(result.block.sequence, 140U, "X_JOG keeps its sequence");
-    expect_i64(result.block.step_delta[0], 160, "X_JOG moves X by its distance");
-    expect_i64(result.block.step_delta[1], 0, "X_JOG leaves Y in place");
-    expect_u32(result.block.feedrate_um_per_s, 1000U, "X_JOG uses its speed");
-    expect_i64(context.machine_state.position_um[0], 3000, "the next move starts at the jog target");
+    expect_u32(result.status, MOTION_PLANNER_STATUS_OK, "a relative move is planned like any other move");
+    expect_u32(result.block.sequence, 140U, "a relative move keeps its sequence");
+    expect_i64(result.block.step_delta[0], 160, "a relative move moves X by its increment");
+    expect_i64(result.block.step_delta[1], 0, "a zero increment leaves Y in place");
+    expect_u32(result.block.feedrate_um_per_s, 1000U, "a relative move uses its speed");
+    expect_i64(context.machine_state.position_um[0], 3000, "the next move starts at the relative target");
     expect_i64(context.machine_state.position_um[1], 500, "Y position is unchanged");
-    expect_u32(test_block_ready_notifications, 1U, "step generator is woken for the jog");
-    expect_u32(fake_x_bench_starts, 0U, "X_JOG no longer drives the axis directly");
+    expect_u32(test_block_ready_notifications, 1U, "step generator is woken for the relative move");
+    expect_u32(fake_x_bench_starts, 0U, "a relative move does not drive the axis directly");
 
     reset_receive_script();
     context = valid_motion_context();
-    run_x_jog(&context, -200000);
+    run_relative_move(&context, -200000);
     expect_u32(
         motion_task_get_last_planner_status(),
         MOTION_PLANNER_STATUS_POSITION_OUT_OF_RANGE,
-        "X_JOG beyond the travel is rejected"
+        "a relative move beyond the travel is rejected"
     );
-    expect_i64(context.machine_state.position_um[0], 0, "rejected X_JOG keeps the position");
-    expect_u32(test_block_ready_notifications, 0U, "rejected X_JOG moves nothing");
+    expect_i64(context.machine_state.position_um[0], 0, "a rejected relative move keeps the position");
+    expect_u32(test_block_ready_notifications, 0U, "a rejected relative move moves nothing");
 
     reset_receive_script();
     context = valid_motion_context();
     context.machine_state.homed_axes_mask = 0U;
-    run_x_jog(&context, 2000);
-    expect_u32(motion_task_get_last_planner_status(), MOTION_PLANNER_STATUS_NOT_HOMED, "X_JOG needs a homed X");
+    run_relative_move(&context, 2000);
+    expect_u32(motion_task_get_last_planner_status(), MOTION_PLANNER_STATUS_NOT_HOMED, "a relative move needs a homed X");
 
     /* Targets beyond int32 are clamped instead of wrapping around. */
     reset_receive_script();
     context = valid_motion_context();
     context.machine_state.position_um[0] = INT32_MAX;
-    run_x_jog(&context, 1);
+    run_relative_move(&context, 1);
     expect_i64(motion_task_test_get_last_planner_result().block.step_delta[0], 0, "positive overflow is clamped");
-    expect_i64(context.machine_state.position_um[0], INT32_MAX, "clamped jog leaves X at the int32 limit");
+    expect_i64(context.machine_state.position_um[0], INT32_MAX, "a clamped move leaves X at the int32 limit");
 
     reset_receive_script();
     context = valid_motion_context();
     context.machine_state.position_um[0] = INT32_MIN;
-    run_x_jog(&context, -1);
+    run_relative_move(&context, -1);
     expect_i64(context.machine_state.position_um[0], INT32_MIN, "negative overflow is clamped");
 
     reset_receive_script();
-    run_x_jog(NULL, 2000);
+    run_relative_move(NULL, 2000);
     expect_u32(
         motion_task_get_last_planner_status(),
         MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
-        "X_JOG without a task context is rejected by the planner"
+        "a relative move without a task context is rejected by the planner"
     );
+}
+
+static void test_relative_move_applies_increments_to_every_axis(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.position_um[0] = 1000;
+    context.machine_state.position_um[1] = 2000;
+    context.machine_state.position_um[2] = 300;
+    CommandDTO_t move = test_relative_move_command;
+    move.parameters.motion_operation.x = -500;
+    move.parameters.motion_operation.y = 1000;
+    move.parameters.motion_operation.z = -300;
+    script_read(0U, osOK, &move);
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(&context);
+
+    const MotionPlannerResult_t result = motion_task_test_get_last_planner_result();
+    expect_u32(result.status, MOTION_PLANNER_STATUS_OK, "a relative XYZ move is planned");
+    /* 80 steps per 1000 um on every axis. */
+    expect_i64(result.block.step_delta[0], -40, "X moves back by its increment");
+    expect_i64(result.block.step_delta[1], 80, "Y moves forward by its increment");
+    expect_i64(result.block.step_delta[2], -24, "Z moves back by its increment");
+    expect_i64(context.machine_state.position_um[0], 500, "X ends at position plus increment");
+    expect_i64(context.machine_state.position_um[1], 3000, "Y ends at position plus increment");
+    expect_i64(context.machine_state.position_um[2], 0, "Z ends at position plus increment");
 }
 
 static void test_stop_fault_acknowledgement_edges(void) {
@@ -2749,7 +2779,8 @@ int main(void) {
     test_home_and_calibrate_wait_for_the_planned_stream();
     test_step_timing_comes_from_the_axis_config();
     test_limit_deceleration_comes_from_the_axis_config();
-    test_x_jog_is_a_relative_planned_move();
+    test_relative_move_is_planned_from_the_current_position();
+    test_relative_move_applies_increments_to_every_axis();
     test_stop_fault_acknowledgement_edges();
     test_stop_clears_runtime_fault_and_x_homing();
     test_stop_without_fault_keeps_homing();
