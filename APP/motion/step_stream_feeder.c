@@ -163,7 +163,7 @@ void step_stream_feeder_reset(StepStreamFeeder_t *feeder) {
 }
 
 static StepStreamFeederStatus_t step_stream_feeder_fault(StepStreamFeeder_t *feeder, StepStreamFeederStatus_t status) {
-    feeder->ports.stop();
+    feeder->ports.stop(feeder->ports.context);
     feeder->phase = STEP_STREAM_FEEDER_PHASE_FAULT;
     feeder->fault_status = status;
     return status;
@@ -217,7 +217,7 @@ static uint8_t step_stream_feeder_rebase_after_clear(StepStreamFeeder_t *feeder)
     if (feeder->config.lane_count != 1U) {
         return 0U;
     }
-    feeder->plan_epoch = feeder->ports.plan_epoch();
+    feeder->plan_epoch = feeder->ports.plan_epoch(feeder->ports.context);
     feeder->front_block = feeder->lane[0].next_block;
     return 1U;
 }
@@ -232,7 +232,7 @@ step_stream_feeder_next_block(StepStreamFeeder_t *feeder, uint32_t lane, MotionP
         return STEP_STREAM_FEEDER_NEXT_NONE;
     }
     const StepStreamFeederPlanResult_t peeked =
-        feeder->ports.peek_block(feeder->plan_epoch, index - feeder->front_block, block);
+        feeder->ports.peek_block(feeder->ports.context, feeder->plan_epoch, index - feeder->front_block, block);
     if (peeked == STEP_STREAM_FEEDER_PLAN_NONE) {
         /* One lane alone cannot get out of step with itself, so its stream stays open for a late block. */
         if (feeder->config.lane_count > 1U) {
@@ -262,7 +262,7 @@ static uint8_t step_stream_feeder_retire_blocks(StepStreamFeeder_t *feeder) {
         return 1U;
     }
     const StepStreamFeederPlanResult_t discarded =
-        feeder->ports.discard_blocks(feeder->plan_epoch, started_by_all - feeder->front_block);
+        feeder->ports.discard_blocks(feeder->ports.context, feeder->plan_epoch, started_by_all - feeder->front_block);
     if (discarded == STEP_STREAM_FEEDER_PLAN_STALE) {
         /* The clear has taken the blocks away already. */
         return step_stream_feeder_rebase_after_clear(feeder);
@@ -363,7 +363,8 @@ static int8_t step_stream_feeder_decide_directions(StepStreamFeeder_t *feeder, u
     uint8_t positive = 0U;
     for (uint32_t offset = 0U;; ++offset) {
         MotionPlanBlock_t block;
-        const StepStreamFeederPlanResult_t peeked = feeder->ports.peek_block(epoch, offset, &block);
+        const StepStreamFeederPlanResult_t peeked =
+            feeder->ports.peek_block(feeder->ports.context, epoch, offset, &block);
         /* Nothing has started yet, so a clear that comes in the middle of the scan only means: look again next time. */
         if (peeked == STEP_STREAM_FEEDER_PLAN_STALE) {
             return 0;
@@ -413,7 +414,7 @@ static int8_t step_stream_feeder_decide_directions(StepStreamFeeder_t *feeder, u
  * it. *begun is 0 when the plan has nothing to start. */
 static StepStreamFeederStatus_t step_stream_feeder_begin_stream(StepStreamFeeder_t *feeder, uint8_t *begun) {
     *begun = 0U;
-    const uint32_t epoch = feeder->ports.plan_epoch();
+    const uint32_t epoch = feeder->ports.plan_epoch(feeder->ports.context);
     const int8_t decided = step_stream_feeder_decide_directions(feeder, epoch);
     if (decided < 0) {
         return step_stream_feeder_generator_fault(feeder);
@@ -422,14 +423,17 @@ static StepStreamFeederStatus_t step_stream_feeder_begin_stream(StepStreamFeeder
         return STEP_STREAM_FEEDER_STATUS_OK;
     }
 
-    if (feeder->ports.prepare() != STEP_STREAM_FEEDER_AXIS_OK) {
+    if (feeder->ports.prepare(feeder->ports.context) != STEP_STREAM_FEEDER_AXIS_OK) {
         return step_stream_feeder_axis_fault(feeder);
     }
     for (uint32_t lane = 0U; lane < feeder->config.lane_count; ++lane) {
         const uint32_t axis = feeder->config.axis_index[lane];
         if (step_stream_feeder_bit(feeder->direction_known_mask, axis) != 0U &&
-            feeder->ports.set_direction(lane, step_stream_feeder_bit(feeder->direction_positive_mask, axis)) !=
-                STEP_STREAM_FEEDER_AXIS_OK) {
+            feeder->ports.set_direction(
+                feeder->ports.context,
+                lane,
+                step_stream_feeder_bit(feeder->direction_positive_mask, axis)
+            ) != STEP_STREAM_FEEDER_AXIS_OK) {
             return step_stream_feeder_axis_fault(feeder);
         }
     }
@@ -463,7 +467,8 @@ static StepStreamFeederStatus_t step_stream_feeder_fill_released_halves(StepStre
         for (;;) {
             uint8_t half = 0U;
             uint16_t *records = NULL;
-            const StepStreamFeederAxisResult_t acquired = feeder->ports.acquire_half(lane, &half, &records);
+            const StepStreamFeederAxisResult_t acquired =
+                feeder->ports.acquire_half(feeder->ports.context, lane, &half, &records);
             if (acquired == STEP_STREAM_FEEDER_AXIS_NO_REQUEST) {
                 break;
             }
@@ -472,7 +477,7 @@ static StepStreamFeederStatus_t step_stream_feeder_fill_released_halves(StepStre
             }
 
             if (feeder->phase == STEP_STREAM_FEEDER_PHASE_STREAMING && step_stream_feeder_stream_finished(feeder)) {
-                feeder->ports.stop();
+                feeder->ports.stop(feeder->ports.context);
                 feeder->phase = STEP_STREAM_FEEDER_PHASE_IDLE;
                 step_stream_feeder_counter_increment(&feeder->diagnostics.streams_stopped);
                 *stopped = 1U;
@@ -484,7 +489,7 @@ static StepStreamFeederStatus_t step_stream_feeder_fill_released_halves(StepStre
             if (filled != STEP_STREAM_FEEDER_STATUS_OK) {
                 return filled;
             }
-            if (feeder->ports.commit_half(lane, half) != STEP_STREAM_FEEDER_AXIS_OK) {
+            if (feeder->ports.commit_half(feeder->ports.context, lane, half) != STEP_STREAM_FEEDER_AXIS_OK) {
                 return step_stream_feeder_axis_fault(feeder);
             }
             feeder->lane[lane].half_has_block[half] = has_block;
@@ -526,7 +531,8 @@ StepStreamFeederStatus_t step_stream_feeder_service(StepStreamFeeder_t *feeder) 
         if (feeder->phase == STEP_STREAM_FEEDER_PHASE_PRIMING) {
             /* Both halves of every lane were filled above; an axis that still lacks one refuses the start and faults.
              */
-            if (feeder->ports.start(feeder->config.startup_period_ns) != STEP_STREAM_FEEDER_AXIS_OK) {
+            if (feeder->ports.start(feeder->ports.context, feeder->config.startup_period_ns) !=
+                STEP_STREAM_FEEDER_AXIS_OK) {
                 return step_stream_feeder_axis_fault(feeder);
             }
             feeder->phase = STEP_STREAM_FEEDER_PHASE_STREAMING;
