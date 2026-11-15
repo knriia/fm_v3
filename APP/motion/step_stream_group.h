@@ -25,15 +25,6 @@ typedef enum {
 
 typedef enum { STEP_STREAM_GROUP_PORT_OK = 0, STEP_STREAM_GROUP_PORT_ERROR } StepStreamGroupPortResult_t;
 
-/* What a limit switch of one channel does. */
-typedef enum {
-    /* A planned move: one switch stops every channel at once, each by its own braking ramp. */
-    STEP_STREAM_GROUP_MODE_PLANNED = 0,
-    /* Homing and calibration: the channels reach their switches at different times, so a switch brakes only its own
-     * channel and the others go on. */
-    STEP_STREAM_GROUP_MODE_INDEPENDENT
-} StepStreamGroupMode_t;
-
 typedef enum {
     /* No channel runs. */
     STEP_STREAM_GROUP_STATE_IDLE = 0,
@@ -79,7 +70,6 @@ typedef struct {
     StepStreamGroupPorts_t ports;
     StepStreamGroupListener_t listener;
     uint32_t member_count;
-    volatile StepStreamGroupMode_t mode;
     volatile StepStreamGroupState_t state;
     volatile uint32_t fault_member;
     volatile uint32_t fault;
@@ -89,7 +79,7 @@ typedef struct {
 } StepStreamGroup_t;
 
 /* A group in static storage can be defined without init: set .ports, .listener and .member_count in its initializer and
- * leave the rest zero (IDLE, PLANNED). It is then complete before any task or interrupt runs, so calls that come
+ * leave the rest zero (IDLE). It is then complete before any task or interrupt runs, so calls that come
  * before the owner task starts need no special case. */
 
 /* member_count channels (1..STEP_STREAM_GROUP_MAX_MEMBERS); the listener may be NULL. */
@@ -99,9 +89,6 @@ StepStreamGroupStatus_t step_stream_group_init(
     const StepStreamGroupPorts_t *ports,
     const StepStreamGroupListener_t *listener
 );
-
-/* Only while IDLE. The mode stays until changed. */
-StepStreamGroupStatus_t step_stream_group_set_mode(StepStreamGroup_t *group, StepStreamGroupMode_t mode);
 
 /* IDLE to PRIMING: resets every ring. */
 StepStreamGroupStatus_t step_stream_group_prepare(StepStreamGroup_t *group);
