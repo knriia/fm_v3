@@ -3,6 +3,7 @@
 
 #include "motion/axis_calibration.h"
 #include "motion/motion_planner.h"
+#include "motion/plan_buffer.h"
 #include "motion_axis_hardware.h"
 #include "motion_stop.h"
 
@@ -49,6 +50,8 @@ typedef struct {
     MotionPlannerConfig_t planner_config;
     /* Kept in RAM only for now: a reboot needs a new calibration. */
     MachineCalibration_t calibration;
+    /* The queue the task pushes plan blocks into; it outlives the task. */
+    PlanBuffer_t *plan_buffer;
 } MotionTaskContext_t;
 
 void MotionTask(void *argument);

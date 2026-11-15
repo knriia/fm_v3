@@ -1,6 +1,8 @@
 #ifndef FM_V3_STEP_GENERATOR_TASK_H
 #define FM_V3_STEP_GENERATOR_TASK_H
 
+#include "motion/plan_buffer.h"
+
 #include <stdint.h>
 
 #define STEP_GENERATOR_TASK_STACK_SIZE_BYTES (1024U * 2U)
@@ -78,6 +80,8 @@ typedef struct {
     uint32_t step_low_time_ns;
     /* Deceleration of the braking on a limit switch; 0 leaves the axis without a ramp, so it stops at once. */
     uint32_t limit_deceleration_steps_per_s2;
+    /* The queue of plan blocks the task plays; it outlives the task. Without it the task only reports an error. */
+    PlanBuffer_t *plan_buffer;
 } StepGeneratorTaskConfig_t;
 
 /* Turns plan blocks into ring records of the X stream axis, keeps its ring filled and starts and stops the stream.

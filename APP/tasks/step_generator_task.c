@@ -69,6 +69,8 @@ typedef struct StepGeneratorInstance {
     /* Owned by the task: only StepGeneratorTask touches it. */
     StepStreamFeeder_t feeder;
     StepStreamGroup_t group;
+    /* The queue of plan blocks this stream plays; set once at task start, NULL before it. */
+    PlanBuffer_t *plan_buffer;
     const MotionAxis_t *member_axes;
     const uint32_t *member_planner_axes;
     uint32_t member_count;
@@ -154,8 +156,8 @@ void step_generator_task_halt(void) {
 
 uint8_t step_generator_task_is_busy(void) {
     PlanBufferDiagnostics_t plan = {0};
-    /* Only a null pointer makes this fail, and the zeroed struct then reads as an empty plan. */
-    (void)plan_buffer_get_diagnostics(&plan);
+    /* Only a null pointer (no queue yet) makes this fail, and the zeroed struct then reads as an empty plan. */
+    (void)plan_buffer_get_diagnostics(step_generator_task_instance.plan_buffer, &plan);
     return (uint8_t)(step_generator_task_instance.stream_busy != 0U || plan.queued != 0U);
 }
 
@@ -260,14 +262,14 @@ static StepStreamFeederPlanResult_t step_generator_task_plan_result(PlanBufferSt
 }
 
 static uint32_t step_generator_task_port_plan_epoch(void *context) {
-    (void)context;
-    return plan_buffer_get_epoch();
+    const StepGeneratorInstance_t *const self = context;
+    return plan_buffer_get_epoch(self->plan_buffer);
 }
 
 static StepStreamFeederPlanResult_t
 step_generator_task_port_peek_block(void *context, uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block) {
-    (void)context;
-    return step_generator_task_plan_result(plan_buffer_try_peek(epoch, offset, block));
+    StepGeneratorInstance_t *const self = context;
+    return step_generator_task_plan_result(plan_buffer_try_peek(self->plan_buffer, epoch, offset, block));
 }
 
 static StepStreamFeederPlanResult_t
@@ -275,7 +277,7 @@ step_generator_task_port_discard_blocks(void *context, uint32_t epoch, uint32_t 
     StepGeneratorInstance_t *const self = context;
     /* Set before the blocks are out of sight, so HOME never sees an empty plan buffer and an idle stream in between. */
     self->stream_busy = 1U;
-    return step_generator_task_plan_result(plan_buffer_discard(epoch, count));
+    return step_generator_task_plan_result(plan_buffer_discard(self->plan_buffer, epoch, count));
 }
 
 /* DMA interrupt: a half of the ring has been played. */
@@ -485,7 +487,12 @@ static uint8_t step_generator_task_member_clocks_match(const StepGeneratorInstan
 /* Builds the feeder from the driver timing. Returns 0 when the clock or the timing cannot be used. */
 static uint8_t
 step_generator_task_setup_feeder(StepGeneratorInstance_t *self, const StepGeneratorTaskConfig_t *task_config) {
-    if (task_config == NULL || step_generator_task_member_clocks_match(self) == 0U) {
+    if (task_config == NULL) {
+        return 0U;
+    }
+    /* Kept even when the setup fails below, so is_busy still sees the queued blocks. */
+    self->plan_buffer = task_config->plan_buffer;
+    if (task_config->plan_buffer == NULL || step_generator_task_member_clocks_match(self) == 0U) {
         return 0U;
     }
     StepStreamFeederConfig_t config;

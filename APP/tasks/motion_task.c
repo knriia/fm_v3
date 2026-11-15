@@ -32,6 +32,9 @@ static volatile MotionTaskDiagnostics motion_task_diagnostics = {
 
 /* The planned step stream of each axis. */
 static StepExecutor_t motion_task_stream_executors[MOTION_AXIS_HARDWARE_COUNT];
+/* The queue the plans, the homing moves and the calibration moves go into. Set once when the task starts; the moves of
+ * the calibration procedure carry no context, so the file keeps it. */
+static PlanBuffer_t *motion_task_plan_buffer;
 
 /* The three homing moves; the switches, not step counts, end them. */
 typedef struct {
@@ -213,7 +216,7 @@ static void motion_task_queue_move(MotionTaskContext_t *context, const MotionPla
 #endif
     if (result.status == MOTION_PLANNER_STATUS_OK) {
         motion_task_counter_increment(&motion_task_diagnostics.planner_blocks_created);
-        if (plan_buffer_try_push(&result.block) != PLAN_BUFFER_STATUS_OK) {
+        if (plan_buffer_try_push(motion_task_plan_buffer, &result.block) != PLAN_BUFFER_STATUS_OK) {
             /* The rejected block is dropped; PlanBuffer records why it was not accepted. */
             return;
         }
@@ -226,7 +229,7 @@ static void motion_task_queue_move(MotionTaskContext_t *context, const MotionPla
         motion_task_counter_increment(&motion_task_diagnostics.planner_no_motion);
     } else {
         motion_task_counter_increment(&motion_task_diagnostics.planner_errors);
-        (void)plan_buffer_clear();
+        (void)plan_buffer_clear(motion_task_plan_buffer);
     }
 }
 
@@ -307,7 +310,7 @@ static uint8_t motion_task_limits_conflict(MotionAxis_t axis) {
  * has reset. Returns 0 when it does not reset in time; the generator then stays halted until the next STOP. */
 static uint8_t motion_task_stream_flush(void) {
     step_generator_task_halt();
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(motion_task_plan_buffer);
     step_generator_task_resume_after_stop();
     for (uint32_t waited_ms = 0U; step_generator_task_is_busy() != 0U; ++waited_ms) {
         if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
@@ -368,7 +371,7 @@ static uint8_t motion_task_stream_start_move(
     }
     /* The stop of the previous move is still recorded; the next poll must wait for the stop of this one. */
     motion_axis_hardware_clear_stop_reason(axis);
-    if (plan_buffer_try_push(&block) != PLAN_BUFFER_STATUS_OK) {
+    if (plan_buffer_try_push(motion_task_plan_buffer, &block) != PLAN_BUFFER_STATUS_OK) {
         return 0U;
     }
     step_generator_task_notify_block_ready();
@@ -430,7 +433,7 @@ static void motion_task_home_begin(MotionTaskAxisState_t *state, MotionTaskConte
     state->home_phase = MOTION_TASK_HOME_IDLE;
     context->machine_state.homed_axes_mask &= (uint8_t)~axis_mask;
     /* Queued blocks were planned from the old position of this axis. */
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(motion_task_plan_buffer);
     if (motion_task_limits_conflict(state->axis) != 0U) {
         return;
     }
@@ -742,7 +745,7 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
 }
 
 static void motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
-    (void)plan_buffer_clear();
+    (void)plan_buffer_clear(motion_task_plan_buffer);
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         motion_task_calibration_cancel(&states[axis]);
         motion_task_stop_axis(&states[axis], context);
@@ -786,6 +789,7 @@ static void motion_task_start_axes(
 void MotionTask(void *argument) {
     MotionTaskContext_t *context = argument;
     MotionTaskAxisState_t axes[MOTION_AXIS_HARDWARE_COUNT] = {0};
+    motion_task_plan_buffer = context == NULL ? NULL : context->plan_buffer;
 
     /* Drive STEP/DIR/ENABLE of every axis to defined levels before any command can arrive. */
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
