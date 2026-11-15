@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 #define COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE 0x01U
+/* With XYZ_MOVE: x, y, z are increments to the planned position instead of an absolute target. */
+#define COMMAND_MOTION_OPERATION_FLAG_RELATIVE 0x10U
 
 typedef struct {
     uint8_t axes;
@@ -14,12 +16,6 @@ typedef struct {
 typedef struct {
     uint8_t axes;
 } CommandCalibrateParameters_t;
-
-/* Relative X move; travel and speed limits come from the calibration and are checked by the planner. */
-typedef struct {
-    int32_t delta_um;
-    uint32_t speed_um_per_s;
-} CommandXAxisJogParameters_t;
 
 typedef struct {
     uint8_t operation_flags;
@@ -53,7 +49,6 @@ typedef struct {
     union {
         CommandHomeParameters_t home;
         CommandCalibrateParameters_t calibrate;
-        CommandXAxisJogParameters_t x_jog;
         CommandMotionOperationParameters_t motion_operation;
         CommandSetTemperatureParameters_t set_temperature;
         CommandSetOutputParameters_t set_output;

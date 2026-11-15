@@ -41,21 +41,17 @@ static uint16_t command_decoder_validate_command(const CommandRequestDTO_t *requ
         }
         return payload[1] != 0U && (payload[1] & 0xF8U) == 0U ? 0U : COMMAND_ERROR_INVALID_PARAMETER;
 
-    case COMMAND_CODE_X_JOG: {
-        if (payload_length != 9U) {
-            return COMMAND_ERROR_INVALID_LENGTH;
-        }
-        const int32_t delta_um = command_decoder_read_i32_le(&payload[1]);
-        const uint32_t speed_um_per_s = command_decoder_read_u32_le(&payload[5]);
-        return delta_um != 0 && speed_um_per_s != 0U ? 0U : COMMAND_ERROR_INVALID_PARAMETER;
-    }
-
     case COMMAND_CODE_MOTION_OPERATION: {
         if (payload_length != 30U) {
             return COMMAND_ERROR_INVALID_LENGTH;
         }
         const uint8_t operation_flags = payload[1];
-        if (operation_flags == 0U || (operation_flags & 0xF0U) != 0U) {
+        if (operation_flags == 0U || (operation_flags & 0xE0U) != 0U) {
+            return COMMAND_ERROR_INVALID_PARAMETER;
+        }
+        /* The relative flag only changes how the XYZ fields are read, so it has no meaning without a move. */
+        if ((operation_flags & COMMAND_MOTION_OPERATION_FLAG_RELATIVE) != 0U &&
+            (operation_flags & COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE) == 0U) {
             return COMMAND_ERROR_INVALID_PARAMETER;
         }
         const uint32_t speed = command_decoder_read_u32_le(&payload[14]);
@@ -103,11 +99,6 @@ static CommandDTO_t command_decoder_decode_command(const CommandRequestDTO_t *re
 
     case COMMAND_CODE_CALIBRATE:
         command.parameters.calibrate.axes = payload[1];
-        break;
-
-    case COMMAND_CODE_X_JOG:
-        command.parameters.x_jog.delta_um = command_decoder_read_i32_le(&payload[1]);
-        command.parameters.x_jog.speed_um_per_s = command_decoder_read_u32_le(&payload[5]);
         break;
 
     case COMMAND_CODE_MOTION_OPERATION:

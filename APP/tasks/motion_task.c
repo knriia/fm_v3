@@ -230,32 +230,25 @@ static void motion_task_queue_move(MotionTaskContext_t *context, const MotionPla
     }
 }
 
+/* A target beyond int32 is clamped; it is far outside any axis, so the planner rejects it. */
+static int32_t motion_task_relative_target(int32_t position_um, int32_t delta_um) {
+    const int64_t target_um = (int64_t)position_um + (int64_t)delta_um;
+    return target_um > INT32_MAX ? INT32_MAX : target_um < INT32_MIN ? INT32_MIN : (int32_t)target_um;
+}
+
+/* Absolute operations carry the target; relative ones carry increments to the planned position. */
 static void motion_task_queue_xyz_move(MotionTaskContext_t *context, const CommandDTO_t *command) {
     const CommandMotionOperationParameters_t *motion = &command->parameters.motion_operation;
-    const MotionPlannerRequest_t request = {
+    MotionPlannerRequest_t request = {
         .sequence = command->sequence,
         .target_um = {motion->x, motion->y, motion->z},
         .feedrate_um_per_s = motion->speed,
     };
-    motion_task_queue_move(context, &request);
-}
-
-/* X_JOG is a move relative to the planned X position; Y and Z stay where they are. */
-static void motion_task_queue_x_jog(MotionTaskContext_t *context, const CommandDTO_t *command) {
-    MotionPlannerRequest_t request = {
-        .sequence = command->sequence,
-        .feedrate_um_per_s = command->parameters.x_jog.speed_um_per_s,
-    };
-    if (context != NULL) {
+    if (context != NULL && (motion->operation_flags & COMMAND_MOTION_OPERATION_FLAG_RELATIVE) != 0U) {
         for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
-            request.target_um[axis] = context->machine_state.position_um[axis];
+            request.target_um[axis] =
+                motion_task_relative_target(context->machine_state.position_um[axis], request.target_um[axis]);
         }
-        /* A target beyond int32 is clamped; it is far outside any axis, so the planner rejects it. */
-        const int64_t target_um =
-            (int64_t)context->machine_state.position_um[0] + (int64_t)command->parameters.x_jog.delta_um;
-        request.target_um[0] = target_um > INT32_MAX   ? INT32_MAX
-                               : target_um < INT32_MIN ? INT32_MIN
-                                                       : (int32_t)target_um;
     }
     motion_task_queue_move(context, &request);
 }
@@ -848,8 +841,6 @@ void MotionTask(void *argument) {
             if (motion_task_axes_can_start(command.parameters.calibrate.axes, start_busy_mask) != 0U) {
                 motion_task_start_axes(axes, context, command.parameters.calibrate.axes, 1U);
             }
-        } else if (command.code == COMMAND_CODE_X_JOG && busy_mask == 0U) {
-            motion_task_queue_x_jog(context, &command);
         } else if (motion_task_is_xyz_move(&command) && busy_mask == 0U) {
             motion_task_queue_xyz_move(context, &command);
         }
