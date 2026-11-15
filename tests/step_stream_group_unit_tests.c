@@ -249,7 +249,6 @@ static void test_init_rejects_bad_arguments(void) {
 
     assert(step_stream_group_init(&local, 1U, &ports, NULL) == STEP_STREAM_GROUP_STATUS_OK);
     assert(step_stream_group_get_state(&local) == STEP_STREAM_GROUP_STATE_IDLE);
-    assert(local.mode == STEP_STREAM_GROUP_MODE_PLANNED);
     assert(step_stream_group_init(&local, STEP_STREAM_GROUP_MAX_MEMBERS, &ports, NULL) == STEP_STREAM_GROUP_STATUS_OK);
 }
 
@@ -257,9 +256,6 @@ static void test_null_group_is_harmless(void) {
     /* A zeroed group is one that was never initialized: no ports, so no call may reach them. */
     StepStreamGroup_t blank;
     memset(&blank, 0, sizeof(blank));
-    assert(
-        step_stream_group_set_mode(&blank, STEP_STREAM_GROUP_MODE_PLANNED) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT
-    );
     assert(step_stream_group_prepare(&blank) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
     assert(step_stream_group_start(&blank, TEST_STARTUP_NS) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
     assert(step_stream_group_reset(&blank) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
@@ -270,9 +266,6 @@ static void test_null_group_is_harmless(void) {
     step_stream_group_on_member_fault(&blank, 0U, 1U);
     assert(step_stream_group_get_state(&blank) == STEP_STREAM_GROUP_STATE_IDLE);
 
-    assert(
-        step_stream_group_set_mode(NULL, STEP_STREAM_GROUP_MODE_PLANNED) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT
-    );
     assert(step_stream_group_prepare(NULL) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
     assert(step_stream_group_start(NULL, TEST_STARTUP_NS) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
     assert(step_stream_group_reset(NULL) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
@@ -284,20 +277,6 @@ static void test_null_group_is_harmless(void) {
     step_stream_group_on_limit(NULL, 0U);
     step_stream_group_on_member_braking(NULL, 0U);
     step_stream_group_on_member_fault(NULL, 0U, 1U);
-}
-
-static void test_mode_changes_only_while_idle(void) {
-    reset_fixture();
-    assert(step_stream_group_set_mode(&group, STEP_STREAM_GROUP_MODE_INDEPENDENT) == STEP_STREAM_GROUP_STATUS_OK);
-    assert(group.mode == STEP_STREAM_GROUP_MODE_INDEPENDENT);
-    assert(step_stream_group_set_mode(&group, (StepStreamGroupMode_t)7) == STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT);
-    assert(group.mode == STEP_STREAM_GROUP_MODE_INDEPENDENT);
-
-    assert(step_stream_group_prepare(&group) == STEP_STREAM_GROUP_STATUS_OK);
-    assert(step_stream_group_set_mode(&group, STEP_STREAM_GROUP_MODE_PLANNED) == STEP_STREAM_GROUP_STATUS_BAD_STATE);
-    assert(group.mode == STEP_STREAM_GROUP_MODE_INDEPENDENT);
-    assert(critical_violations == 0U);
-    assert(critical_depth == 0U);
 }
 
 static void test_prepare_resets_every_ring(void) {
@@ -396,7 +375,7 @@ static void test_stop_keeps_a_fault(void) {
     assert(step_stream_group_get_fault(&group) == 5U);
 }
 
-static void test_planned_limit_brakes_every_member(void) {
+static void test_limit_brakes_every_member(void) {
     reset_fixture();
     run_group();
     step_stream_group_on_limit(&group, 1U);
@@ -413,22 +392,6 @@ static void test_planned_limit_brakes_every_member(void) {
     assert(step_stream_group_get_state(&group) == STEP_STREAM_GROUP_STATE_STOPPING);
     assert(critical_violations == 0U);
     assert(critical_depth == 0U);
-}
-
-static void test_independent_limit_brakes_only_its_member(void) {
-    reset_fixture();
-    assert(step_stream_group_set_mode(&group, STEP_STREAM_GROUP_MODE_INDEPENDENT) == STEP_STREAM_GROUP_STATUS_OK);
-    run_group();
-    step_stream_group_on_limit(&group, 1U);
-    assert(call_count == 1U);
-    expect_call(0U, CALL_BRAKE, 1U, 0U);
-    assert(step_stream_group_get_state(&group) == STEP_STREAM_GROUP_STATE_RUNNING);
-
-    /* The others reach their switches later and brake the same way. */
-    step_stream_group_on_limit(&group, 0U);
-    assert(call_count == 2U);
-    expect_call(1U, CALL_BRAKE, 0U, 0U);
-    assert(step_stream_group_get_state(&group) == STEP_STREAM_GROUP_STATE_RUNNING);
 }
 
 static void test_limit_is_ignored_unless_running(void) {
@@ -680,25 +643,13 @@ static void test_limit_before_running_is_applied_after_the_start(void) {
     assert(call_count == 0U);
 
     assert(step_stream_group_start(&group, TEST_STARTUP_NS) == STEP_STREAM_GROUP_STATUS_OK);
-    /* Arm x3, trigger, then the switch as if it had just come: every channel brakes (planned move). */
+    /* Arm x3, trigger, then the switch as if it had just come: every channel brakes. */
     assert(call_count == TEST_MEMBERS + 1U + TEST_MEMBERS);
     expect_call(TEST_MEMBERS, CALL_TRIGGER, 0U, 0U);
     for (uint32_t member = 0U; member < TEST_MEMBERS; ++member) {
         expect_call(TEST_MEMBERS + 1U + member, CALL_BRAKE, member, 0U);
     }
     assert(step_stream_group_get_state(&group) == STEP_STREAM_GROUP_STATE_STOPPING);
-}
-
-static void test_independent_limit_before_running_brakes_only_its_member(void) {
-    reset_fixture();
-    assert(step_stream_group_set_mode(&group, STEP_STREAM_GROUP_MODE_INDEPENDENT) == STEP_STREAM_GROUP_STATUS_OK);
-    assert(step_stream_group_prepare(&group) == STEP_STREAM_GROUP_STATUS_OK);
-    step_stream_group_on_limit(&group, 2U);
-    call_count = 0U;
-    assert(step_stream_group_start(&group, TEST_STARTUP_NS) == STEP_STREAM_GROUP_STATUS_OK);
-    assert(count_calls(CALL_BRAKE) == 1U);
-    expect_call(TEST_MEMBERS + 1U, CALL_BRAKE, 2U, 0U);
-    assert(step_stream_group_get_state(&group) == STEP_STREAM_GROUP_STATE_RUNNING);
 }
 
 static void test_a_pending_limit_does_not_outlive_its_stream(void) {
@@ -748,7 +699,6 @@ static void test_restart_after_a_braking(void) {
 int main(void) {
     test_init_rejects_bad_arguments();
     test_null_group_is_harmless();
-    test_mode_changes_only_while_idle();
     test_prepare_resets_every_ring();
     test_prepare_failure_leaves_the_group_idle();
     test_start_arms_every_member_then_triggers_once();
@@ -756,8 +706,7 @@ int main(void) {
     test_start_failure_stops_the_armed_members();
     test_stop_stops_every_member_and_goes_idle();
     test_stop_keeps_a_fault();
-    test_planned_limit_brakes_every_member();
-    test_independent_limit_brakes_only_its_member();
+    test_limit_brakes_every_member();
     test_limit_is_ignored_unless_running();
     test_braking_is_forwarded_to_the_listener();
     test_fault_stops_the_others_and_is_reported_once();
@@ -775,7 +724,6 @@ int main(void) {
     test_failed_arm_does_not_overwrite_a_fault();
     test_stop_does_not_overwrite_a_fault_that_comes_meanwhile();
     test_limit_before_running_is_applied_after_the_start();
-    test_independent_limit_before_running_brakes_only_its_member();
     test_a_pending_limit_does_not_outlive_its_stream();
     test_reset_is_valid_in_every_state_without_active_members();
     test_restart_after_a_braking();

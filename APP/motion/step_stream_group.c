@@ -22,7 +22,6 @@ StepStreamGroupStatus_t step_stream_group_init(
         .ports = *ports,
         .listener = listener != NULL ? *listener : (StepStreamGroupListener_t){0},
         .member_count = member_count,
-        .mode = STEP_STREAM_GROUP_MODE_PLANNED,
         .state = STEP_STREAM_GROUP_STATE_IDLE,
     };
     return STEP_STREAM_GROUP_STATUS_OK;
@@ -56,21 +55,6 @@ static uint8_t step_stream_group_any_active(const StepStreamGroup_t *group) {
         }
     }
     return 0U;
-}
-
-StepStreamGroupStatus_t step_stream_group_set_mode(StepStreamGroup_t *group, StepStreamGroupMode_t mode) {
-    if (step_stream_group_is_ready(group) == 0U ||
-        (mode != STEP_STREAM_GROUP_MODE_PLANNED && mode != STEP_STREAM_GROUP_MODE_INDEPENDENT)) {
-        return STEP_STREAM_GROUP_STATUS_INVALID_ARGUMENT;
-    }
-    const uint32_t saved = step_stream_group_enter(group);
-    StepStreamGroupStatus_t status = STEP_STREAM_GROUP_STATUS_BAD_STATE;
-    if (group->state == STEP_STREAM_GROUP_STATE_IDLE) {
-        group->mode = mode;
-        status = STEP_STREAM_GROUP_STATUS_OK;
-    }
-    step_stream_group_exit(group, saved);
-    return status;
 }
 
 StepStreamGroupStatus_t step_stream_group_prepare(StepStreamGroup_t *group) {
@@ -204,16 +188,11 @@ void step_stream_group_on_limit(StepStreamGroup_t *group, uint32_t member) {
         group->pending_limits |= 1UL << member;
     }
     const uint8_t running = group->state == STEP_STREAM_GROUP_STATE_RUNNING ? 1U : 0U;
-    const uint8_t planned = group->mode == STEP_STREAM_GROUP_MODE_PLANNED ? 1U : 0U;
-    if (running != 0U && planned != 0U) {
+    if (running != 0U) {
         group->state = STEP_STREAM_GROUP_STATE_STOPPING;
     }
     step_stream_group_exit(group, saved);
     if (running == 0U) {
-        return;
-    }
-    if (planned == 0U) {
-        group->ports.brake(group->ports.context, member);
         return;
     }
     for (uint32_t other = 0U; other < group->member_count; ++other) {
