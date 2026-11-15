@@ -50,21 +50,28 @@ typedef enum {
 
 typedef struct {
     /* Resets the rings of every lane of an IDLE stream. */
-    StepStreamFeederAxisResult_t (*prepare)(void);
+    StepStreamFeederAxisResult_t (*prepare)(void *context);
     /* The first EMPTY half of the lane and the room for HALF_RECORD_COUNT records in it. */
-    StepStreamFeederAxisResult_t (*acquire_half)(uint32_t lane, uint8_t *half, uint16_t **records);
-    StepStreamFeederAxisResult_t (*commit_half)(uint32_t lane, uint8_t half);
+    StepStreamFeederAxisResult_t (*acquire_half)(void *context, uint32_t lane, uint8_t *half, uint16_t **records);
+    StepStreamFeederAxisResult_t (*commit_half)(void *context, uint32_t lane, uint8_t half);
     /* Called only while the stream is stopped, after prepare. */
-    StepStreamFeederAxisResult_t (*set_direction)(uint32_t lane, uint8_t positive);
+    StepStreamFeederAxisResult_t (*set_direction)(void *context, uint32_t lane, uint8_t positive);
     /* Every lane has both halves FULL. */
-    StepStreamFeederAxisResult_t (*start)(uint32_t startup_period_ns);
+    StepStreamFeederAxisResult_t (*start)(void *context, uint32_t startup_period_ns);
     /* Stops a running stream; harmless on an idle one. */
-    void (*stop)(void);
+    void (*stop)(void *context);
     /* The three below are the plan buffer: its epoch, the block `offset` places behind the front (without taking it)
      * and the drop of the first `count` blocks. */
-    uint32_t (*plan_epoch)(void);
-    StepStreamFeederPlanResult_t (*peek_block)(uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block);
-    StepStreamFeederPlanResult_t (*discard_blocks)(uint32_t epoch, uint32_t count);
+    uint32_t (*plan_epoch)(void *context);
+    StepStreamFeederPlanResult_t (*peek_block)(
+        void *context,
+        uint32_t epoch,
+        uint32_t offset,
+        MotionPlanBlock_t *block
+    );
+    StepStreamFeederPlanResult_t (*discard_blocks)(void *context, uint32_t epoch, uint32_t count);
+    /* Handed to every port above as its first argument: the owner of the stream the feeder serves. */
+    void *context;
 } StepStreamFeederPorts_t;
 
 typedef struct {

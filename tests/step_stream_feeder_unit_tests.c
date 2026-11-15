@@ -62,7 +62,23 @@ static MotionPlanBlock_t fake_push_block;
 /* A clear of the plan buffer right after the given peek call (0: none), the way a planner error does it. */
 static uint32_t fake_clear_after_peek_call;
 
-static StepStreamFeederAxisResult_t fake_prepare(void) {
+/* The token that make_ports hands to the feeder; every port must get it back as its first argument. */
+static int fake_context_token;
+static uint32_t fake_wrong_context_calls;
+/* One bit per port that has been called. */
+static uint32_t fake_context_ports_seen;
+#define FAKE_ALL_PORTS_MASK 0x1FFU
+#define FAKE_STOP_PORT_BIT (1U << 5)
+
+static void note_context(const void *context, uint32_t port_bit) {
+    fake_context_ports_seen |= port_bit;
+    if (context != &fake_context_token) {
+        ++fake_wrong_context_calls;
+    }
+}
+
+static StepStreamFeederAxisResult_t fake_prepare(void *context) {
+    note_context(context, 1U << 0);
     ++fake_prepare_calls;
     if (fake_fail_prepare != 0U) {
         return STEP_STREAM_FEEDER_AXIS_ERROR;
@@ -71,7 +87,8 @@ static StepStreamFeederAxisResult_t fake_prepare(void) {
     return STEP_STREAM_FEEDER_AXIS_OK;
 }
 
-static StepStreamFeederAxisResult_t fake_acquire_half(uint32_t lane, uint8_t *half, uint16_t **records) {
+static StepStreamFeederAxisResult_t fake_acquire_half(void *context, uint32_t lane, uint8_t *half, uint16_t **records) {
+    note_context(context, 1U << 1);
     if (fake_fail_acquire != 0U && fake_failing_lane == lane) {
         return STEP_STREAM_FEEDER_AXIS_ERROR;
     }
@@ -85,7 +102,8 @@ static StepStreamFeederAxisResult_t fake_acquire_half(uint32_t lane, uint8_t *ha
     return STEP_STREAM_FEEDER_AXIS_NO_REQUEST;
 }
 
-static StepStreamFeederAxisResult_t fake_commit_half(uint32_t lane, uint8_t half) {
+static StepStreamFeederAxisResult_t fake_commit_half(void *context, uint32_t lane, uint8_t half) {
+    note_context(context, 1U << 2);
     if (fake_fail_commit != 0U && fake_failing_lane == lane) {
         return STEP_STREAM_FEEDER_AXIS_ERROR;
     }
@@ -93,7 +111,8 @@ static StepStreamFeederAxisResult_t fake_commit_half(uint32_t lane, uint8_t half
     return STEP_STREAM_FEEDER_AXIS_OK;
 }
 
-static StepStreamFeederAxisResult_t fake_set_direction(uint32_t lane, uint8_t positive) {
+static StepStreamFeederAxisResult_t fake_set_direction(void *context, uint32_t lane, uint8_t positive) {
+    note_context(context, 1U << 3);
     if (fake_direction_calls < sizeof(fake_direction_lane_log) / sizeof(fake_direction_lane_log[0])) {
         fake_direction_lane_log[fake_direction_calls] = lane;
     }
@@ -104,15 +123,22 @@ static StepStreamFeederAxisResult_t fake_set_direction(uint32_t lane, uint8_t po
                                                                   : STEP_STREAM_FEEDER_AXIS_OK;
 }
 
-static StepStreamFeederAxisResult_t fake_start(uint32_t startup_period_ns) {
+static StepStreamFeederAxisResult_t fake_start(void *context, uint32_t startup_period_ns) {
+    note_context(context, 1U << 4);
     ++fake_start_calls;
     fake_last_startup_ns = startup_period_ns;
     return fake_fail_start != 0U ? STEP_STREAM_FEEDER_AXIS_ERROR : STEP_STREAM_FEEDER_AXIS_OK;
 }
 
-static void fake_stop(void) { ++fake_stop_calls; }
+static void fake_stop(void *context) {
+    note_context(context, 1U << 5);
+    ++fake_stop_calls;
+}
 
-static uint32_t fake_plan_epoch(void) { return fake_epoch; }
+static uint32_t fake_plan_epoch(void *context) {
+    note_context(context, 1U << 6);
+    return fake_epoch;
+}
 
 static void queue_block(const MotionPlanBlock_t *block);
 
@@ -130,7 +156,9 @@ static StepStreamFeederPlanResult_t fake_peek_block_now(uint32_t epoch, uint32_t
     return STEP_STREAM_FEEDER_PLAN_OK;
 }
 
-static StepStreamFeederPlanResult_t fake_peek_block(uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block) {
+static StepStreamFeederPlanResult_t
+fake_peek_block(void *context, uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block) {
+    note_context(context, 1U << 7);
     ++fake_peek_calls;
     const StepStreamFeederPlanResult_t result = fake_peek_block_now(epoch, offset, block);
     if (fake_push_after_first_end != 0U && result == STEP_STREAM_FEEDER_PLAN_NONE) {
@@ -145,7 +173,8 @@ static StepStreamFeederPlanResult_t fake_peek_block(uint32_t epoch, uint32_t off
     return result;
 }
 
-static StepStreamFeederPlanResult_t fake_discard_blocks(uint32_t epoch, uint32_t count) {
+static StepStreamFeederPlanResult_t fake_discard_blocks(void *context, uint32_t epoch, uint32_t count) {
+    note_context(context, 1U << 8);
     if (fake_discard_forced_result != STEP_STREAM_FEEDER_PLAN_OK) {
         return fake_discard_forced_result;
     }
@@ -217,6 +246,7 @@ static StepStreamFeederPorts_t make_ports(void) {
         .plan_epoch = fake_plan_epoch,
         .peek_block = fake_peek_block,
         .discard_blocks = fake_discard_blocks,
+        .context = &fake_context_token,
     };
 }
 
@@ -250,6 +280,8 @@ static void reset_fakes(void) {
     fake_push_after_first_end = 0U;
     fake_push_fired = 0U;
     fake_clear_after_peek_call = 0U;
+    fake_context_ports_seen = 0U;
+    fake_wrong_context_calls = 0U;
     memset(&fake_push_block, 0, sizeof(fake_push_block));
 }
 
@@ -664,6 +696,8 @@ static void test_short_block_stream_lifecycle(void) {
     expect_u32(diagnostics.halves_filled, 3U, "halves filled");
     expect_u32(diagnostics.streams_started, 1U, "streams started");
     expect_u32(diagnostics.streams_stopped, 1U, "streams stopped");
+    expect_u32(fake_context_ports_seen, FAKE_ALL_PORTS_MASK, "every port was called in the lifecycle");
+    expect_u32(fake_wrong_context_calls, 0U, "every port gets the context of the ports table");
 }
 
 static void test_late_block_joins_idle_stream(void) {
@@ -1304,6 +1338,12 @@ static void test_axis_errors(void) {
     queue_block(&block);
     expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_AXIS_ERROR, "start fails");
     expect_u32(fake_stop_calls, 1U, "axis stopped after a failed start");
+    expect_u32(
+        fake_context_ports_seen & FAKE_STOP_PORT_BIT,
+        FAKE_STOP_PORT_BIT,
+        "the fault path stops through the port"
+    );
+    expect_u32(fake_wrong_context_calls, 0U, "the fault path passes the context to the stop port");
 
     StepStreamFeederDiagnostics_t diagnostics;
     step_stream_feeder_get_diagnostics(&feeder, &diagnostics);
