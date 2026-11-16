@@ -1,6 +1,7 @@
 #include "command_task.h"
 
 #include "command/command_queue.h"
+#include "command/command_result_queue.h"
 #include "command_decoder.h"
 #include "command_protocol.h"
 #include "motion_stop.h"
@@ -22,10 +23,12 @@
 #define COMMAND_TASK_FLAG_TX (1UL << 1)
 #define COMMAND_TASK_FLAG_ERROR (1UL << 2)
 #define COMMAND_TASK_FLAG_QUEUE_SPACE (1UL << 3)
+#define COMMAND_TASK_FLAG_RESULT (1UL << 4)
 #define COMMAND_TASK_FLAGS_ALL                                                                                         \
-    (COMMAND_TASK_FLAG_RX | COMMAND_TASK_FLAG_TX | COMMAND_TASK_FLAG_ERROR | COMMAND_TASK_FLAG_QUEUE_SPACE)
+    (COMMAND_TASK_FLAG_RX | COMMAND_TASK_FLAG_TX | COMMAND_TASK_FLAG_ERROR | COMMAND_TASK_FLAG_QUEUE_SPACE |           \
+        COMMAND_TASK_FLAG_RESULT)
 
-/* The largest response is ERROR: header, 16-bit error code and CRC. */
+/* The largest responses are ERROR and DONE: header, a 16-bit code and CRC. */
 #define COMMAND_TASK_MAX_RESPONSE_SIZE (COMMAND_FRAME_HEADER_SIZE + 2U + COMMAND_FRAME_CRC_SIZE)
 #define COMMAND_TASK_TX_BUFFER_SIZE 256U
 /* Input is read only while a held ACK and the reply to one new frame still fit into the send buffer. */
@@ -83,7 +86,7 @@ static uint8_t command_task_send_protocol_response(
     CommandTaskAssemblerContext_t *assembler_context,
     uint8_t response_type,
     uint32_t sequence,
-    uint16_t error_code
+    uint16_t code
 ) {
     uint8_t frame[COMMAND_MAX_FRAME_SIZE];
     size_t response_length = 0U;
@@ -91,8 +94,10 @@ static uint8_t command_task_send_protocol_response(
         response_length = command_protocol_build_pong_response(frame, sizeof(frame), sequence);
     } else if (response_type == COMMAND_MESSAGE_TYPE_ACK) {
         response_length = command_protocol_build_ack_response(frame, sizeof(frame), sequence);
+    } else if (response_type == COMMAND_MESSAGE_TYPE_DONE) {
+        response_length = command_protocol_build_done_response(frame, sizeof(frame), sequence, code);
     } else if (response_type == COMMAND_MESSAGE_TYPE_ERROR) {
-        response_length = command_protocol_build_error_response(frame, sizeof(frame), sequence, error_code);
+        response_length = command_protocol_build_error_response(frame, sizeof(frame), sequence, code);
     }
 
     return command_task_send_response(assembler_context, frame, response_length);
@@ -454,6 +459,23 @@ static void command_task_queue_space_available(void) {
     (void)osThreadFlagsSet(command_task_thread_id, COMMAND_TASK_FLAG_QUEUE_SPACE);
 }
 
+/* Runs in MotionTask once a result is queued. */
+static void command_task_result_available(void) {
+    if (command_task_thread_id == NULL) {
+        return;
+    }
+    (void)osThreadFlagsSet(command_task_thread_id, COMMAND_TASK_FLAG_RESULT);
+}
+
+/* Nothing of a client outlives its connection: the motion stops, the queued commands, plan blocks and unsent results
+ * are dropped. The STOP behind the drop makes MotionTask clear the rest; it has the internal sequence, so it gets no
+ * answer. */
+static void command_task_discard_session(void) {
+    motion_task_request_stop();
+    const CommandDTO_t stop = {.sequence = COMMAND_SEQUENCE_INTERNAL, .code = COMMAND_CODE_STOP};
+    (void)command_queue_try_send(&stop);
+}
+
 /* Returns 1 to keep the client connected and 0 to close it. */
 static uint8_t command_task_send_pending_ack(CommandTaskAssemblerContext_t *assembler_context) {
     if (assembler_context->ack_pending == 0U) {
@@ -468,6 +490,26 @@ static uint8_t command_task_send_pending_ack(CommandTaskAssemblerContext_t *asse
         ) == 0U) {
         assembler_context->disconnect_requested = 1U;
         return 0U;
+    }
+    return 1U;
+}
+
+/* Sends the decisions MotionTask has made about commands: DONE for an accepted one, ERROR with the reason for a refused
+ * one. A result stays in its queue until the send buffer has the room that reading needs, so a held ACK and the reply
+ * to one new frame still fit after it; the TX flag brings the result back here. Returns 1 to keep the client connected
+ * and 0 to close it. */
+static uint8_t command_task_send_results(CommandTaskAssemblerContext_t *assembler_context) {
+    while (command_task_tx_free_space(assembler_context) >= COMMAND_TASK_TX_RESERVE_SIZE) {
+        CommandResult_t result = {0};
+        if (command_result_queue_try_receive(&result) != osOK) {
+            return 1U;
+        }
+        const uint8_t sent =
+            command_task_send_protocol_response(assembler_context, result.response_type, result.sequence, result.code);
+        if (sent == 0U) {
+            assembler_context->disconnect_requested = 1U;
+            return 0U;
+        }
     }
     return 1U;
 }
@@ -636,6 +678,12 @@ static void command_task_serve_client(struct netconn *client) {
                     return;
                 }
             }
+            /* Drained responses make room for results that waited, and a new result may have arrived. */
+            if ((flags & (COMMAND_TASK_FLAG_TX | COMMAND_TASK_FLAG_RESULT)) != 0U) {
+                if (command_task_send_results(&assembler_context) == 0U) {
+                    return;
+                }
+            }
             if ((flags & (COMMAND_TASK_FLAG_RX | COMMAND_TASK_FLAG_ERROR)) != 0U) {
                 read_now = 1U;
             }
@@ -655,6 +703,11 @@ static void command_task_serve_client(struct netconn *client) {
         if (command_task_receive_available(&assembler_context) == 0U) {
             return;
         }
+        /* Sending the replies may have freed room that no flag announces. A held ACK goes first, so a result never
+         * overtakes the ACK of its own command; its QUEUE_SPACE flag then sends both in order. */
+        if (assembler_context.ack_pending == 0U && command_task_send_results(&assembler_context) == 0U) {
+            return;
+        }
     }
 }
 
@@ -664,6 +717,7 @@ void CommandTask(void *argument) {
     configASSERT(context->lwip_flags != NULL);
     command_task_thread_id = osThreadGetId();
     command_queue_set_space_listener(command_task_queue_space_available);
+    command_result_queue_set_listener(command_task_result_available);
 
     const uint32_t wait_result =
         osEventFlagsWait(context->lwip_flags, LWIP_READY_FLAG, osFlagsWaitAll | osFlagsNoClear, osWaitForever);
@@ -707,6 +761,8 @@ void CommandTask(void *argument) {
                 break;
             }
             osThreadFlagsClear(COMMAND_TASK_FLAGS_ALL);
+            /* Results of the previous client's commands mean nothing to this one. */
+            command_result_queue_discard_all();
             command_counter_increment(&command_task_diagnostics.connections_accepted);
             command_task_diagnostics.active_connection = 1U;
 
@@ -714,6 +770,7 @@ void CommandTask(void *argument) {
 
             netconn_close(client);
             netconn_delete(client);
+            command_task_discard_session();
             command_task_diagnostics.active_connection = 0U;
             command_counter_increment(&command_task_diagnostics.connections_closed);
         }

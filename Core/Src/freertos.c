@@ -29,6 +29,7 @@
 #include "telemetry_task.h"
 #include "command_task.h"
 #include "command/command_queue.h"
+#include "command/command_result_queue.h"
 #include "motion_task.h"
 #include "motion/plan_buffer.h"
 #include "step_generator_task.h"
@@ -129,6 +130,11 @@ void MX_FREERTOS_Init(void);
 void MX_FREERTOS_Init(void)
 {
   if (command_queue_init() != osOK)
+  {
+    Error_Handler();
+  }
+
+  if (command_result_queue_init() != osOK)
   {
     Error_Handler();
   }

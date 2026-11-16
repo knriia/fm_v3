@@ -42,6 +42,37 @@ typedef enum {
 #define COMMAND_ERROR_QUEUE_FULL 0x000AU
 #define COMMAND_ERROR_INVALID_SEQUENCE 0x000DU
 
+/* The codes from here on answer a command that MotionTask took from the queue: it either accepted the command (DONE)
+ * or refused it (ERROR with one of these codes). Accepted means the planner made a block or the homing or calibration
+ * started, not that the move has ended.
+ * A move to the point where the axes already are is not a refusal: it is answered with DONE and the result code
+ * COMMAND_DONE_ALREADY_AT_TARGET.
+ * A planner refusal MotionPlannerStatus_t `status` is reported as COMMAND_ERROR_PLANNER_BASE + status, so NO_MOVEMENT
+ * is 0x0101 and AXIS_SPEED_LIMIT_EXCEEDED is 0x0107. */
+#define COMMAND_ERROR_PLANNER_BASE 0x0100U
+/* An axis the command names is homing, calibrating, moving, or its stream is busy. */
+#define COMMAND_ERROR_AXIS_BUSY 0x0120U
+/* The start and end switches of an axis are active together: a wiring or sensor fault. */
+#define COMMAND_ERROR_LIMITS_CONFLICT 0x0121U
+/* The homing or calibration could not start its first move. */
+#define COMMAND_ERROR_HOME_NOT_STARTED 0x0122U
+/* The plan queue did not take the block of the move. */
+#define COMMAND_ERROR_PLAN_QUEUE_FULL 0x0123U
+/* The command, or the part of it that MotionTask would run, is not implemented. */
+#define COMMAND_ERROR_NOT_SUPPORTED 0x0124U
+/* STOP did not bring every axis to rest in time; the step generator stays halted. */
+#define COMMAND_ERROR_STOP_NOT_SETTLED 0x0125U
+/* MotionTask has no machine context, so it cannot plan or home. */
+#define COMMAND_ERROR_NOT_CONFIGURED 0x0126U
+
+/* Result codes of a DONE frame. */
+#define COMMAND_DONE_ACCEPTED 0x0000U
+#define COMMAND_DONE_ALREADY_AT_TARGET 0x0001U
+
+/* No client command has sequence 0 (the protocol rejects it), so the device uses it for commands it issues itself. They
+ * get no response. */
+#define COMMAND_SEQUENCE_INTERNAL 0U
+
 typedef struct __attribute__((packed)) {
     uint16_t magic;
     uint8_t version;
@@ -53,6 +84,10 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint16_t error_code;
 } CommandErrorPayloadDTO_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t result_code;
+} CommandDonePayloadDTO_t;
 
 /* Complete, transport-valid request copied out of the protocol parser buffer. */
 typedef struct {
@@ -70,5 +105,6 @@ typedef struct {
 
 _Static_assert(sizeof(CommandFrameHeaderDTO_t) == COMMAND_FRAME_HEADER_SIZE, "Invalid command frame header size");
 _Static_assert(sizeof(CommandErrorPayloadDTO_t) == 2U, "Invalid command error payload size");
+_Static_assert(sizeof(CommandDonePayloadDTO_t) == 2U, "Invalid command done payload size");
 
 #endif /* FM_V3_COMMAND_TRANSPORT_DTO_H */

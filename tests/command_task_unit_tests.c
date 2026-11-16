@@ -1,6 +1,7 @@
 #include "command_decoder.h"
 #include "command_protocol.h"
 #include "command/command_queue.h"
+#include "command/command_result_queue.h"
 #include "command_task.h"
 #include "FreeRTOS.h"
 #include "cmsis_os.h"
@@ -66,11 +67,26 @@ static uint8_t test_force_assembler_consume_failure;
 static uint8_t test_force_decoder_invalid_argument;
 static CommandQueuePutResult_t test_command_queue_put_result;
 static uint32_t test_command_queue_put_calls;
-static CommandDTO_t test_queued_command;
+static CommandDTO_t test_put_commands[8];
+static uint32_t test_put_stop_requests_before[8];
 static uint32_t test_queue_free_slots[TEST_SCRIPT_LENGTH];
 static uint32_t test_queue_free_slots_calls;
 static CommandQueueSpaceListener_t test_space_listener;
 static CommandFrameAssembler_t test_assembler;
+/* The results MotionTask has left in the result queue: delivered in order by try_receive, dropped by discard_all. */
+#define TEST_RESULT_SCRIPT_LENGTH 8U
+static CommandResult_t test_result_script[TEST_RESULT_SCRIPT_LENGTH];
+static uint32_t test_result_script_count;
+static uint32_t test_result_script_position;
+static uint32_t test_result_receive_calls;
+static uint32_t test_result_discard_calls;
+/* Whether a discard erases the scripted results; the others are scripted for after the client has connected. */
+static uint8_t test_result_discard_erases;
+/* Scripted results become visible only once this many flag waits have started; 0 means from the beginning. */
+static uint32_t test_result_visible_from_wait;
+static CommandResultListener_t test_result_listener;
+/* How many results had been taken when each wait for flags began. */
+static uint32_t test_results_taken_at_wait[TEST_SCRIPT_LENGTH];
 
 enum {
     TEST_WRITE_FULL = 0U,
@@ -332,6 +348,7 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
     ++test_thread_flags_wait_calls;
     if (index < TEST_SCRIPT_LENGTH) {
         test_thread_flags_wait_timeouts[index] = timeout;
+        test_results_taken_at_wait[index] = test_result_script_position;
     }
     if (index < test_flags_wait_script_count) {
         if (test_flags_waits[index].set_tick != 0U) {
@@ -345,20 +362,27 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
     return COMMAND_TASK_FLAG_RX;
 }
 
+/* The order of the calls that stop motion: how many commands had been queued at each request_stop, and the command and
+ * the number of request_stop calls before each queued command. */
+#define TEST_CALL_LOG_LENGTH 8U
 static uint32_t test_motion_stop_requests;
-static uint32_t test_queue_puts_before_stop_request;
+static uint32_t test_stop_request_puts_before[TEST_CALL_LOG_LENGTH];
+static uint32_t test_stop_request_deletes_before[TEST_CALL_LOG_LENGTH];
 
 void motion_task_request_stop(void) {
+    if (test_motion_stop_requests < TEST_CALL_LOG_LENGTH) {
+        test_stop_request_puts_before[test_motion_stop_requests] = test_command_queue_put_calls;
+        test_stop_request_deletes_before[test_motion_stop_requests] = test_netconn_delete_calls;
+    }
     ++test_motion_stop_requests;
-    test_queue_puts_before_stop_request = test_command_queue_put_calls;
 }
 
 CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command) {
-    ++test_command_queue_put_calls;
-    if (command == NULL) {
-        return COMMAND_QUEUE_PUT_ERROR;
+    if (test_command_queue_put_calls < TEST_CALL_LOG_LENGTH) {
+        test_put_commands[test_command_queue_put_calls] = *command;
+        test_put_stop_requests_before[test_command_queue_put_calls] = test_motion_stop_requests;
     }
-    test_queued_command = *command;
+    ++test_command_queue_put_calls;
     return test_command_queue_put_result;
 }
 
@@ -373,6 +397,25 @@ uint32_t command_queue_free_slots(void) {
 }
 
 void command_queue_set_space_listener(CommandQueueSpaceListener_t listener) { test_space_listener = listener; }
+
+void command_result_queue_set_listener(CommandResultListener_t listener) { test_result_listener = listener; }
+
+osStatus_t command_result_queue_try_receive(CommandResult_t *result) {
+    ++test_result_receive_calls;
+    if (test_thread_flags_wait_calls < test_result_visible_from_wait ||
+        test_result_script_position >= test_result_script_count) {
+        return osErrorResource;
+    }
+    *result = test_result_script[test_result_script_position++];
+    return osOK;
+}
+
+void command_result_queue_discard_all(void) {
+    ++test_result_discard_calls;
+    if (test_result_discard_erases != 0U) {
+        test_result_script_position = test_result_script_count;
+    }
+}
 
 static CommandFrameAssemblerEvent_t test_command_frame_assembler_next(const CommandFrameAssembler_t *assembler) {
     if (test_force_assembler_next == TEST_ASSEMBLER_NEXT_NEED_MORE) {
@@ -484,11 +527,22 @@ static void reset_fixture(void) {
     test_command_queue_put_result = COMMAND_QUEUE_PUT_OK;
     test_command_queue_put_calls = 0U;
     test_motion_stop_requests = 0U;
-    test_queue_puts_before_stop_request = 0U;
-    test_queued_command = (CommandDTO_t){0};
+    memset(test_stop_request_puts_before, 0, sizeof(test_stop_request_puts_before));
+    memset(test_stop_request_deletes_before, 0, sizeof(test_stop_request_deletes_before));
+    memset(test_put_commands, 0, sizeof(test_put_commands));
+    memset(test_put_stop_requests_before, 0, sizeof(test_put_stop_requests_before));
     memset(test_queue_free_slots, 0xFF, sizeof(test_queue_free_slots));
     test_queue_free_slots_calls = 0U;
     test_space_listener = NULL;
+    memset(test_result_script, 0, sizeof(test_result_script));
+    test_result_script_count = 0U;
+    test_result_script_position = 0U;
+    test_result_receive_calls = 0U;
+    test_result_discard_calls = 0U;
+    test_result_discard_erases = 0U;
+    test_result_visible_from_wait = 0U;
+    test_result_listener = NULL;
+    memset(test_results_taken_at_wait, 0, sizeof(test_results_taken_at_wait));
     memset(test_receives, 0, sizeof(test_receives));
     memset(test_buffers, 0, sizeof(test_buffers));
     memset(test_flags_waits, 0, sizeof(test_flags_waits));
@@ -612,7 +666,8 @@ static size_t build_stop_command(uint8_t *frame, uint32_t sequence) {
 }
 
 static void expect_single_response(uint8_t type, uint32_t sequence, uint16_t error_code) {
-    const size_t expected_length = type == COMMAND_MESSAGE_TYPE_ERROR ? 16U : 14U;
+    const uint8_t has_code = type == COMMAND_MESSAGE_TYPE_ERROR || type == COMMAND_MESSAGE_TYPE_DONE ? 1U : 0U;
+    const size_t expected_length = has_code != 0U ? 16U : 14U;
     expect_u32((uint32_t)test_captured_response_length, (uint32_t)expected_length, "exactly one response is sent");
     CommandFrameHeaderDTO_t header = {0};
     expect_u32(
@@ -622,10 +677,10 @@ static void expect_single_response(uint8_t type, uint32_t sequence, uint16_t err
     );
     expect_u32(header.type, type, "response type matches the current protocol");
     expect_u32(header.sequence, sequence, "response preserves request sequence");
-    if (type == COMMAND_MESSAGE_TYPE_ERROR) {
+    if (has_code != 0U) {
         const uint16_t actual_error = (uint16_t)test_captured_response[COMMAND_FRAME_HEADER_SIZE] |
             ((uint16_t)test_captured_response[COMMAND_FRAME_HEADER_SIZE + 1U] << 8U);
-        expect_u32(actual_error, error_code, "ERROR response contains the expected code");
+        expect_u32(actual_error, error_code, "response contains the expected code");
     }
 }
 
@@ -655,6 +710,7 @@ static void test_context_and_listener_failures(void) {
     expect_true(test_listener_callback == command_task_netconn_event, "listener is created with the event callback");
     expect_true(command_task_thread_id == TEST_THREAD_ID, "task stores its id for the callback");
     expect_true(test_space_listener == command_task_queue_space_available, "task listens for free queue space");
+    expect_true(test_result_listener == command_task_result_available, "task listens for new command results");
 
     reset_fixture();
     test_bind_result = ERR_MEM;
@@ -705,7 +761,8 @@ static void test_ping_ack_and_error_responses(void) {
     run_one_receive(frame, frame_length);
     expect_single_response(COMMAND_MESSAGE_TYPE_PONG, 41U, 0U);
     expect_u32(test_netconn_write_calls, 1U, "PING receives only one PONG");
-    expect_u32(test_command_queue_put_calls, 0U, "PING is not placed in the command queue");
+    expect_u32(test_command_queue_put_calls, 1U, "only the STOP of the disconnect is placed in the command queue");
+    expect_u32(test_put_commands[0].sequence, COMMAND_SEQUENCE_INTERNAL, "PING itself is not queued: the STOP is internal");
     expect_u32(command_task_diagnostics.complete_frames_received, 1U, "complete PING is counted");
 
     reset_fixture();
@@ -713,11 +770,16 @@ static void test_ping_ack_and_error_responses(void) {
     run_one_receive(frame, frame_length);
     expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 42U, 0U);
     expect_u32(test_netconn_write_calls, 1U, "accepted command receives only one ACK");
-    expect_u32(test_command_queue_put_calls, 1U, "decoded command is submitted to the queue once");
-    expect_u32(test_motion_stop_requests, 1U, "STOP acts before it waits in the queue");
-    expect_u32(test_queue_puts_before_stop_request, 0U, "STOP acts before it is queued");
-    expect_u32(test_queued_command.sequence, 42U, "queued command preserves sequence");
-    expect_u32(test_queued_command.code, COMMAND_CODE_STOP, "queued command preserves command code");
+    expect_u32(test_command_queue_put_calls, 2U, "the client STOP and the STOP of the disconnect are queued");
+    expect_u32(test_motion_stop_requests, 2U, "the client STOP and the disconnect each stop motion once");
+    expect_u32(test_stop_request_puts_before[0], 0U, "STOP acts before it is queued");
+    expect_u32(test_put_stop_requests_before[0], 1U, "the client STOP is queued after its request_stop");
+    expect_u32(test_put_commands[0].sequence, 42U, "queued command preserves sequence");
+    expect_u32(test_put_commands[0].code, COMMAND_CODE_STOP, "queued command preserves command code");
+    expect_u32(test_stop_request_puts_before[1], 1U, "the disconnect stops motion after the client STOP was queued");
+    expect_u32(test_put_stop_requests_before[1], 2U, "the STOP of the disconnect is queued after its request_stop");
+    expect_u32(test_put_commands[1].sequence, COMMAND_SEQUENCE_INTERNAL, "the STOP of the disconnect is internal");
+    expect_u32(test_put_commands[1].code, COMMAND_CODE_STOP, "the disconnect queues a STOP");
 
     reset_fixture();
     const uint8_t home_payload[] = {COMMAND_CODE_HOME, 0x01U};
@@ -731,7 +793,11 @@ static void test_ping_ack_and_error_responses(void) {
     );
     run_one_receive(frame, frame_length);
     expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 48U, 0U);
-    expect_u32(test_motion_stop_requests, 0U, "other commands do not stop motion");
+    expect_u32(test_motion_stop_requests, 1U, "other commands do not stop motion: only the disconnect does");
+    expect_u32(test_command_queue_put_calls, 2U, "the HOME and the STOP of the disconnect are queued");
+    expect_u32(test_put_commands[0].code, COMMAND_CODE_HOME, "the HOME is queued first");
+    expect_u32(test_put_stop_requests_before[0], 0U, "the HOME is queued without a stop before it");
+    expect_u32(test_stop_request_puts_before[0], 1U, "the stop of the disconnect comes after the HOME");
 
     reset_fixture();
     test_command_queue_put_result = COMMAND_QUEUE_PUT_FULL;
@@ -978,7 +1044,7 @@ static void test_deferred_ack(void) {
     set_flags_wait(0U, COMMAND_TASK_FLAG_QUEUE_SPACE);
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "command that fills the queue is accepted");
-    expect_u32(test_command_queue_put_calls, 1U, "command filling the queue is queued");
+    expect_u32(test_command_queue_put_calls, 2U, "command filling the queue and the STOP of the disconnect are queued");
     expect_u32(command_task_diagnostics.acks_deferred, 1U, "held ACK is counted");
     expect_single_response(COMMAND_MESSAGE_TYPE_ACK, 101U, 0U);
     expect_u32(test_thread_flags_wait_calls, 2U, "ACK waits for the queue space flag");
@@ -1038,7 +1104,11 @@ static void test_deferred_ack(void) {
     test_write_mode = TEST_WRITE_FAIL;
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "failed held ACK before the next ACK closes the client");
-    expect_u32(test_command_queue_put_calls, 2U, "next command was queued before the held ACK failed");
+    expect_u32(
+        test_command_queue_put_calls,
+        3U,
+        "both commands were queued before the held ACK failed, and the disconnect queued its STOP"
+    );
     expect_u32(test_netconn_write_calls, 1U, "only the held ACK is attempted");
     expect_u32(test_queue_free_slots_calls, 1U, "next ACK is not prepared after the held ACK failed");
     expect_u32(command_task_diagnostics.connections_closed, 1U, "client closes after the failed held ACK");
@@ -1554,7 +1624,402 @@ static void test_decoder_failure_and_error_response_send_failure(void) {
     expect_u32(test_netconn_write_calls, 1U, "malformed-frame ERROR write is attempted once");
 }
 
+/* Checks one response frame in `data`: valid CRC, type, sequence, and for ERROR and DONE the 16-bit code, which is
+ * the only payload and is little endian. */
+static void expect_frame_in(
+    const uint8_t *data,
+    size_t data_length,
+    size_t offset,
+    uint8_t type,
+    uint32_t sequence,
+    uint16_t error_code,
+    const char *message
+) {
+    const uint8_t has_code = type == COMMAND_MESSAGE_TYPE_ERROR || type == COMMAND_MESSAGE_TYPE_DONE ? 1U : 0U;
+    const size_t length = has_code != 0U ? 16U : 14U;
+    const uint8_t present = data_length >= offset + length ? 1U : 0U;
+    expect_true(present, message);
+    if (present == 0U) {
+        return;
+    }
+    CommandFrameHeaderDTO_t header = {0};
+    expect_u32(command_protocol_validate_frame(&data[offset], length, &header), COMMAND_FRAME_VALID, message);
+    expect_u32(header.type, type, message);
+    expect_u32(header.sequence, sequence, message);
+    expect_u32(header.payload_length, has_code != 0U ? 2U : 0U, message);
+    if (has_code != 0U) {
+        const uint16_t actual_error =
+            (uint16_t)data[offset + COMMAND_FRAME_HEADER_SIZE] |
+            (uint16_t)((uint16_t)data[offset + COMMAND_FRAME_HEADER_SIZE + 1U] << 8U);
+        expect_u32(actual_error, error_code, message);
+    }
+}
+
+static void expect_frame_at(size_t offset, uint8_t type, uint32_t sequence, uint16_t error_code, const char *message) {
+    expect_frame_in(test_captured_response, test_captured_response_length, offset, type, sequence, error_code, message);
+}
+
+static void script_result(uint32_t index, uint32_t sequence, uint8_t response_type, uint16_t code) {
+    test_result_script[index] = (CommandResult_t){.sequence = sequence, .response_type = response_type, .code = code};
+    if (test_result_script_count <= index) {
+        test_result_script_count = index + 1U;
+    }
+}
+
+/* A DONE result goes to the client as a DONE frame with the sequence of its command and its result code. */
+static void test_result_done_frame(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    script_result(0U, 500U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    test_result_visible_from_wait = 1U;
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "a result is sent to the connected client");
+    expect_u32((uint32_t)test_captured_response_length, 16U, "DONE is a header, a two-byte result code and a CRC");
+    expect_frame_at(0U, COMMAND_MESSAGE_TYPE_DONE, 500U, 0U, "an accepted result is sent as DONE with code 0");
+    expect_u32(test_captured_response[COMMAND_FRAME_HEADER_SIZE], 0x00U, "the ACCEPTED payload is 00 00 (low byte)");
+    expect_u32(test_captured_response[COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "the ACCEPTED payload is 00 00 (high byte)");
+    expect_u32(test_netconn_write_calls, 1U, "the result is written once");
+    expect_u32(test_result_receive_calls, 3U, "one empty read after the socket, then the result and an empty read");
+    expect_u32(test_thread_flags_wait_calls, 2U, "the RESULT flag alone does not read the socket");
+    expect_u32(command_task_diagnostics.response_send_errors, 0U, "a sent result is not an error");
+}
+
+/* Several results wake the task once; each is answered in queue order with the frame its response type selects, not
+ * its code: a DONE with a nonzero code stays DONE. */
+static void test_result_error_frames_and_order(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    script_result(0U, 510U, COMMAND_MESSAGE_TYPE_ERROR, 0x0121U);
+    script_result(1U, 511U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(2U, 512U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ALREADY_AT_TARGET);
+    script_result(3U, 513U, COMMAND_MESSAGE_TYPE_ERROR, 0x0126U);
+    test_result_visible_from_wait = 1U;
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "several results are sent in one wake-up");
+    expect_u32((uint32_t)test_captured_response_length, 4U * 16U, "four 16-byte frames were sent");
+    expect_frame_at(0U, COMMAND_MESSAGE_TYPE_ERROR, 510U, 0x0121U, "a refused command gets ERROR with its code");
+    expect_frame_at(16U, COMMAND_MESSAGE_TYPE_DONE, 511U, 0U, "an accepted command gets DONE with code 0");
+    expect_frame_at(32U, COMMAND_MESSAGE_TYPE_DONE, 512U, 1U, "a move to the current point gets DONE with code 1");
+    expect_u32(test_captured_response[32U + COMMAND_FRAME_HEADER_SIZE], 0x01U, "ALREADY_AT_TARGET payload is 01 00 (low)");
+    expect_u32(test_captured_response[32U + COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "ALREADY_AT_TARGET payload is 01 00 (high)");
+    expect_frame_at(48U, COMMAND_MESSAGE_TYPE_ERROR, 513U, 0x0126U, "the last refusal gets its own code");
+    expect_u32(test_result_receive_calls, 6U, "one empty read after the socket, four results and one empty read");
+}
+
+/* A result stays queued while fewer than 32 bytes are free and is sent once the TX flag drained the buffer. */
+static void test_result_waits_for_send_buffer_space(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    static uint8_t pings[17][COMMAND_MAX_FRAME_SIZE];
+    const uint32_t ping_count = 17U;
+    const size_t pong_length = 14U;
+
+    reset_fixture();
+    /* 17 PONGs fill 238 of 256 bytes while LwIP takes nothing; reading stops with 18 bytes free. */
+    for (uint32_t index = 0U; index < ping_count; ++index) {
+        const size_t ping_length = build_ping(pings[index], 200U + index);
+        set_buffer(index, pings[index], (u16_t)ping_length, NULL, 0U, NULL, 0U);
+        set_receive_result(index, ERR_OK);
+    }
+    script_result(0U, 600U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(1U, 601U, COMMAND_MESSAGE_TYPE_ERROR, 0x0122U);
+    script_result(2U, 602U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    test_write_blocked = 1U;
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
+    set_flags_wait(1U, COMMAND_TASK_FLAG_TX);
+    test_flags_waits[1].unblock_writes = 1U;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "client is served while its send buffer is full");
+
+    expect_u32(test_thread_flags_wait_calls, 2U, "the task waited for the RESULT and the TX flags");
+    expect_u32(test_results_taken_at_wait[0], 0U, "no result is taken before the RESULT flag");
+    expect_u32(test_results_taken_at_wait[1], 0U, "18 free bytes are below the 32 reserved, so no result is taken");
+    expect_u32(test_result_script_position, 3U, "the TX flag brought the waiting results");
+    expect_u32(test_result_receive_calls, 4U, "three results and one empty read");
+    expect_u32(
+        (uint32_t)test_captured_response_length,
+        ping_count * (uint32_t)pong_length + 3U * 16U,
+        "the PONGs and the three 16-byte results reach the client"
+    );
+    for (uint32_t index = 0U; index < ping_count; ++index) {
+        expect_frame_at(index * pong_length, COMMAND_MESSAGE_TYPE_PONG, 200U + index, 0U, "PONGs keep their order");
+    }
+    expect_frame_at(238U, COMMAND_MESSAGE_TYPE_DONE, 600U, 0U, "the first result follows the PONGs");
+    expect_frame_at(254U, COMMAND_MESSAGE_TYPE_ERROR, 601U, 0x0122U, "the second result follows the first");
+    expect_frame_at(270U, COMMAND_MESSAGE_TYPE_DONE, 602U, 0U, "the third result is last");
+}
+
+/* The send buffer must keep 32 bytes free (a held ACK plus the reply to a new frame) before a result is taken. */
+static void test_result_needs_room_for_the_largest_frame(void) {
+    CommandTaskAssemblerContext_t context;
+
+    reset_fixture();
+    script_result(0U, 700U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(1U, 701U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    context = test_context();
+    test_write_blocked = 1U;
+    context.tx_length = 225U;
+    expect_u32(command_task_send_results(&context), 1U, "a nearly full send buffer keeps the client");
+    expect_u32(test_result_receive_calls, 0U, "no result is taken with 31 bytes free");
+    expect_u32(test_result_script_position, 0U, "the results stay queued");
+    expect_u32(test_netconn_write_calls, 0U, "nothing is written without a result");
+
+    context.tx_length = 224U;
+    expect_u32(command_task_send_results(&context), 1U, "32 free bytes take one result");
+    expect_u32(test_result_receive_calls, 1U, "exactly one result is taken with 32 bytes free");
+    expect_u32(test_result_script_position, 1U, "the second result stays queued behind it");
+    expect_u32((uint32_t)context.tx_length, 240U, "the 16-byte DONE frame is appended after the 224 buffered bytes");
+    expect_frame_in(
+        context.tx_buffer,
+        context.tx_length,
+        224U,
+        COMMAND_MESSAGE_TYPE_DONE,
+        700U,
+        0U,
+        "the buffered frame is the DONE of the first result"
+    );
+}
+
+/* A result that cannot be sent closes the connection. */
+static void test_result_send_failure_closes_the_client(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    script_result(0U, 710U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(1U, 711U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    test_result_visible_from_wait = 1U;
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
+    test_write_mode = TEST_WRITE_FAIL;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "a failed result write ends the client session");
+    expect_u32(test_netconn_write_calls, 1U, "the result write is attempted once");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "the failed result write is counted");
+    expect_u32(command_task_diagnostics.connections_closed, 1U, "the client is closed after the failed result");
+    expect_u32(test_netconn_recv_calls, 1U, "the socket is not read after the failed result");
+    expect_u32(test_thread_flags_wait_calls, 1U, "the task does not wait again for a closed client");
+    expect_u32(test_result_receive_calls, 2U, "after the empty read only the failing result is taken, not the next one");
+
+    reset_fixture();
+    script_result(0U, 712U, COMMAND_MESSAGE_TYPE_ERROR, 0x0124U);
+    CommandTaskAssemblerContext_t send_context = test_context();
+    test_write_mode = TEST_WRITE_FAIL;
+    expect_u32(command_task_send_results(&send_context), 0U, "a failed ERROR write reports the closing of the client");
+    expect_u32(send_context.disconnect_requested, 1U, "the failed result marks the disconnect");
+}
+
+/* A new client must not receive what was decided for the commands of the previous one. */
+static void test_new_client_does_not_get_old_results(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    test_result_discard_erases = 1U;
+    script_result(0U, 800U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(1U, 801U, COMMAND_MESSAGE_TYPE_ERROR, 0x0125U);
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the client is served after the old results are dropped");
+    expect_u32(test_result_discard_calls, 1U, "accepting a client drops the queued results");
+    expect_u32((uint32_t)test_captured_response_length, 0U, "no old result reaches the new client");
+    expect_u32(test_netconn_write_calls, 0U, "nothing is written for old results");
+
+    reset_fixture();
+    test_result_discard_erases = 1U;
+    script_result(0U, 802U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    test_jump_after_accept_calls = 2U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "two clients are served in a row");
+    expect_u32(test_result_discard_calls, 2U, "every accepted client drops the queued results");
+    expect_u32(command_task_diagnostics.connections_accepted, 2U, "both clients were accepted");
+}
+
+/* A result already in the queue goes out right after the incoming frame is read, with no RESULT flag. */
+static void test_result_is_sent_after_reading_input(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    uint8_t ping[COMMAND_MAX_FRAME_SIZE];
+    const size_t ping_length = build_ping(ping, 300U);
+
+    reset_fixture();
+    script_result(0U, 310U, COMMAND_MESSAGE_TYPE_ERROR, 0x0121U);
+    set_buffer(0U, ping, (u16_t)ping_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the client is served with a result already queued");
+    expect_u32(test_results_taken_at_wait[0], 1U, "the result was taken before the first wait for flags");
+    expect_u32((uint32_t)test_captured_response_length, 14U + 16U, "PONG and the result reach the client");
+    expect_frame_at(0U, COMMAND_MESSAGE_TYPE_PONG, 300U, 0U, "the reply to the frame comes first");
+    expect_frame_at(14U, COMMAND_MESSAGE_TYPE_ERROR, 310U, 0x0121U, "the queued result follows the reply");
+    expect_u32(command_task_diagnostics.response_send_errors, 0U, "sending after reading is not an error");
+
+    /* A send failure at this point closes the connection before the task waits for anything. */
+    reset_fixture();
+    script_result(0U, 311U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(1U, 312U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    test_write_mode = TEST_WRITE_FAIL;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "a failed result write after reading ends the session");
+    expect_u32(test_netconn_write_calls, 1U, "the result write is attempted once");
+    expect_u32(test_result_receive_calls, 1U, "the next result is not taken after the failure");
+    expect_u32(command_task_diagnostics.response_send_errors, 1U, "the failed result write is counted");
+    expect_u32(command_task_diagnostics.connections_closed, 1U, "the client is closed after the failed result");
+    expect_u32(test_thread_flags_wait_calls, 0U, "the task does not wait again for a closed client");
+}
+
+/* While an ACK is held, a result is not sent after reading; QUEUE_SPACE sends the ACK first and the result after it. */
+static void test_held_ack_goes_before_results_after_reading(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    uint8_t stop[COMMAND_MAX_FRAME_SIZE];
+    const size_t stop_length = build_stop_command(stop, 101U);
+
+    reset_fixture();
+    test_queue_free_slots[0] = 0U;
+    script_result(0U, 320U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    set_buffer(0U, stop, (u16_t)stop_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    set_receive_result(1U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_QUEUE_SPACE | COMMAND_TASK_FLAG_RESULT);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the client is served with a held ACK and a result");
+    expect_u32(command_task_diagnostics.acks_deferred, 1U, "the ACK of the command that filled the queue is held");
+    expect_u32(test_results_taken_at_wait[0], 0U, "no result is taken after reading while the ACK is held");
+    expect_u32((uint32_t)test_captured_response_length, 14U + 16U, "the 14-byte ACK and the 16-byte result reach the client");
+    expect_ack_at(0U, 101U, "the held ACK is sent before the result");
+    expect_frame_at(14U, COMMAND_MESSAGE_TYPE_DONE, 320U, 0U, "the result follows the ACK");
+    expect_u32(command_task_diagnostics.response_send_errors, 0U, "nothing fails");
+}
+
+/* A held ACK must still fit into an almost full send buffer: results leave 32 bytes free and go after the ACK. */
+static void test_results_do_not_starve_held_ack(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    static uint8_t pings[17][COMMAND_MAX_FRAME_SIZE];
+    const uint32_t ping_count = 17U;
+    const size_t pong_length = 14U;
+    uint8_t stop[COMMAND_MAX_FRAME_SIZE];
+    const size_t stop_length = build_stop_command(stop, 101U);
+
+    reset_fixture();
+    /* The STOP fills the command queue and its ACK is held. 17 PONGs then occupy 238 of 256 bytes. */
+    test_queue_free_slots[0] = 0U;
+    set_buffer(0U, stop, (u16_t)stop_length, NULL, 0U, NULL, 0U);
+    set_receive_result(0U, ERR_OK);
+    for (uint32_t index = 0U; index < ping_count; ++index) {
+        const size_t ping_length = build_ping(pings[index], 200U + index);
+        set_buffer(1U + index, pings[index], (u16_t)ping_length, NULL, 0U, NULL, 0U);
+        set_receive_result(1U + index, ERR_OK);
+    }
+    script_result(0U, 600U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    script_result(1U, 601U, COMMAND_MESSAGE_TYPE_ERROR, 0x0122U);
+    script_result(2U, 602U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
+    test_write_blocked = 1U;
+    set_flags_wait(0U, COMMAND_TASK_FLAG_QUEUE_SPACE | COMMAND_TASK_FLAG_RESULT);
+    set_flags_wait(1U, COMMAND_TASK_FLAG_TX);
+    test_flags_waits[1].unblock_writes = 1U;
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the client is served with a held ACK and a full buffer");
+
+    expect_u32(command_task_diagnostics.acks_deferred, 1U, "the ACK is held");
+    expect_u32(test_thread_flags_wait_calls, 2U, "the task waited for QUEUE_SPACE with RESULT and then for TX");
+    expect_u32(test_results_taken_at_wait[0], 0U, "no result is taken while the ACK is held");
+    expect_u32(test_results_taken_at_wait[1], 0U, "the ACK took the room: 4 bytes are left, so no result is taken");
+    expect_u32(command_task_diagnostics.response_send_errors, 0U, "the held ACK is not refused for lack of room");
+    expect_u32(test_result_script_position, 3U, "the TX flag brought all three results");
+    expect_u32(
+        (uint32_t)test_captured_response_length,
+        ping_count * (uint32_t)pong_length + 14U + 3U * 16U,
+        "the PONGs, the 14-byte ACK and the three 16-byte results reach the client"
+    );
+    for (uint32_t index = 0U; index < ping_count; ++index) {
+        expect_frame_at(index * pong_length, COMMAND_MESSAGE_TYPE_PONG, 200U + index, 0U, "PONGs keep their order");
+    }
+    expect_ack_at(238U, 101U, "the held ACK follows the PONGs");
+    expect_frame_at(252U, COMMAND_MESSAGE_TYPE_DONE, 600U, 0U, "the first result goes after the ACK");
+    expect_frame_at(268U, COMMAND_MESSAGE_TYPE_ERROR, 601U, 0x0122U, "the second result follows the first");
+    expect_frame_at(284U, COMMAND_MESSAGE_TYPE_DONE, 602U, 0U, "the third result is last");
+}
+
+/* Nothing of a client outlives its connection: after the socket is closed and deleted the motion is stopped and a STOP
+ * with the internal sequence follows it into the command queue. */
+static void test_disconnect_stops_motion_and_queues_an_internal_stop(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "one client connects and leaves");
+    expect_u32(test_motion_stop_requests, 1U, "the disconnect stops motion exactly once");
+    expect_u32(test_command_queue_put_calls, 1U, "the disconnect queues exactly one command");
+    expect_u32(test_put_commands[0].code, COMMAND_CODE_STOP, "the queued command is a STOP");
+    expect_u32(test_put_commands[0].sequence, 0U, "the STOP has sequence 0: it gets no answer");
+    expect_u32(test_stop_request_puts_before[0], 0U, "motion is stopped before the STOP is queued");
+    expect_u32(test_put_stop_requests_before[0], 1U, "the STOP is queued after motion was stopped");
+    expect_u32(test_stop_request_deletes_before[0], 1U, "motion is stopped after the client socket is deleted");
+    expect_u32(test_netconn_close_calls, 1U, "the client socket is closed");
+    expect_u32(test_netconn_delete_calls, 1U, "the client socket is deleted");
+
+    reset_fixture();
+    test_jump_after_accept_calls = 2U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "two clients connect one after another");
+    expect_u32(test_motion_stop_requests, 2U, "each disconnect stops motion once");
+    expect_u32(test_command_queue_put_calls, 2U, "each disconnect queues one command");
+    for (uint32_t index = 0U; index < 2U; ++index) {
+        expect_u32(test_put_commands[index].code, COMMAND_CODE_STOP, "each queued command is a STOP");
+        expect_u32(test_put_commands[index].sequence, 0U, "each STOP has sequence 0");
+        expect_u32(test_stop_request_puts_before[index], index, "each stop comes after the STOP of the earlier client");
+        expect_u32(test_put_stop_requests_before[index], index + 1U, "each STOP is queued after its own stop of motion");
+        expect_u32(test_stop_request_deletes_before[index], index + 1U, "each stop follows the deletion of its socket");
+    }
+}
+
+/* A STOP that does not fit into the command queue, or fails, does not end the accept loop. */
+static void test_disconnect_survives_a_refused_stop(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+    const CommandQueuePutResult_t refusals[] = {COMMAND_QUEUE_PUT_FULL, COMMAND_QUEUE_PUT_ERROR};
+
+    for (uint32_t index = 0U; index < sizeof(refusals) / sizeof(refusals[0]); ++index) {
+        reset_fixture();
+        test_command_queue_put_result = refusals[index];
+        test_jump_after_accept_calls = 2U;
+        expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the accept loop goes on after a refused STOP");
+        expect_u32(test_netconn_accept_calls, 3U, "the loop accepted both clients and waited for a third");
+        expect_u32(command_task_diagnostics.connections_accepted, 2U, "both clients were accepted");
+        expect_u32(command_task_diagnostics.connections_closed, 2U, "both clients were counted as closed");
+        expect_u32(command_task_diagnostics.active_connection, 0U, "no connection stays active");
+        expect_u32(test_motion_stop_requests, 2U, "motion was stopped for each disconnect");
+        expect_u32(test_command_queue_put_calls, 2U, "a STOP was offered for each disconnect");
+    }
+}
+
+static void test_result_listener_sets_its_flag(void) {
+    reset_fixture();
+    command_task_result_available();
+    expect_u32(test_thread_flags_set_calls, 0U, "a result before the task id is known sets no flag");
+
+    command_task_thread_id = TEST_THREAD_ID;
+    command_task_result_available();
+    expect_u32(test_thread_flags_set_value, COMMAND_TASK_FLAG_RESULT, "a new result sets the RESULT flag");
+    expect_true(test_thread_flags_set_target == TEST_THREAD_ID, "the RESULT flag goes to the command task");
+    expect_u32(COMMAND_TASK_FLAGS_ALL & COMMAND_TASK_FLAG_RESULT, COMMAND_TASK_FLAG_RESULT, "the RESULT flag is awaited");
+}
+
 int main(void) {
+    test_result_done_frame();
+    test_result_error_frames_and_order();
+    test_result_waits_for_send_buffer_space();
+    test_result_needs_room_for_the_largest_frame();
+    test_result_send_failure_closes_the_client();
+    test_new_client_does_not_get_old_results();
+    test_result_is_sent_after_reading_input();
+    test_held_ack_goes_before_results_after_reading();
+    test_results_do_not_starve_held_ack();
+    test_disconnect_stops_motion_and_queues_an_internal_stop();
+    test_disconnect_survives_a_refused_stop();
+    test_result_listener_sets_its_flag();
     test_context_and_listener_failures();
     test_ping_ack_and_error_responses();
     test_fragmented_receive_and_disconnect_cleanup();

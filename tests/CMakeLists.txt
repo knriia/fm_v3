@@ -56,6 +56,11 @@ add_executable(command_queue_unit_tests
 )
 target_compile_definitions(command_queue_unit_tests PRIVATE FM_V3_ENABLE_TEST_HOOKS)
 
+add_executable(command_result_queue_unit_tests
+    command_result_queue_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/command/command_result_queue.c
+)
+
 add_executable(motion_task_unit_tests
     motion_task_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/motion_task.c
@@ -229,6 +234,12 @@ target_include_directories(command_queue_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
 )
 
+target_include_directories(command_result_queue_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/stubs
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command
+)
+
 target_include_directories(motion_task_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/stubs
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/ENC
@@ -373,6 +384,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(command_result_queue_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
     target_compile_options(motion_task_unit_tests PRIVATE
         -Wall
         -Wextra
@@ -498,6 +514,7 @@ add_test(NAME command_protocol_tests COMMAND command_protocol_tests)
 add_test(NAME command_task_unit_tests COMMAND command_task_unit_tests)
 add_test(NAME command_decoder_unit_tests COMMAND command_decoder_unit_tests)
 add_test(NAME command_queue_unit_tests COMMAND command_queue_unit_tests)
+add_test(NAME command_result_queue_unit_tests COMMAND command_result_queue_unit_tests)
 add_test(NAME motion_task_unit_tests COMMAND motion_task_unit_tests)
 add_test(NAME plan_buffer_unit_tests COMMAND plan_buffer_unit_tests)
 add_test(NAME motion_planner_unit_tests COMMAND motion_planner_unit_tests)
