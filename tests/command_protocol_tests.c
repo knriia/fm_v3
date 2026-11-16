@@ -349,6 +349,30 @@ static void test_frame_and_response_builders(void) {
     expect_u32(command_protocol_validate_frame(frame, ack_length, &header), COMMAND_FRAME_VALID, "ACK frame CRC is valid");
     expect_u32(header.type, COMMAND_MESSAGE_TYPE_ACK, "ACK type is correct");
 
+    const size_t done_length = command_protocol_build_done_response(frame, sizeof(frame), 33U, 0x1234U);
+    expect_u32((uint32_t)done_length, 16U, "DONE frame is a header, a two-byte result code and a CRC");
+    expect_u32(command_protocol_validate_frame(frame, done_length, &header), COMMAND_FRAME_VALID, "DONE frame CRC is valid");
+    expect_u32(header.type, 0x03U, "DONE type is 0x03");
+    expect_u32(header.payload_length, 2U, "DONE result code occupies two bytes");
+    expect_u32(header.sequence, 33U, "DONE sequence is preserved");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE], 0x34U, "DONE result code low byte comes first");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], 0x12U, "DONE result code high byte comes second");
+    const size_t accepted_length =
+        command_protocol_build_done_response(frame, sizeof(frame), 34U, COMMAND_DONE_ACCEPTED);
+    expect_u32((uint32_t)accepted_length, 16U, "DONE ACCEPTED frame has the same length");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE], 0x00U, "ACCEPTED payload low byte is 0");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "ACCEPTED payload high byte is 0");
+    const size_t at_target_length =
+        command_protocol_build_done_response(frame, sizeof(frame), 34U, COMMAND_DONE_ALREADY_AT_TARGET);
+    expect_u32((uint32_t)at_target_length, 16U, "DONE ALREADY_AT_TARGET frame has the same length");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE], 0x01U, "ALREADY_AT_TARGET payload low byte is 1");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "ALREADY_AT_TARGET payload high byte is 0");
+    expect_u32(
+        (uint32_t)command_protocol_build_done_response(frame, 15U, 33U, COMMAND_DONE_ACCEPTED),
+        0U,
+        "DONE is not built into a buffer that is too small"
+    );
+
     const size_t error_length =
         command_protocol_build_error_response(frame, sizeof(frame), 35U, COMMAND_ERROR_INVALID_LENGTH);
     expect_u32((uint32_t)error_length, 16U, "ERROR frame size is correct");

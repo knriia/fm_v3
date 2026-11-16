@@ -1,6 +1,7 @@
 #include "motion_task.h"
 
 #include "command/command_queue.h"
+#include "command/command_result_queue.h"
 #include "encoder.h"
 #include "motion/axis_bench.h"
 #include "motion/axis_calibration_run.h"
@@ -196,18 +197,31 @@ static int motion_task_is_xyz_move(const CommandDTO_t *command) {
            (command->parameters.motion_operation.operation_flags & COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE) != 0U;
 }
 
-/* Plans one absolute move and hands it to the step generator; a move the planner rejects is dropped. */
-static void motion_task_queue_move(MotionTaskContext_t *context, const MotionPlannerRequest_t *request) {
-    motion_task_counter_increment(&motion_task_diagnostics.planner_calls);
-    MotionPlannerMachineState_t planner_state = {0};
-    if (context != NULL) {
-        planner_state = context->machine_state;
+/* The answer MotionTask gives to one command: DONE with a COMMAND_DONE_* code, or ERROR with a COMMAND_ERROR_* code. */
+typedef struct {
+    uint8_t response_type;
+    uint16_t code;
+} MotionTaskDecision_t;
+
+static MotionTaskDecision_t motion_task_done(uint16_t result_code) {
+    return (MotionTaskDecision_t){.response_type = COMMAND_MESSAGE_TYPE_DONE, .code = result_code};
+}
+
+/* Error code 0 means the command was accepted. */
+static MotionTaskDecision_t motion_task_decision_from_error(uint16_t error_code) {
+    if (error_code == 0U) {
+        return motion_task_done(COMMAND_DONE_ACCEPTED);
     }
-    const MotionPlannerResult_t result = motion_planner_plan_linear(
-        request,
-        context == NULL ? NULL : &planner_state,
-        context == NULL ? NULL : &context->planner_config
-    );
+    return (MotionTaskDecision_t){.response_type = COMMAND_MESSAGE_TYPE_ERROR, .code = error_code};
+}
+
+/* Plans one absolute move and hands it to the step generator; a move the planner rejects is dropped. A move to the
+ * point where the axes already are is no refusal and is answered as such. The context is not NULL. */
+static MotionTaskDecision_t
+motion_task_queue_move(MotionTaskContext_t *context, const MotionPlannerRequest_t *request) {
+    motion_task_counter_increment(&motion_task_diagnostics.planner_calls);
+    MotionPlannerMachineState_t planner_state = context->machine_state;
+    const MotionPlannerResult_t result = motion_planner_plan_linear(request, &planner_state, &context->planner_config);
     motion_task_diagnostics.last_planner_status = (uint32_t)result.status;
     motion_task_diagnostics.last_planner_sequence = request->sequence;
 #ifdef FM_V3_ENABLE_TEST_HOOKS
@@ -218,19 +232,22 @@ static void motion_task_queue_move(MotionTaskContext_t *context, const MotionPla
         motion_task_counter_increment(&motion_task_diagnostics.planner_blocks_created);
         if (plan_buffer_try_push(motion_task_plan_buffer, &result.block) != PLAN_BUFFER_STATUS_OK) {
             /* The rejected block is dropped; PlanBuffer records why it was not accepted. */
-            return;
+            return motion_task_decision_from_error(COMMAND_ERROR_PLAN_QUEUE_FULL);
         }
         /* The next move starts where this one ends, not where the axis is right now. */
         for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
             context->machine_state.position_um[axis] = request->target_um[axis];
         }
         step_generator_task_notify_block_ready();
-    } else if (result.status == MOTION_PLANNER_STATUS_NO_MOVEMENT) {
-        motion_task_counter_increment(&motion_task_diagnostics.planner_no_motion);
-    } else {
-        motion_task_counter_increment(&motion_task_diagnostics.planner_errors);
-        (void)plan_buffer_clear(motion_task_plan_buffer);
+        return motion_task_done(COMMAND_DONE_ACCEPTED);
     }
+    if (result.status == MOTION_PLANNER_STATUS_NO_MOVEMENT) {
+        motion_task_counter_increment(&motion_task_diagnostics.planner_no_motion);
+        return motion_task_done(COMMAND_DONE_ALREADY_AT_TARGET);
+    }
+    motion_task_counter_increment(&motion_task_diagnostics.planner_errors);
+    (void)plan_buffer_clear(motion_task_plan_buffer);
+    return motion_task_decision_from_error((uint16_t)(COMMAND_ERROR_PLANNER_BASE + (uint32_t)result.status));
 }
 
 /* A target beyond int32 is clamped; it is far outside any axis, so the planner rejects it. */
@@ -240,20 +257,20 @@ static int32_t motion_task_relative_target(int32_t position_um, int32_t delta_um
 }
 
 /* Absolute operations carry the target; relative ones carry increments to the planned position. */
-static void motion_task_queue_xyz_move(MotionTaskContext_t *context, const CommandDTO_t *command) {
+static MotionTaskDecision_t motion_task_queue_xyz_move(MotionTaskContext_t *context, const CommandDTO_t *command) {
     const CommandMotionOperationParameters_t *motion = &command->parameters.motion_operation;
     MotionPlannerRequest_t request = {
         .sequence = command->sequence,
         .target_um = {motion->x, motion->y, motion->z},
         .feedrate_um_per_s = motion->speed,
     };
-    if (context != NULL && (motion->operation_flags & COMMAND_MOTION_OPERATION_FLAG_RELATIVE) != 0U) {
+    if ((motion->operation_flags & COMMAND_MOTION_OPERATION_FLAG_RELATIVE) != 0U) {
         for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
             request.target_um[axis] =
                 motion_task_relative_target(context->machine_state.position_um[axis], request.target_um[axis]);
         }
     }
-    motion_task_queue_move(context, &request);
+    return motion_task_queue_move(context, &request);
 }
 
 _Static_assert(MOTION_PLANNER_AXIS_COUNT == MOTION_AXIS_HARDWARE_COUNT, "planner axes index the axis configs");
@@ -428,11 +445,9 @@ static void motion_task_home_start_approach(MotionTaskAxisState_t *state, Motion
     );
 }
 
-/* Callers start homing only while the axis is idle, so no homing or calibration of it is running here. */
+/* Callers start homing only while the axis is idle, so no homing or calibration of it is running here. The context is
+ * not NULL: motion_task_start_axes refuses a command without one. */
 static void motion_task_home_begin(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
-    if (context == NULL) {
-        return;
-    }
     /* The axis is no longer where its zero was, whether or not the homing can start now. */
     const uint8_t axis_mask = motion_task_axis_mask(state->axis);
     context->machine_state.homed_axes_mask &= (uint8_t)~axis_mask;
@@ -724,11 +739,13 @@ static uint8_t motion_task_stream_busy_axes(void) {
     return (uint8_t)(print_busy_mask | motion_task_axis_streams_busy_axes());
 }
 
-/* HOME and CALIBRATE name axes that can home and are idle; anything else refuses the whole command. */
-static uint8_t motion_task_axes_can_start(uint8_t axes_mask, uint8_t busy_mask) {
-    return axes_mask != 0U && (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) == 0U && (axes_mask & busy_mask) == 0U
-               ? 1U
-               : 0U;
+/* HOME and CALIBRATE name axes that can home and are idle; anything else refuses the whole command. Returns 0 when the
+ * command may start, otherwise the COMMAND_ERROR_* code of the refusal. */
+static uint16_t motion_task_axes_start_refusal(uint8_t axes_mask, uint8_t busy_mask) {
+    if (axes_mask == 0U || (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) != 0U) {
+        return COMMAND_ERROR_INVALID_PARAMETER;
+    }
+    return (axes_mask & busy_mask) != 0U ? COMMAND_ERROR_AXIS_BUSY : 0U;
 }
 
 void motion_task_request_stop(void) {
@@ -736,7 +753,10 @@ void motion_task_request_stop(void) {
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         motion_axis_hardware_request_stop((MotionAxis_t)axis);
     }
-    command_queue_discard_all();
+    /* STOP drops every command that waits behind it in the queue, without an answer. */
+    CommandDTO_t cancelled = {0};
+    while (command_queue_receive(&cancelled, 0U) == osOK) {
+    }
 }
 
 static uint8_t motion_task_any_hardware_is_active(void) {
@@ -749,11 +769,11 @@ static uint8_t motion_task_any_hardware_is_active(void) {
 }
 
 /* Second half of STOP: once every axis is at rest the step pipeline is emptied and restarted. If one does not come
- * to rest in time the generator stays halted, so nothing moves until the next STOP succeeds. */
-static void motion_task_finish_stop(MotionTaskContext_t *context) {
+ * to rest in time the generator stays halted, so nothing moves until the next STOP succeeds; returns 0 then. */
+static uint8_t motion_task_finish_stop(MotionTaskContext_t *context) {
     for (uint32_t waited_ms = 0U; motion_task_any_hardware_is_active() != 0U; ++waited_ms) {
         if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
-            return;
+            return 0U;
         }
         (void)osDelay(1U);
     }
@@ -766,6 +786,7 @@ static void motion_task_finish_stop(MotionTaskContext_t *context) {
         }
     }
     step_generator_task_resume_all_after_stop();
+    return 1U;
 }
 
 static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
@@ -784,7 +805,8 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
     motion_axis_hardware_reset_timing_peaks(state->axis);
 }
 
-static void motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
+/* Returns 0 when the axes did not come to rest in time. */
+static uint8_t motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
     (void)plan_buffer_clear(motion_task_plan_buffer);
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         /* The homing and calibration moves still queued were cut short as well. */
@@ -793,7 +815,7 @@ static void motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t 
         motion_task_calibration_cancel(&states[axis]);
         motion_task_stop_axis(&states[axis], context);
     }
-    motion_task_finish_stop(context);
+    return motion_task_finish_stop(context);
 }
 
 /* A queue failure leaves no way to supervise a running homing or calibration, so all of them are aborted. */
@@ -811,22 +833,66 @@ static void motion_task_abort_axes(MotionTaskAxisState_t *states, MotionTaskCont
     }
 }
 
-static void motion_task_start_axes(
+/* Starts the homing or calibration of every named axis. Returns 0 when all of them started, otherwise the code of the
+ * first axis that did not; the others still run. */
+static uint16_t motion_task_start_axes(
     MotionTaskAxisState_t *states,
     MotionTaskContext_t *context,
     uint8_t axes_mask,
     uint8_t calibrate
 ) {
+    if (context == NULL) {
+        return COMMAND_ERROR_NOT_CONFIGURED;
+    }
+    uint16_t error_code = 0U;
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         if ((axes_mask & motion_task_axis_mask((MotionAxis_t)axis)) == 0U) {
             continue;
         }
+        const uint8_t limits_conflict = motion_task_limits_conflict((MotionAxis_t)axis);
         if (calibrate != 0U) {
             motion_task_calibration_begin(&states[axis], context);
         } else {
             motion_task_home_begin(&states[axis], context);
         }
+        /* Both procedures begin with a homing move, so an idle homing means the axis did not start. */
+        if (motion_task_home_is_active(&states[axis]) == 0U && error_code == 0U) {
+            error_code = limits_conflict != 0U ? COMMAND_ERROR_LIMITS_CONFLICT : COMMAND_ERROR_HOME_NOT_STARTED;
+        }
     }
+    return error_code;
+}
+
+/* The decision about one command other than STOP: accepted, or refused with the reason. The move itself is not finished
+ * by then. */
+static MotionTaskDecision_t motion_task_execute_command(
+    MotionTaskAxisState_t *states,
+    MotionTaskContext_t *context,
+    const CommandDTO_t *command,
+    uint8_t busy_mask
+) {
+    /* A stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE are
+     * refused for those axes meanwhile like any other command that finds the axis busy. */
+    const uint8_t start_busy_mask =
+        (uint8_t)(busy_mask | motion_task_stream_busy_axes() | motion_task_active_hardware_axes());
+    if (command->code == COMMAND_CODE_HOME || command->code == COMMAND_CODE_CALIBRATE) {
+        const uint8_t calibrate = command->code == COMMAND_CODE_CALIBRATE ? 1U : 0U;
+        const uint8_t axes_mask = calibrate != 0U ? command->parameters.calibrate.axes : command->parameters.home.axes;
+        const uint16_t refusal = motion_task_axes_start_refusal(axes_mask, start_busy_mask);
+        return motion_task_decision_from_error(
+            refusal != 0U ? refusal : motion_task_start_axes(states, context, axes_mask, calibrate)
+        );
+    }
+    if (motion_task_is_xyz_move(command) != 0) {
+        if (context == NULL) {
+            return motion_task_decision_from_error(COMMAND_ERROR_NOT_CONFIGURED);
+        }
+        if (busy_mask != 0U || motion_task_axis_streams_busy_axes() != 0U) {
+            return motion_task_decision_from_error(COMMAND_ERROR_AXIS_BUSY);
+        }
+        return motion_task_queue_xyz_move(context, command);
+    }
+    return motion_task_decision_from_error(COMMAND_ERROR_NOT_SUPPORTED);
 }
 
 void MotionTask(void *argument) {
@@ -869,26 +935,20 @@ void MotionTask(void *argument) {
         motion_task_diagnostics.last_command_code = (uint32_t)command.code;
 
         if (command.code == COMMAND_CODE_STOP) {
-            motion_task_stop(axes, context);
+            const uint8_t settled = motion_task_stop(axes, context);
+            /* Whatever the client has not read of the earlier commands is gone with them. */
+            command_result_queue_discard_all();
+            if (command.sequence != COMMAND_SEQUENCE_INTERNAL) {
+                const MotionTaskDecision_t decision =
+                    motion_task_decision_from_error(settled != 0U ? 0U : COMMAND_ERROR_STOP_NOT_SETTLED);
+                command_result_queue_post(command.sequence, decision.response_type, decision.code);
+            }
             motion_task_publish_axes(axes, context);
             continue;
         }
 
-        /* A stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE are
-         * refused for those axes meanwhile like any other command that finds the axis busy. */
-        const uint8_t start_busy_mask =
-            (uint8_t)(busy_mask | motion_task_stream_busy_axes() | motion_task_active_hardware_axes());
-        if (command.code == COMMAND_CODE_HOME) {
-            if (motion_task_axes_can_start(command.parameters.home.axes, start_busy_mask) != 0U) {
-                motion_task_start_axes(axes, context, command.parameters.home.axes, 0U);
-            }
-        } else if (command.code == COMMAND_CODE_CALIBRATE) {
-            if (motion_task_axes_can_start(command.parameters.calibrate.axes, start_busy_mask) != 0U) {
-                motion_task_start_axes(axes, context, command.parameters.calibrate.axes, 1U);
-            }
-        } else if (motion_task_is_xyz_move(&command) && busy_mask == 0U && motion_task_axis_streams_busy_axes() == 0U) {
-            motion_task_queue_xyz_move(context, &command);
-        }
+        const MotionTaskDecision_t decision = motion_task_execute_command(axes, context, &command, busy_mask);
+        command_result_queue_post(command.sequence, decision.response_type, decision.code);
 
         motion_task_poll_axes(axes, context);
         motion_task_publish_axes(axes, context);

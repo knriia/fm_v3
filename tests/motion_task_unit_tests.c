@@ -1,4 +1,5 @@
 #include "command/command_queue.h"
+#include "command/command_result_queue.h"
 #include "motion/axis_bench.h"
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
@@ -41,6 +42,30 @@ static uint32_t test_receive_script_position;
 static TestQueueRead_t test_receive_script[16];
 /* Called with the index of the read that is about to be served, to change the world while MotionTask is blocked. */
 static void (*test_receive_hook)(uint32_t read_index);
+
+/* Set while MotionTask runs. Outside of it command_queue_receive serves test_pending_commands instead of the script:
+ * that is how motion_task_request_stop (called from another task) drains the queue. */
+static uint8_t test_task_running;
+#define TEST_PENDING_CAPACITY 8U
+static CommandDTO_t test_pending_commands[TEST_PENDING_CAPACITY];
+static uint32_t test_pending_count;
+static uint32_t test_pending_position;
+static uint32_t test_pending_receive_calls;
+/* The largest timeout any receive outside of the task asked for. */
+static uint32_t test_pending_max_timeout;
+
+/* What MotionTask told the command result queue, in call order. */
+#define TEST_RESULT_CAPACITY 64U
+typedef struct {
+    uint32_t sequence;
+    uint8_t response_type;
+    uint16_t code;
+} TestResult_t;
+static TestResult_t test_results[TEST_RESULT_CAPACITY];
+static uint32_t test_result_count;
+/* discard_all erases the recorded results, like the real queue; the count of calls and of the results it erased are kept. */
+static uint32_t test_discard_calls;
+static uint32_t test_discarded_results;
 
 /* One faked generator instance: the three one-lane instances of the axes (indexed by MotionAxis_t) and the printing
  * stream behind them. Each has the flags the real task derives from its stream, its own halt and reset counts and, for
@@ -168,6 +193,17 @@ static void script_x_state(
 }
 
 osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
+    if (test_task_running == 0U) {
+        ++test_pending_receive_calls;
+        if (timeout_ms > test_pending_max_timeout) {
+            test_pending_max_timeout = timeout_ms;
+        }
+        if (test_pending_position < test_pending_count) {
+            *command = test_pending_commands[test_pending_position++];
+            return osOK;
+        }
+        return osErrorResource;
+    }
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         FakeAxis_t *fake = &fake_axes[axis];
         if (test_receive_calls < 16U && fake->state_script[test_receive_calls].apply != 0U) {
@@ -286,7 +322,6 @@ void step_generator_task_notify_block_ready(void) {
 /* The part of the halt and reset counts of every instance that came from STOP of all instances. */
 static uint32_t test_generator_all_halts;
 static uint32_t test_generator_all_resumes;
-static uint32_t test_queue_discards;
 /* After this many 1 ms waits the X axis reports READY; 0 keeps it moving. */
 static uint32_t test_axis_settles_after_delays;
 
@@ -333,7 +368,23 @@ void step_generator_task_resume_all_after_stop(void) {
     }
 }
 
-void command_queue_discard_all(void) { ++test_queue_discards; }
+void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_t code) {
+    if (test_result_count >= TEST_RESULT_CAPACITY) {
+        ++test_failures;
+        (void)fprintf(stderr, "FAIL: more results than the test records\n");
+        return;
+    }
+    test_results[test_result_count].sequence = sequence;
+    test_results[test_result_count].response_type = response_type;
+    test_results[test_result_count].code = code;
+    ++test_result_count;
+}
+
+void command_result_queue_discard_all(void) {
+    ++test_discard_calls;
+    test_discarded_results += test_result_count;
+    test_result_count = 0U;
+}
 
 uint32_t osDelay(uint32_t milliseconds) {
     ++test_delay_calls;
@@ -586,7 +637,16 @@ static void reset_receive_script(void) {
     test_block_ready_notifications = 0U;
     test_generator_all_halts = 0U;
     test_generator_all_resumes = 0U;
-    test_queue_discards = 0U;
+    test_task_running = 0U;
+    (void)memset(test_pending_commands, 0, sizeof(test_pending_commands));
+    test_pending_count = 0U;
+    test_pending_position = 0U;
+    test_pending_receive_calls = 0U;
+    test_pending_max_timeout = 0U;
+    (void)memset(test_results, 0, sizeof(test_results));
+    test_result_count = 0U;
+    test_discard_calls = 0U;
+    test_discarded_results = 0U;
     test_axis_settles_after_delays = 0U;
     test_calibration_load_status = CALIBRATION_STORE_STATUS_EMPTY;
     test_stored_calibration = (MachineCalibration_t){0};
@@ -637,10 +697,12 @@ static MotionTaskContext_t valid_motion_context(void) {
 
 static int run_motion_task_until_scripted_stop(MotionTaskContext_t *context) {
     test_jump_active = 1U;
+    test_task_running = 1U;
     const int jumped = setjmp(test_jump_buffer);
     if (jumped == 0) {
         MotionTask(context);
     }
+    test_task_running = 0U;
     test_jump_active = 0U;
     return jumped;
 }
@@ -696,6 +758,10 @@ static void test_successful_receive_marks_dequeue(void) {
     expect_i64(planner_result.block.step_delta[1], 0, "Y stays in place");
     expect_i64(planner_result.block.step_delta[2], 0, "Z stays in place");
     expect_u32(planner_result.block.feedrate_um_per_s, 12000U, "planner receives the XYZ feedrate");
+    expect_u32(test_result_count, 1U, "the accepted move is answered once");
+    expect_u32(test_results[0].sequence, 101U, "the answer carries the sequence of the move");
+    expect_u32(test_results[0].response_type, COMMAND_MESSAGE_TYPE_DONE, "an accepted move is answered with DONE");
+    expect_u32(test_results[0].code, COMMAND_DONE_ACCEPTED, "an accepted move is answered with ACCEPTED");
 
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
     expect_u32(
@@ -750,6 +816,22 @@ static void test_fifo_commands_are_dequeued_once(void) {
     expect_u32(test_receive_calls, 6U, "consumer performs one receive per command then waits again");
     expect_u32(test_receive_script_position, 5U, "each scripted queue item is removed exactly once");
     expect_u32(test_last_receive_timeout, osWaitForever, "each consumer read blocks indefinitely");
+    /* The refusal of HOME (102) is erased by STOP (103); the commands after STOP are answered as usual. */
+    expect_u32(test_discard_calls, 1U, "STOP discards the earlier results once");
+    expect_u32(test_discarded_results, 1U, "only the answer of HOME was waiting");
+    expect_u32(test_result_count, 4U, "STOP and the three commands after it are answered");
+    const uint8_t expected_types[4] = {
+        COMMAND_MESSAGE_TYPE_DONE,
+        COMMAND_MESSAGE_TYPE_ERROR,
+        COMMAND_MESSAGE_TYPE_ERROR,
+        COMMAND_MESSAGE_TYPE_ERROR,
+    };
+    const uint16_t expected_codes[4] = {COMMAND_DONE_ACCEPTED, 0x0124U, 0x0124U, 0x0124U};
+    for (uint32_t index = 0U; index < 4U; ++index) {
+        expect_u32(test_results[index].sequence, 103U + index, "results follow the command order");
+        expect_u32(test_results[index].response_type, expected_types[index], "response type of the command");
+        expect_u32(test_results[index].code, expected_codes[index], "result code of the command");
+    }
 
     MotionTaskDiagnostics diagnostics = {0};
     motion_task_get_diagnostics(&diagnostics);
@@ -906,6 +988,50 @@ static void test_xyz_command_without_position_change_counts_no_motion(void) {
     PlanBufferDiagnostics_t plan_buffer_diagnostics = {0};
     (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, 1U, "no-motion result preserves earlier plans");
+    expect_u32(plan_buffer_diagnostics.enqueued_total, 1U, "no block is queued for a move to the current point");
+    expect_u32(test_block_ready_notifications, 0U, "a move to the current point does not wake the step generator");
+    expect_u32(test_result_count, 1U, "a move to the current point is answered once");
+    expect_u32(test_results[0].sequence, 111U, "the answer carries the sequence of the move");
+    expect_u32(test_results[0].response_type, COMMAND_MESSAGE_TYPE_DONE, "a move to the current point is answered with DONE");
+    expect_u32(test_results[0].code, COMMAND_DONE_ALREADY_AT_TARGET, "the DONE says the axes are already there");
+}
+
+static void test_relative_move_without_increment_is_already_at_target(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.position_um[0] = 500;
+    context.machine_state.position_um[1] = -700;
+    context.machine_state.position_um[2] = 300;
+    const CommandDTO_t command = {
+        .sequence = 113U,
+        .code = COMMAND_CODE_MOTION_OPERATION,
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE | COMMAND_MOTION_OPERATION_FLAG_RELATIVE,
+                .x = 0,
+                .y = 0,
+                .z = 0,
+                .speed = 1000U,
+            },
+    };
+    script_read(0U, osOK, &command);
+    script_read(1U, osErrorResource, NULL);
+    test_jump_on_delay = 1U;
+
+    (void)run_motion_task_until_scripted_stop(&context);
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.planner_no_motion, 1U, "a zero relative move is counted as no-motion");
+    expect_u32(diagnostics.planner_errors, 0U, "a zero relative move is not a planner error");
+    expect_u32(enqueued_blocks(&test_plan_buffer), 0U, "a zero relative move queues no block");
+    expect_u32(test_block_ready_notifications, 0U, "a zero relative move does not wake the step generator");
+    expect_i64(context.machine_state.position_um[0], 500, "X is unchanged");
+    expect_i64(context.machine_state.position_um[1], -700, "Y is unchanged");
+    expect_i64(context.machine_state.position_um[2], 300, "Z is unchanged");
+    expect_u32(test_result_count, 1U, "a zero relative move is answered once");
+    expect_u32(test_results[0].sequence, 113U, "the answer carries the sequence of the move");
+    expect_u32(test_results[0].response_type, COMMAND_MESSAGE_TYPE_DONE, "a zero relative move is answered with DONE");
+    expect_u32(test_results[0].code, COMMAND_DONE_ALREADY_AT_TARGET, "a zero relative move is already at the target");
 }
 
 static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plans(void) {
@@ -956,7 +1082,7 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
     expect_u32(first_block.sequence, 1U, "full rejection does not replace earlier plans");
 }
 
-static void test_xyz_command_with_null_context_reaches_planner_as_invalid_input(void) {
+static void test_xyz_command_with_null_context_is_not_configured(void) {
     reset_receive_script();
     const CommandDTO_t command = {
         .sequence = 109U,
@@ -975,25 +1101,16 @@ static void test_xyz_command_with_null_context_reaches_planner_as_invalid_input(
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(NULL);
-    expect_u32(
-        motion_task_test_get_planner_call_count(),
-        1U,
-        "MotionPlanner is called even when task context is absent"
-    );
-    expect_u32(
-        motion_task_test_get_last_planner_result().status,
-        MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
-        "missing motion context is rejected by MotionPlanner"
-    );
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "MotionPlanner is not called without a task context");
+    expect_u32(test_result_count, 1U, "an XYZ move without a task context is answered once");
+    expect_u32(test_results[0].sequence, 109U, "the answer carries the sequence of the move");
+    expect_u32(test_results[0].response_type, COMMAND_MESSAGE_TYPE_ERROR, "a move without a task context is refused");
+    expect_u32(test_results[0].code, 0x0126U, "an XYZ move without a task context is not configured");
     MotionTaskDiagnostics diagnostics = {0};
     motion_task_get_diagnostics(&diagnostics);
-    expect_u32(diagnostics.planner_errors, 1U, "missing motion context increments planner errors");
-    expect_u32(
-        diagnostics.last_planner_status,
-        MOTION_PLANNER_STATUS_INVALID_ARGUMENT,
-        "missing context status is recorded"
-    );
-    expect_u32(diagnostics.last_planner_sequence, 109U, "missing context sequence is recorded");
+    expect_u32(diagnostics.planner_calls, 0U, "missing motion context is not counted as a planner call");
+    expect_u32(diagnostics.planner_errors, 0U, "missing motion context is not a planner error");
+    expect_u32(diagnostics.last_planner_sequence, 0U, "the planner never saw the move");
 }
 
 static void test_motion_operation_without_xyz_flag_does_not_call_planner(void) {
@@ -1679,7 +1796,8 @@ static void test_stop_request_and_pipeline_reset(void) {
         expect_u32(fake_generators[index].halts, 1U, "STOP halts each instance once at once");
     }
     expect_u32(fake_x_stop_requests, 1U, "STOP stops the pulses at once");
-    expect_u32(test_queue_discards, 1U, "STOP drops the commands accepted before it");
+    expect_u32(test_pending_receive_calls, 1U, "STOP reads the command queue until it is empty");
+    expect_u32(test_result_count, 0U, "STOP with an empty command queue answers nothing");
 
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
@@ -2774,9 +2892,15 @@ static void test_stop_during_the_homing_of_three_axes(void) {
     /* A block that reached the printing queue just before STOP. */
     test_receive_hook = push_pending_print_block_at_read_2;
 
+    /* A command that was accepted before STOP and still waits in the queue. */
+    test_pending_commands[0] = (CommandDTO_t){.sequence = 190U, .code = COMMAND_CODE_SET_OUTPUT};
+    test_pending_count = 1U;
+
     /* The first half of STOP, which runs in the task that received it. */
     motion_task_request_stop();
     expect_u32(test_generator_all_halts, 1U, "the immediate STOP halts every instance");
+    expect_u32(test_result_count, 0U, "the immediate STOP answers nothing");
+    expect_u32(test_pending_position, 1U, "the immediate STOP took the command behind it out of the queue");
     (void)run_motion_task_until_scripted_stop(&context);
 
     for (uint32_t index = 0U; index < TEST_GENERATOR_COUNT; ++index) {
@@ -2794,7 +2918,11 @@ static void test_stop_during_the_homing_of_three_axes(void) {
     expect_u32(queued_blocks(&test_plan_buffer), 0U, "STOP emptied the printing queue");
     expect_u32(cancelled_blocks(&test_plan_buffer), 1U, "STOP cancelled the block of the printing queue");
     expect_u32(context.machine_state.homed_axes_mask, 0U, "no axis is homed after the cancelled homing");
-    expect_u32(test_queue_discards, 1U, "the immediate STOP dropped the commands behind it");
+    expect_u32(test_discarded_results, 1U, "STOP erased the answer of HOME, which the client had not read");
+    expect_u32(test_result_count, 1U, "only the answer of STOP is left");
+    expect_u32(test_results[0].sequence, 182U, "STOP is answered by its sequence");
+    expect_u32(test_results[0].response_type, COMMAND_MESSAGE_TYPE_DONE, "STOP settled with the axes at rest");
+    expect_u32(test_results[0].code, COMMAND_DONE_ACCEPTED, "STOP is accepted");
     expect_u32(test_last_receive_timeout, osWaitForever, "no homing is left to poll");
 }
 
@@ -3525,7 +3653,489 @@ static void test_calibration_whose_final_homing_cannot_start_fails(void) {
     expect_u32(axis.homed, 0U, "X is not homed after the calibration moved it away");
 }
 
+/* Wire values of the command results, written out here and not taken from the macros so that a changed value is
+ * noticed: the GUI depends on them. The planner refusals are 0x0100 plus the MotionPlannerStatus_t. */
+#define TEST_ERROR_INVALID_PARAMETER 0x0005U
+#define TEST_ERROR_PLANNER_NOT_HOMED 0x0104U
+#define TEST_ERROR_PLANNER_OUT_OF_RANGE 0x0105U
+#define TEST_ERROR_PLANNER_INVALID_FEEDRATE 0x0106U
+#define TEST_ERROR_PLANNER_AXIS_SPEED_LIMIT 0x0107U
+#define TEST_ERROR_AXIS_BUSY 0x0120U
+#define TEST_ERROR_LIMITS_CONFLICT 0x0121U
+#define TEST_ERROR_HOME_NOT_STARTED 0x0122U
+#define TEST_ERROR_PLAN_QUEUE_FULL 0x0123U
+#define TEST_ERROR_NOT_SUPPORTED 0x0124U
+#define TEST_ERROR_STOP_NOT_SETTLED 0x0125U
+#define TEST_ERROR_NOT_CONFIGURED 0x0126U
+#define TEST_DONE_ALREADY_AT_TARGET 0x0001U
+
+/* Checks one recorded result: with a code of 0 a DONE frame with the result code ACCEPTED, otherwise an ERROR frame
+ * with that code. */
+static void expect_result_at(uint32_t index, uint32_t sequence, uint16_t error_code, const char *message) {
+    if (index >= test_result_count) {
+        ++test_failures;
+        (void)fprintf(stderr, "FAIL: %s (no result at index %lu)\n", message, (unsigned long)index);
+        return;
+    }
+    expect_u32(test_results[index].sequence, sequence, message);
+    expect_u32(test_results[index].response_type, error_code == 0U ? 0x03U : 0xFFU, message);
+    expect_u32(test_results[index].code, error_code, message);
+}
+
+/* Checks one recorded DONE result with the given result code. */
+static void expect_done_at(uint32_t index, uint32_t sequence, uint16_t result_code, const char *message) {
+    if (index >= test_result_count) {
+        ++test_failures;
+        (void)fprintf(stderr, "FAIL: %s (no result at index %lu)\n", message, (unsigned long)index);
+        return;
+    }
+    expect_u32(test_results[index].sequence, sequence, message);
+    expect_u32(test_results[index].response_type, 0x03U, message);
+    expect_u32(test_results[index].code, result_code, message);
+}
+
+static CommandDTO_t with_sequence(CommandDTO_t command, uint32_t sequence) {
+    command.sequence = sequence;
+    return command;
+}
+
+static CommandDTO_t xyz_move_to(uint32_t sequence, int32_t x_um, uint32_t speed_um_per_s) {
+    return (CommandDTO_t){
+        .sequence = sequence,
+        .code = COMMAND_CODE_MOTION_OPERATION,
+        .parameters.motion_operation =
+            {
+                .operation_flags = COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE,
+                .x = x_um,
+                .speed = speed_um_per_s,
+            },
+    };
+}
+
+/* Delivers the commands one per read, then ends the run when the queue is empty. */
+static void run_commands(MotionTaskContext_t *context, const CommandDTO_t *commands, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        script_read(index, osOK, &commands[index]);
+    }
+    test_block_when_empty = 1U;
+    (void)run_motion_task_until_scripted_stop(context);
+}
+
+static void test_result_of_an_accepted_move_is_zero(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t move = xyz_move_to(141U, 1000, 1000U);
+    run_commands(&context, &move, 1U);
+
+    expect_u32(test_result_count, 1U, "an accepted move is answered once");
+    expect_done_at(0U, 141U, COMMAND_DONE_ACCEPTED, "an accepted move is answered with DONE ACCEPTED");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the accepted move is queued");
+}
+
+typedef struct {
+    const char *name;
+    uint8_t homed_axes_mask;
+    int32_t x_um;
+    uint32_t speed_um_per_s;
+    uint16_t expected_code;
+} TestPlannerRefusal_t;
+
+/* The context allows X from -100000 to 100000 um at up to 100000 um/s. */
+static const TestPlannerRefusal_t test_planner_refusals[] = {
+    {"a move of an unhomed axis", 0U, 1000, 1000U, TEST_ERROR_PLANNER_NOT_HOMED},
+    {"a target beyond the travel", MOTION_PLANNER_ALL_AXES_MASK, 100001, 1000U, TEST_ERROR_PLANNER_OUT_OF_RANGE},
+    {"a move without a feedrate", MOTION_PLANNER_ALL_AXES_MASK, 1000, 0U, TEST_ERROR_PLANNER_INVALID_FEEDRATE},
+    {"a move faster than the axis", MOTION_PLANNER_ALL_AXES_MASK, 1000, 200000U, TEST_ERROR_PLANNER_AXIS_SPEED_LIMIT},
+};
+
+static void test_result_of_a_planner_refusal_is_the_planner_code(void) {
+    for (uint32_t index = 0U; index < sizeof(test_planner_refusals) / sizeof(test_planner_refusals[0]); ++index) {
+        const TestPlannerRefusal_t *refusal = &test_planner_refusals[index];
+        reset_receive_script();
+        MotionTaskContext_t context = valid_motion_context();
+        context.machine_state.homed_axes_mask = refusal->homed_axes_mask;
+        const CommandDTO_t move = xyz_move_to(300U + index, refusal->x_um, refusal->speed_um_per_s);
+        run_commands(&context, &move, 1U);
+
+        expect_u32(test_result_count, 1U, refusal->name);
+        expect_result_at(0U, 300U + index, refusal->expected_code, refusal->name);
+        expect_u32(enqueued_blocks(&test_plan_buffer), 0U, "a refused move queues nothing");
+        expect_u32(test_block_ready_notifications, 0U, "a refused move wakes no generator");
+    }
+
+    reset_receive_script();
+    const CommandDTO_t move = xyz_move_to(310U, 1000, 1000U);
+    run_commands(NULL, &move, 1U);
+    expect_u32(test_result_count, 1U, "a move without a context is answered once");
+    expect_result_at(0U, 310U, TEST_ERROR_NOT_CONFIGURED, "a move without a context is not configured");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "a move without a context does not reach the planner");
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.planner_calls, 0U, "a move without a context is not counted as a planner call");
+    expect_u32(test_block_ready_notifications, 0U, "a move without a context wakes no generator");
+}
+
+static void test_result_of_a_move_to_the_current_position_is_done_at_target(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t move = xyz_move_to(142U, 0, 1000U);
+    run_commands(&context, &move, 1U);
+
+    expect_u32(test_result_count, 1U, "a move to the current position is answered once");
+    expect_done_at(0U, 142U, TEST_DONE_ALREADY_AT_TARGET, "a move to the current position is DONE, already at target");
+    expect_u32(enqueued_blocks(&test_plan_buffer), 0U, "a move to the current position queues nothing");
+    expect_u32(test_block_ready_notifications, 0U, "a move to the current position wakes no generator");
+}
+
+static void test_result_of_a_move_into_a_full_plan_buffer(void) {
+    reset_receive_script();
+    for (uint32_t sequence = 1U; sequence <= PLAN_BUFFER_CAPACITY; ++sequence) {
+        const MotionPlanBlock_t block = {.sequence = sequence};
+        expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the plan buffer is filled");
+    }
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t move = xyz_move_to(320U, 1234, 12000U);
+    run_commands(&context, &move, 1U);
+
+    expect_u32(test_result_count, 1U, "a move that does not fit is answered once");
+    expect_result_at(0U, 320U, TEST_ERROR_PLAN_QUEUE_FULL, "a full plan buffer refuses the move");
+    expect_u32(test_block_ready_notifications, 0U, "the refused block wakes no generator");
+    expect_i64(context.machine_state.position_um[0], 0, "the planned position stays where it was");
+}
+
+static void test_result_of_a_move_while_an_axis_is_busy(void) {
+    /* An axis homes. */
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t homing_then_move[] = {with_sequence(test_home_x_command, 330U), xyz_move_to(331U, 1000, 1000U)};
+    run_commands(&context, homing_then_move, 2U);
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 330U, 0U, "HOME of an idle axis is accepted");
+    expect_result_at(1U, 331U, TEST_ERROR_AXIS_BUSY, "a move is refused while an axis homes");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "the refused move is not planned");
+
+    /* The stream of one axis still plays a block, whichever axis it is. */
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        reset_receive_script();
+        context = valid_motion_context();
+        fake_generators[axis].busy = 1U;
+        const CommandDTO_t move = xyz_move_to(340U + (uint32_t)axis, 1000, 1000U);
+        run_commands(&context, &move, 1U);
+        expect_u32(test_result_count, 1U, "a move is answered once while a stream is busy");
+        expect_result_at(0U, 340U + axis, TEST_ERROR_AXIS_BUSY, "a move is refused while an axis stream plays");
+        expect_u32(motion_task_test_get_planner_call_count(), 0U, "the refused move is not planned");
+    }
+}
+
+static void test_result_of_home_and_calibrate_that_start(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 350U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_Y_MASK), 351U),
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_Z_MASK), 352U),
+    };
+    run_commands(&context, commands, 3U);
+    expect_u32(test_result_count, 3U, "every command is answered once");
+    expect_result_at(0U, 350U, 0U, "HOME of X is accepted");
+    expect_result_at(1U, 351U, 0U, "CALIBRATE of Y is accepted while X homes");
+    expect_result_at(2U, 352U, 0U, "HOME of Z is accepted while X homes and Y calibrates");
+    expect_u32(fake_x_bench_starts, 1U, "X started its seek");
+    expect_u32(fake_y.bench_starts, 1U, "Y started its seek");
+    expect_u32(fake_z.bench_starts, 1U, "Z started its seek");
+}
+
+static void test_result_of_home_and_calibrate_for_busy_axes(void) {
+    /* The axis already homes or calibrates. */
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t repeated[] = {
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 360U),
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 361U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_X_MASK), 362U),
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK), 363U),
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_Y_MASK), 364U),
+    };
+    run_commands(&context, repeated, 5U);
+    expect_u32(test_result_count, 5U, "every command is answered once");
+    expect_result_at(0U, 360U, 0U, "the first HOME is accepted");
+    expect_result_at(1U, 361U, TEST_ERROR_AXIS_BUSY, "HOME of a homing axis is refused");
+    expect_result_at(2U, 362U, TEST_ERROR_AXIS_BUSY, "CALIBRATE of a homing axis is refused");
+    expect_result_at(3U, 363U, TEST_ERROR_AXIS_BUSY, "a command that names a busy axis is refused as a whole");
+    expect_result_at(4U, 364U, 0U, "an idle axis is accepted meanwhile");
+    expect_u32(fake_x_bench_starts, 1U, "X is not restarted");
+    expect_u32(fake_y.bench_starts, 1U, "Y starts only with the command that does not name X");
+
+    /* The printing stream plays blocks: it holds every axis. */
+    reset_receive_script();
+    context = valid_motion_context();
+    gen_print.busy = 1U;
+    const CommandDTO_t home_y = with_sequence(home_command_for(MOTION_PLANNER_AXIS_Y_MASK), 365U);
+    run_commands(&context, &home_y, 1U);
+    expect_u32(test_result_count, 1U, "HOME during printing is answered once");
+    expect_result_at(0U, 365U, TEST_ERROR_AXIS_BUSY, "HOME is refused while the printing stream plays");
+    expect_u32(fake_y.bench_starts, 0U, "the refused HOME does not move");
+
+    /* The hardware of the axis moves although its stream is idle. */
+    for (uint32_t calibrate = 0U; calibrate < 2U; ++calibrate) {
+        reset_receive_script();
+        test_receive_keeps_generator_idle = 1U;
+        context = valid_motion_context();
+        script_axis_state(
+            MOTION_AXIS_Z,
+            0U,
+            MOTION_AXIS_HARDWARE_STATUS_RUNNING,
+            MOTION_AXIS_HARDWARE_STOP_REASON_NONE,
+            0U
+        );
+        const CommandDTO_t command = calibrate != 0U
+                                         ? with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_Z_MASK), 366U)
+                                         : with_sequence(home_command_for(MOTION_PLANNER_AXIS_Z_MASK), 366U);
+        run_commands(&context, &command, 1U);
+        expect_u32(test_result_count, 1U, "a command for an active axis is answered once");
+        expect_result_at(0U, 366U, TEST_ERROR_AXIS_BUSY, "an axis whose hardware moves is busy");
+        expect_u32(fake_z.bench_starts, 0U, "nothing starts on an active axis");
+    }
+}
+
+static void test_result_of_home_and_calibrate_with_wrong_axes(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        with_sequence(home_command_for(0x00U), 370U),
+        with_sequence(calibrate_command_for(0x00U), 371U),
+        with_sequence(home_command_for(0x08U), 372U),
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK | 0x08U), 373U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_X_MASK | 0x80U), 374U),
+    };
+    run_commands(&context, commands, 5U);
+    expect_u32(test_result_count, 5U, "every command is answered once");
+    for (uint32_t index = 0U; index < 5U; ++index) {
+        expect_result_at(index, 370U + index, TEST_ERROR_INVALID_PARAMETER, "a mask without axes or with extra bits");
+    }
+    expect_u32(fake_x_bench_starts, 0U, "a refused mask starts no axis, even a valid one in it");
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "a refused mask unhomes nothing");
+}
+
+static void test_result_of_home_and_calibrate_without_a_context(void) {
+    reset_receive_script();
+    const CommandDTO_t commands[] = {
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 380U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_X_MASK), 381U),
+    };
+    run_commands(NULL, commands, 2U);
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 380U, TEST_ERROR_NOT_CONFIGURED, "HOME without a context is not configured");
+    expect_result_at(1U, 381U, TEST_ERROR_NOT_CONFIGURED, "CALIBRATE without a context is not configured");
+    expect_u32(fake_x_bench_starts, 0U, "nothing moves without a context");
+}
+
+static void test_result_of_home_and_calibrate_that_do_not_start(void) {
+    /* Both switches of the axis are active. */
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    fake_x_start_limit_active = 1U;
+    fake_x_end_limit_active = 1U;
+    const CommandDTO_t conflicts[] = {
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 390U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_X_MASK), 391U),
+    };
+    run_commands(&context, conflicts, 2U);
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 390U, TEST_ERROR_LIMITS_CONFLICT, "HOME with both switches active is a conflict");
+    expect_result_at(1U, 391U, TEST_ERROR_LIMITS_CONFLICT, "CALIBRATE with both switches active is a conflict");
+
+    /* The start switch alone is a normal start. */
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_start_limit_active = 1U;
+    const CommandDTO_t on_switch = with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 392U);
+    run_commands(&context, &on_switch, 1U);
+    expect_result_at(0U, 392U, 0U, "HOME on the start switch alone is accepted");
+
+    /* The seek block cannot be built. */
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_failing_start = 1U;
+    const CommandDTO_t home_x = with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 393U);
+    run_commands(&context, &home_x, 1U);
+    expect_u32(test_result_count, 1U, "a HOME that does not start is answered once");
+    expect_result_at(0U, 393U, TEST_ERROR_HOME_NOT_STARTED, "HOME whose seek cannot start is not started");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_failing_start = 1U;
+    const CommandDTO_t calibrate_x = with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_X_MASK), 394U);
+    run_commands(&context, &calibrate_x, 1U);
+    expect_u32(test_result_count, 1U, "a CALIBRATE that does not start is answered once");
+    expect_result_at(0U, 394U, TEST_ERROR_HOME_NOT_STARTED, "CALIBRATE whose homing cannot start is not started");
+
+    /* The first axis that fails gives the code; the other axes still start. */
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_failing_start = 1U;
+    fake_y.start_limit_active = 1U;
+    fake_y.end_limit_active = 1U;
+    const CommandDTO_t home_xyz = with_sequence(home_command_for(MOTION_PLANNER_ALL_AXES_MASK), 395U);
+    run_commands(&context, &home_xyz, 1U);
+    expect_u32(test_result_count, 1U, "a command with failing axes is answered once");
+    expect_result_at(0U, 395U, TEST_ERROR_HOME_NOT_STARTED, "the code of the first failing axis (X) is reported");
+    expect_u32(fake_y.bench_starts, 0U, "Y with both switches active does not move");
+    expect_u32(fake_z.bench_starts, 1U, "Z still starts although X and Y did not");
+
+    reset_receive_script();
+    context = valid_motion_context();
+    fake_x_start_limit_active = 1U;
+    fake_x_end_limit_active = 1U;
+    fake_y.failing_start = 1U;
+    run_commands(&context, &home_xyz, 1U);
+    expect_u32(test_result_count, 1U, "a command with failing axes is answered once");
+    expect_result_at(0U, 395U, TEST_ERROR_LIMITS_CONFLICT, "the code of the first failing axis (X) is reported");
+    expect_u32(fake_y.bench_starts, 1U, "Y tried to start although X did not");
+    expect_u32(fake_z.bench_starts, 1U, "Z still starts although X and Y did not");
+}
+
+static void test_result_of_stop(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    run_single_stop(&context, MOTION_AXIS_HARDWARE_STATUS_READY);
+    expect_u32(test_result_count, 1U, "STOP is answered once");
+    expect_result_at(0U, 120U, 0U, "STOP with the axes at rest is answered with 0");
+
+    /* An axis that keeps moving does not come to rest within the settle time. */
+    reset_receive_script();
+    context = valid_motion_context();
+    run_single_stop(&context, MOTION_AXIS_HARDWARE_STATUS_RUNNING);
+    expect_u32(test_result_count, 1U, "an unsettled STOP is answered once");
+    expect_result_at(0U, 120U, TEST_ERROR_STOP_NOT_SETTLED, "STOP whose axes do not settle says so");
+}
+
+static void test_result_of_unsupported_commands(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        {
+            .sequence = 400U,
+            .code = COMMAND_CODE_SET_TEMPERATURE,
+            .parameters.set_temperature = {.heater_id = 2U, .temperature = 215U},
+        },
+        {.sequence = 401U, .code = COMMAND_CODE_SET_OUTPUT, .parameters.set_output = {.output_id = 4U, .state = 1U}},
+        {.sequence = 402U, .code = COMMAND_CODE_CHANGE_TOOL, .parameters.change_tool = {.tool_id = 7U}},
+        {
+            .sequence = 403U,
+            .code = COMMAND_CODE_MOTION_OPERATION,
+            .parameters.motion_operation = {.operation_flags = 0x04U, .spindle_pwm = 5000U},
+        },
+        {
+            .sequence = 404U,
+            .code = COMMAND_CODE_MOTION_OPERATION,
+            .parameters.motion_operation = {.operation_flags = COMMAND_MOTION_OPERATION_FLAG_RELATIVE, .x = 500},
+        },
+    };
+    run_commands(&context, commands, 5U);
+    expect_u32(test_result_count, 5U, "every unsupported command is answered once");
+    for (uint32_t index = 0U; index < 5U; ++index) {
+        expect_result_at(index, 400U + index, TEST_ERROR_NOT_SUPPORTED, "a command MotionTask does not run");
+    }
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "unsupported commands are not planned");
+}
+
+static void test_stop_erases_unread_results_and_keeps_its_own(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        xyz_move_to(500U, 1000, 1000U),
+        xyz_move_to(501U, 0, 0U),
+        {.sequence = 502U, .code = COMMAND_CODE_SET_OUTPUT, .parameters.set_output = {.output_id = 4U, .state = 1U}},
+        {.sequence = 503U, .code = COMMAND_CODE_STOP},
+    };
+    run_commands(&context, commands, 4U);
+
+    expect_u32(test_discard_calls, 1U, "STOP discards the unread results once");
+    expect_u32(test_discarded_results, 3U, "the answers of the three earlier commands were waiting");
+    expect_u32(test_result_count, 1U, "only the answer of STOP is left");
+    expect_done_at(0U, 503U, COMMAND_DONE_ACCEPTED, "STOP is answered with DONE ACCEPTED after the discard");
+}
+
+static void test_unsettled_stop_answers_after_discarding_earlier_results(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        xyz_move_to(510U, 1000, 1000U),
+        {.sequence = 511U, .code = COMMAND_CODE_STOP},
+    };
+    /* The X axis keeps running through the whole settle time. */
+    script_x_state(1U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_commands(&context, commands, 2U);
+
+    expect_u32(test_discarded_results, 1U, "the answer of the move was erased");
+    expect_u32(test_result_count, 1U, "only the answer of STOP is left");
+    expect_result_at(0U, 511U, TEST_ERROR_STOP_NOT_SETTLED, "an unsettled STOP is answered with the error");
+}
+
+static void test_internal_stop_discards_results_and_posts_none(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        xyz_move_to(520U, 1000, 1000U),
+        {.sequence = COMMAND_SEQUENCE_INTERNAL, .code = COMMAND_CODE_STOP},
+    };
+    run_commands(&context, commands, 2U);
+
+    expect_u32(test_discard_calls, 1U, "the internal STOP discards the unread results");
+    expect_u32(test_discarded_results, 1U, "the answer of the move was erased");
+    expect_u32(test_result_count, 0U, "the internal STOP is not answered");
+    expect_u32(test_generator_all_resumes, 1U, "the internal STOP still restarts the generators");
+    expect_u32(queued_blocks(&test_plan_buffer), 0U, "the internal STOP still empties the printing queue");
+    expect_u32(fake_x_stop_requests, 1U, "the internal STOP still stops the axes");
+}
+
+static void test_unsettled_internal_stop_posts_nothing(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t stop = {.sequence = COMMAND_SEQUENCE_INTERNAL, .code = COMMAND_CODE_STOP};
+    /* The X axis keeps running through the whole settle time. */
+    script_x_state(0U, MOTION_AXIS_HARDWARE_STATUS_RUNNING, MOTION_AXIS_HARDWARE_STOP_REASON_NONE, 0U);
+    run_commands(&context, &stop, 1U);
+
+    expect_u32(test_discard_calls, 1U, "the internal STOP discards the results");
+    expect_u32(test_result_count, 0U, "an unsettled internal STOP is not answered");
+    expect_u32(test_generator_all_resumes, 0U, "the generators stay halted after an unsettled STOP");
+}
+
+static void test_request_stop_drops_the_commands_behind_it_silently(void) {
+    reset_receive_script();
+    test_pending_commands[0] = (CommandDTO_t){.sequence = 210U, .code = COMMAND_CODE_HOME};
+    test_pending_commands[1] = xyz_move_to(211U, 1000, 1000U);
+    test_pending_count = 2U;
+
+    motion_task_request_stop();
+    expect_u32(test_result_count, 0U, "no command behind STOP is answered");
+    expect_u32(test_discard_calls, 0U, "the immediate STOP does not touch the unread results");
+    expect_u32(test_pending_receive_calls, 3U, "the queue is read until it is empty");
+    expect_u32(test_pending_position, 2U, "both commands were taken out of the queue");
+    expect_u32(test_pending_max_timeout, 0U, "STOP never waits for the queue");
+    expect_u32(fake_x_stop_requests, 1U, "the pulses are stopped as well");
+}
+
 int main(void) {
+    test_result_of_an_accepted_move_is_zero();
+    test_result_of_a_planner_refusal_is_the_planner_code();
+    test_result_of_a_move_to_the_current_position_is_done_at_target();
+    test_result_of_a_move_into_a_full_plan_buffer();
+    test_result_of_a_move_while_an_axis_is_busy();
+    test_result_of_home_and_calibrate_that_start();
+    test_result_of_home_and_calibrate_for_busy_axes();
+    test_result_of_home_and_calibrate_with_wrong_axes();
+    test_result_of_home_and_calibrate_without_a_context();
+    test_result_of_home_and_calibrate_that_do_not_start();
+    test_result_of_stop();
+    test_result_of_unsupported_commands();
+    test_stop_erases_unread_results_and_keeps_its_own();
+    test_unsettled_stop_answers_after_discarding_earlier_results();
+    test_internal_stop_discards_results_and_posts_none();
+    test_unsettled_internal_stop_posts_nothing();
+    test_request_stop_drops_the_commands_behind_it_silently();
     test_move_goes_to_the_queue_of_the_context();
     test_move_without_a_queue_is_dropped();
     test_stored_calibration_sets_planner_limits();
@@ -3562,8 +4172,9 @@ int main(void) {
     test_diagnostic_counters_saturate();
     test_xyz_command_reports_unconfigured_planner_inputs();
     test_xyz_command_without_position_change_counts_no_motion();
+    test_relative_move_without_increment_is_already_at_target();
     test_full_plan_buffer_rejects_new_block_without_losing_existing_plans();
-    test_xyz_command_with_null_context_reaches_planner_as_invalid_input();
+    test_xyz_command_with_null_context_is_not_configured();
     test_motion_operation_without_xyz_flag_does_not_call_planner();
     test_y_homing_through_the_stream();
     test_z_homing_through_the_stream();

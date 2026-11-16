@@ -75,6 +75,8 @@ size_t command_protocol_build_response(uint8_t *frame, size_t frame_capacity, co
 size_t command_protocol_build_pong_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence);
 size_t command_protocol_build_ack_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence);
 size_t
+command_protocol_build_done_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t result_code);
+size_t
 command_protocol_build_error_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t error_code);
 
 #endif /* FM_V3_COMMAND_PROTOCOL_H */

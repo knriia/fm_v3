@@ -315,6 +315,17 @@ size_t command_protocol_build_ack_response(uint8_t *frame, size_t frame_capacity
 }
 
 size_t
+command_protocol_build_done_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t result_code) {
+    CommandResponseDTO_t response = {
+        .type = COMMAND_MESSAGE_TYPE_DONE,
+        .sequence = sequence,
+        .payload_length = sizeof(CommandDonePayloadDTO_t),
+    };
+    command_write_u16_le(response.payload, result_code);
+    return command_protocol_build_response(frame, frame_capacity, &response);
+}
+
+size_t
 command_protocol_build_error_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t error_code) {
     CommandResponseDTO_t response = {
         .type = COMMAND_MESSAGE_TYPE_ERROR,
