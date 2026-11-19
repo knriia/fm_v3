@@ -179,11 +179,13 @@ static void test_initialization(void) {
 
     expect_u32((uint32_t)command_result_queue_init(), (uint32_t)osOK, "the queue initializes after allocation recovers");
     expect_u32(test_new_calls, 2U, "creation is attempted on each initialization");
-    expect_u32(test_queue.capacity, COMMAND_QUEUE_CAPACITY, "there is room for a result of every queued command");
+    /* 100 queued commands + 128 moves that wait for their final result + 1. */
+    expect_u32(test_queue.capacity, 229U, "there is room for the results of every queued command and waiting move");
+    expect_u32(test_queue.capacity, COMMAND_RESULT_QUEUE_CAPACITY, "the queue is created with the declared capacity");
     expect_u32(
         test_queue.message_size,
-        8U,
-        "a message holds a 32-bit sequence, an 8-bit type and a 16-bit code, padded to 8 bytes"
+        12U,
+        "a message holds a 32-bit sequence, an 8-bit type, a 16-bit code and three 8-bit fields, padded to 12 bytes"
     );
     expect_u32(test_attributes_were_null, 1U, "the queue uses the default CMSIS allocation");
 
@@ -234,6 +236,59 @@ static void test_results_keep_their_order_and_values(void) {
         (uint32_t)osErrorParameter,
         "an unexpected RTOS error is passed on"
     );
+}
+
+static void test_plain_post_has_no_stop_details(void) {
+    CommandResult_t result = {.cause = 0x55U, .axis = 0x55U, .detail = 0x55U};
+    reset_initialized_fixture();
+
+    command_result_queue_post(40U, COMMAND_MESSAGE_TYPE_ERROR, 0x0123U);
+    expect_u32((uint32_t)command_result_queue_try_receive(&result), (uint32_t)osOK, "the result is received");
+    expect_u32(result.sequence, 40U, "the sequence is kept");
+    expect_u32(result.response_type, 0xFFU, "the type is kept");
+    expect_u32(result.code, 0x0123U, "the code is kept");
+    expect_u32(result.cause, 0U, "a plain result has cause 0");
+    expect_u32(result.axis, 0xFFU, "a plain result blames no axis");
+    expect_u32(result.detail, 0U, "a plain result has detail 0");
+}
+
+static void test_detailed_post_keeps_the_stop_details(void) {
+    CommandResult_t result = {0};
+    reset_initialized_fixture();
+    command_result_queue_set_listener(test_listener);
+
+    command_result_queue_post_detailed(41U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 2U, 1U, 3U);
+    command_result_queue_post_detailed(42U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 0xA1U, 0U, 0xC3U);
+    expect_u32(test_listener_calls, 2U, "a detailed result wakes the consumer like a plain one");
+    expect_u32(test_listener_queued_at_call, 2U, "the consumer is woken after the result is in the queue");
+
+    expect_u32((uint32_t)command_result_queue_try_receive(&result), (uint32_t)osOK, "the first result is received");
+    expect_u32(result.sequence, 41U, "the first sequence is kept");
+    expect_u32(result.response_type, 0xFFU, "the first type is kept");
+    expect_u32(result.code, 0x0128U, "the first code is kept");
+    expect_u32(result.cause, 2U, "the first cause is kept");
+    expect_u32(result.axis, 1U, "the first axis is kept");
+    expect_u32(result.detail, 3U, "the first detail is kept");
+    expect_u32((uint32_t)command_result_queue_try_receive(&result), (uint32_t)osOK, "the second result is received");
+    expect_u32(result.sequence, 42U, "the second sequence is kept");
+    expect_u32(result.cause, 0xA1U, "the second cause is kept");
+    expect_u32(result.axis, 0U, "axis X stays 0 and is not turned into no axis");
+    expect_u32(result.detail, 0xC3U, "the second detail is kept");
+
+    /* A detailed result is dropped like a plain one when the queue does not take it. */
+    test_next_put_status = osErrorResource;
+    command_result_queue_post_detailed(43U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 2U, 1U, 3U);
+    expect_u32(test_listener_calls, 2U, "a detailed result that was not queued does not wake the consumer");
+    expect_u32(test_queue.count, 0U, "a detailed result that was not queued adds nothing");
+}
+
+static void test_detailed_post_before_initialization_queues_nothing(void) {
+    reset_counters();
+    command_result_queue_set_listener(test_listener);
+    command_result_queue_post_detailed(44U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 2U, 1U, 3U);
+    expect_u32(test_put_calls, 0U, "nothing is put into a queue that does not exist");
+    expect_u32(test_listener_calls, 0U, "a result that was not queued does not wake the consumer");
+    command_result_queue_set_listener(NULL);
 }
 
 static void test_full_queue_drops_new_results_and_keeps_old_ones(void) {
@@ -315,7 +370,10 @@ static void test_listener_can_be_removed(void) {
 
 int main(void) {
     test_before_initialization_nothing_is_queued();
+    test_detailed_post_before_initialization_queues_nothing();
     test_initialization();
+    test_plain_post_has_no_stop_details();
+    test_detailed_post_keeps_the_stop_details();
     test_results_keep_their_order_and_values();
     test_full_queue_drops_new_results_and_keeps_old_ones();
     test_discard_drops_every_queued_result();

@@ -31,6 +31,8 @@
  * single lane has nothing to get out of step with and takes a late block into the running stream. */
 
 #define STEP_STREAM_FEEDER_MAX_LANES 4U
+/* Blocks that the feeder remembers between starting a block on the first lane and the last lane having played it. */
+#define STEP_STREAM_FEEDER_BLOCK_END_CAPACITY 128U
 
 typedef enum {
     STEP_STREAM_FEEDER_AXIS_OK = 0,
@@ -115,6 +117,8 @@ typedef struct {
     uint32_t streams_stopped;
     uint32_t generator_errors;
     uint32_t axis_errors;
+    /* Streams closed early because the block ends did not fit; the plan buffer capacity should prevent it. */
+    uint32_t block_end_overflows;
 } StepStreamFeederDiagnostics_t;
 
 typedef struct {
@@ -126,7 +130,19 @@ typedef struct {
     uint8_t generator_active;
     /* A half that carries records of a block, steps or waiting. A half with none is a filler stretch. */
     uint8_t half_has_block[2];
+    /* Records of the halves already filled, the number of the first record of the half being filled. Counts from the
+     * start of the stream and wraps; it is the numbering in which the axis reports the record it has played. */
+    uint32_t record_base;
 } StepStreamFeederLane_t;
+
+/* Where a block ends on each lane, in the numbering of the lane's records. */
+typedef struct {
+    /* MotionPlanBlock_t.order of the block. */
+    uint32_t order;
+    uint32_t end_record[STEP_STREAM_FEEDER_MAX_LANES];
+    /* Bit = lane: the generator of the lane has written the last record of the block. */
+    uint8_t end_known_mask;
+} StepStreamFeederBlockEnd_t;
 
 typedef struct {
     StepStreamFeederConfig_t config;
@@ -150,6 +166,15 @@ typedef struct {
     uint8_t direction_positive_mask;
     /* Planner axes that a lane drives. */
     uint8_t lane_axes_mask;
+    /* Blocks that a lane has started and not every lane has played yet, oldest first, as a ring. The block with index
+     * block_end_first_block in the sequence of the stream is at block_end_head. */
+    StepStreamFeederBlockEnd_t block_ends[STEP_STREAM_FEEDER_BLOCK_END_CAPACITY];
+    uint32_t block_end_head;
+    uint32_t block_end_count;
+    uint32_t block_end_first_block;
+    /* Blocks played completely since reset (wraps) and the order of the last of them. */
+    uint32_t played_blocks;
+    uint32_t played_order;
     StepStreamFeederDiagnostics_t diagnostics;
 } StepStreamFeeder_t;
 
@@ -192,6 +217,18 @@ void step_stream_feeder_reset(StepStreamFeeder_t *feeder);
 /* Fills released halves, starts a primed stream and stops an idle one. A block whose direction differs from the
  * running stream waits until every lane has played an idle stretch and the stream has stopped, then opens a new one. */
 StepStreamFeederStatus_t step_stream_feeder_service(StepStreamFeeder_t *feeder);
+
+/* Moves the blocks that the axes have played from the queue of block ends to the played count. executed_record[lane] is
+ * the number of records of the plan that the lane has played, in the numbering of StepStreamFeederLane_t.record_base. A
+ * block is played when on every lane its end is known and not beyond the executed record; a block whose end is not
+ * known yet is not played, and the blocks behind an unplayed one are not either. A stream that has ended counts all of
+ * its blocks as played on its own. Callable while the stream runs, from the task that owns the feeder. */
+void step_stream_feeder_update_played(StepStreamFeeder_t *feeder, const uint32_t *executed_record);
+/* Played blocks since reset (wraps) and the MotionPlanBlock_t.order of the last of them. */
+void step_stream_feeder_get_played(const StepStreamFeeder_t *feeder, uint32_t *blocks, uint32_t *last_order);
+/* The block that the lanes have started and not finished playing, the oldest one: 1 and its order, 0 when there is
+ * none. */
+uint8_t step_stream_feeder_get_first_unplayed(const StepStreamFeeder_t *feeder, uint32_t *order);
 
 StepStreamFeederPhase_t step_stream_feeder_get_phase(const StepStreamFeeder_t *feeder);
 /* Planner axes (bit = axis) that the blocks of the stream being opened or played move; 0 for a feeder without one. A

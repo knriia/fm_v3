@@ -55,6 +55,10 @@ typedef struct {
 } MotionTaskContext_t;
 
 void MotionTask(void *argument);
+/* Wake MotionTask: a command was put into the command queue, or the step stream reported progress. They only set a
+ * thread flag, so they can be called from any task; before the task has started they do nothing. */
+void motion_task_notify_command(void);
+void motion_task_notify_progress(void);
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics);
 /* An axis outside MotionAxis_t leaves `diagnostics` untouched. */
 void motion_task_get_axis_diagnostics(MotionAxis_t axis, MotionAxisDiagnostics *diagnostics);

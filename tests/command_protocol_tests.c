@@ -375,12 +375,62 @@ static void test_frame_and_response_builders(void) {
 
     const size_t error_length =
         command_protocol_build_error_response(frame, sizeof(frame), 35U, COMMAND_ERROR_INVALID_LENGTH);
-    expect_u32((uint32_t)error_length, 16U, "ERROR frame size is correct");
+    expect_u32((uint32_t)error_length, 19U, "ERROR frame is a header, a five-byte payload and a CRC");
     expect_u32(command_protocol_validate_frame(frame, error_length, &header), COMMAND_FRAME_VALID, "ERROR frame CRC is valid");
-    expect_u32(header.type, COMMAND_MESSAGE_TYPE_ERROR, "ERROR type is correct");
-    expect_u32(header.payload_length, 2U, "ERROR code occupies two bytes");
+    expect_u32(header.type, 0xFFU, "ERROR type is 0xFF");
+    expect_u32(header.payload_length, 5U, "ERROR payload is the code, the cause, the axis and the detail");
     expect_u32(header.sequence, 35U, "ERROR sequence is preserved");
     expect_u32(frame[COMMAND_FRAME_HEADER_SIZE], COMMAND_ERROR_INVALID_LENGTH, "ERROR payload is little endian");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "ERROR code high byte follows the low byte");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 2U], 0U, "an ERROR that is not a stop has cause 0");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 3U], 0xFFU, "an ERROR that is not a stop blames no axis");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 4U], 0U, "an ERROR that is not a stop has detail 0");
+    expect_u32(
+        (uint32_t)command_protocol_build_error_response(frame, 18U, 35U, COMMAND_ERROR_INVALID_LENGTH),
+        0U,
+        "ERROR is not built into a buffer that is too small"
+    );
+}
+
+static void test_error_detail_response(void) {
+    uint8_t frame[COMMAND_MAX_FRAME_SIZE] = {0};
+    CommandFrameHeaderDTO_t header = {0};
+    /* STREAM_INTERRUPTED 0x0128: a limit switch (cause 2) of Z (axis 2), the end switch (detail 3). */
+    const size_t length = command_protocol_build_error_detail_response(frame, sizeof(frame), 0x01020304U, 0x0128U, 2U, 2U, 3U);
+    expect_u32((uint32_t)length, 19U, "ERROR frame with details is 10 + 5 + 4 bytes");
+    expect_u32(command_protocol_validate_frame(frame, length, &header), COMMAND_FRAME_VALID, "ERROR frame CRC is valid");
+    expect_u32(header.type, 0xFFU, "ERROR type is 0xFF");
+    expect_u32(header.payload_length, 5U, "ERROR payload has five bytes");
+    expect_u32(header.sequence, 0x01020304U, "ERROR sequence is preserved");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE], 0x28U, "error code low byte comes first");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], 0x01U, "error code high byte comes second");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 2U], 2U, "the cause is the third payload byte");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 3U], 2U, "the axis is the fourth payload byte");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 4U], 3U, "the detail is the fifth payload byte");
+
+    /* The CRC covers the new bytes. */
+    frame[COMMAND_FRAME_HEADER_SIZE + 4U] ^= 1U;
+    expect_u32(
+        command_protocol_validate_frame(frame, length, &header),
+        COMMAND_FRAME_INVALID_CRC,
+        "a changed detail byte breaks the CRC"
+    );
+
+    /* Axis 0 is X, not "no axis"; every field keeps its own byte. */
+    const size_t second = command_protocol_build_error_detail_response(frame, sizeof(frame), 7U, 0xABCDU, 0x11U, 0U, 0xEEU);
+    expect_u32((uint32_t)second, 19U, "the frame size does not depend on the values");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE], 0xCDU, "second code low byte");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 1U], 0xABU, "second code high byte");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 2U], 0x11U, "second cause");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 3U], 0x00U, "axis X stays 0");
+    expect_u32(frame[COMMAND_FRAME_HEADER_SIZE + 4U], 0xEEU, "second detail");
+    expect_u32(command_protocol_validate_frame(frame, second, &header), COMMAND_FRAME_VALID, "second frame CRC is valid");
+
+    expect_u32(
+        (uint32_t)command_protocol_build_error_detail_response(frame, 18U, 7U, 0x0128U, 2U, 2U, 3U),
+        0U,
+        "ERROR with details is not built into a buffer that is too small"
+    );
 }
 
 int main(void) {
@@ -388,6 +438,7 @@ int main(void) {
     test_assembler_frame_events();
     test_header_frame_and_request_validation();
     test_frame_and_response_builders();
+    test_error_detail_response();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Command protocol tests failed: %u\n", test_failures);

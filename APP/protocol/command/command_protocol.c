@@ -325,13 +325,36 @@ command_protocol_build_done_response(uint8_t *frame, size_t frame_capacity, uint
     return command_protocol_build_response(frame, frame_capacity, &response);
 }
 
-size_t
-command_protocol_build_error_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t error_code) {
+size_t command_protocol_build_error_detail_response(
+    uint8_t *frame,
+    size_t frame_capacity,
+    uint32_t sequence,
+    uint16_t error_code,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail
+) {
     CommandResponseDTO_t response = {
         .type = COMMAND_MESSAGE_TYPE_ERROR,
         .sequence = sequence,
         .payload_length = sizeof(CommandErrorPayloadDTO_t),
     };
     command_write_u16_le(response.payload, error_code);
+    response.payload[2] = cause;
+    response.payload[3] = axis;
+    response.payload[4] = detail;
     return command_protocol_build_response(frame, frame_capacity, &response);
+}
+
+size_t
+command_protocol_build_error_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t error_code) {
+    return command_protocol_build_error_detail_response(
+        frame,
+        frame_capacity,
+        sequence,
+        error_code,
+        0U,
+        COMMAND_ERROR_AXIS_NONE,
+        0U
+    );
 }

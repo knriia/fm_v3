@@ -62,7 +62,9 @@ typedef struct {
     /* STEP_GENERATOR_TASK_HALT_CAUSE_* of the first halt since the last reset: a later halt, e.g. MotionTask ending the
      * move after a switch stopped it, does not overwrite it. It stays after the reset, so with halted 0 it is old. */
     uint32_t halt_cause;
-    /* Member (0 = X, 1 = Y, 2 = Z) that reported the latest limit or fault, or STEP_GENERATOR_TASK_NO_MEMBER. */
+    /* Member (0 = X, 1 = Y, 2 = Z): for a limit the one whose switch fired first since the last reset, or the braking
+     * channel when no switch was reported; for a fault the faulted one; STEP_GENERATOR_TASK_NO_MEMBER when no channel
+     * is to blame. */
     uint32_t halt_member;
     /* StepStreamAxisFault_t of the latest group fault. */
     uint32_t halt_fault;
@@ -108,6 +110,41 @@ PlanBuffer_t *step_generator_instance_get_plan_buffer(const StepGeneratorInstanc
 void step_generator_task_notify_block_ready(void);
 /* Called from the axis DMA interrupt when a ring half has been played and needs refilling. */
 void step_generator_task_notify_ring_half_released(void);
+/* What the instance has played and why it stopped: a snapshot that StepGeneratorTask is the only writer of. MotionTask
+ * turns its changes into answers to the client. */
+typedef struct {
+    /* Increases with every STOP and client disconnect (step_generator_instance_halt): a snapshot of an older generation
+     * belongs to a stream that was cancelled and its results must not be sent. Wraps. */
+    uint32_t generation;
+    /* Blocks played completely since the last reset of the instance and MotionPlanBlock_t.order of the last of them.
+     * Both wrap; compare differences. */
+    uint32_t played_blocks;
+    uint32_t played_order;
+    /* 1 once the instance is halted, no channel runs any more and the played blocks above are final. The fields below
+     * are valid only then. */
+    uint8_t stop_resolved;
+    /* 1 when a block was cut off, and unplayed_order is the order of the first such block. */
+    uint8_t has_unplayed;
+    uint32_t unplayed_order;
+    /* STEP_GENERATOR_TASK_HALT_CAUSE_* of the stop. */
+    uint32_t halt_cause;
+    /* MotionAxis_t that the stop is blamed on (the axis whose switch fired first, or the faulted channel), or
+     * STEP_GENERATOR_TASK_NO_AXIS. */
+    uint32_t halt_axis;
+    /* For LIMIT MotionAxisHardwareStopReason_t (START_LIMIT 2, END_LIMIT 3), for GROUP_FAULT StepStreamAxisFault_t, for
+     * FEEDER_ERROR StepStreamFeederStatus_t; 0 for the others. */
+    uint32_t halt_detail;
+} StepGeneratorProgress_t;
+
+/* halt_axis while no axis is to blame. */
+#define STEP_GENERATOR_TASK_NO_AXIS 0xFFFFFFFFU
+
+/* Called from StepGeneratorTask after the snapshot of the printing stream changed; must only signal and return. */
+typedef void (*StepGeneratorProgressListener_t)(void);
+void step_generator_task_set_progress_listener(StepGeneratorProgressListener_t listener);
+
+/* Copies the snapshot in one piece. A NULL instance or progress does nothing. */
+void step_generator_instance_get_progress(const StepGeneratorInstance_t *instance, StepGeneratorProgress_t *progress);
 /* Stops the instance's channels and feeding right away; callable from any task. A NULL instance does nothing. */
 void step_generator_instance_halt(StepGeneratorInstance_t *instance);
 /* STOP: halts every instance. */

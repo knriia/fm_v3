@@ -7,6 +7,7 @@
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
 #include "motion/home_block.h"
+#include "motion/move_result_tracker.h"
 #include "motion/plan_buffer.h"
 #include "motion/step_executor.h"
 #include "step_generator_task.h"
@@ -21,6 +22,14 @@
 #define MOTION_TASK_STREAM_AXES_MASK                                                                                   \
     (MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK | MOTION_PLANNER_AXIS_Z_MASK)
 #define MOTION_TASK_HOME_POLL_INTERVAL_MS 1U
+/* Thread flags of MotionTask: a command is queued, the step stream has progress to report. */
+#define MOTION_TASK_FLAG_COMMAND (1UL << 0)
+#define MOTION_TASK_FLAG_PROGRESS (1UL << 1)
+#define MOTION_TASK_FLAGS_ALL (MOTION_TASK_FLAG_COMMAND | MOTION_TASK_FLAG_PROGRESS)
+_Static_assert(
+    MOVE_RESULT_TRACKER_CAPACITY == COMMAND_RESULT_QUEUE_PENDING_MOVES,
+    "the result queue has room for every move that waits for its result"
+);
 /* Lets the belt come to rest between the backoff and the approach. */
 #define MOTION_TASK_HOME_SETTLE_MS 10U
 /* The start switch, not a step count, ends every homing move; a switch that never changes is a separate open
@@ -36,6 +45,10 @@ static StepExecutor_t motion_task_stream_executors[MOTION_AXIS_HARDWARE_COUNT];
 /* The queue of the planned moves (the printing stream). Set once when the task starts. The homing and calibration moves
  * go into the queue of the generator instance of their axis instead. */
 static PlanBuffer_t *motion_task_plan_buffer;
+/* The moves of the printing stream that have been accepted and wait for their final result. */
+static MoveResultTracker_t motion_task_move_tracker;
+/* Written once when the task starts; the notify functions read it. */
+static osThreadId_t volatile motion_task_thread_id;
 
 /* The three homing moves; the switches, not step counts, end them. */
 typedef struct {
@@ -230,8 +243,16 @@ motion_task_queue_move(MotionTaskContext_t *context, const MotionPlannerRequest_
 #endif
     if (result.status == MOTION_PLANNER_STATUS_OK) {
         motion_task_counter_increment(&motion_task_diagnostics.planner_blocks_created);
-        if (plan_buffer_try_push(motion_task_plan_buffer, &result.block) != PLAN_BUFFER_STATUS_OK) {
+        /* The tracker's capacity is what the step feeder can remember of started blocks, so a move that does not fit
+         * is refused here and no queue further down can overflow. */
+        MotionPlanBlock_t block = result.block;
+        block.order = move_result_tracker_add(&motion_task_move_tracker, request->sequence);
+        if (block.order == 0U) {
+            return motion_task_decision_from_error(COMMAND_ERROR_PLAN_QUEUE_FULL);
+        }
+        if (plan_buffer_try_push(motion_task_plan_buffer, &block) != PLAN_BUFFER_STATUS_OK) {
             /* The rejected block is dropped; PlanBuffer records why it was not accepted. */
+            move_result_tracker_remove_last(&motion_task_move_tracker);
             return motion_task_decision_from_error(COMMAND_ERROR_PLAN_QUEUE_FULL);
         }
         /* The next move starts where this one ends, not where the axis is right now. */
@@ -246,8 +267,16 @@ motion_task_queue_move(MotionTaskContext_t *context, const MotionPlannerRequest_
         return motion_task_done(COMMAND_DONE_ALREADY_AT_TARGET);
     }
     motion_task_counter_increment(&motion_task_diagnostics.planner_errors);
-    (void)plan_buffer_clear(motion_task_plan_buffer);
+    /* The caller treats the refusal as a malformed command and brings the machine to rest and empty. */
     return motion_task_decision_from_error((uint16_t)(COMMAND_ERROR_PLANNER_BASE + (uint32_t)result.status));
+}
+
+/* 1 for a refusal by the planner (COMMAND_ERROR_PLANNER_BASE + status, below the codes of MotionTask itself). */
+static uint8_t motion_task_is_planner_refusal(const MotionTaskDecision_t *decision) {
+    return decision->response_type == COMMAND_MESSAGE_TYPE_ERROR && decision->code > COMMAND_ERROR_PLANNER_BASE &&
+                   decision->code < COMMAND_ERROR_AXIS_BUSY
+               ? 1U
+               : 0U;
 }
 
 /* A target beyond int32 is clamped; it is far outside any axis, so the planner rejects it. */
@@ -832,8 +861,60 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
     motion_axis_hardware_reset_timing_peaks(state->axis);
 }
 
+static void motion_task_emit_move_result(void *context, const MoveResult_t *result) {
+    (void)context;
+    if (result->kind == MOVE_RESULT_COMPLETED) {
+        command_result_queue_post(result->sequence, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_COMPLETED);
+        return;
+    }
+    command_result_queue_post_detailed(
+        result->sequence,
+        COMMAND_MESSAGE_TYPE_ERROR,
+        COMMAND_ERROR_STREAM_INTERRUPTED,
+        result->cause,
+        result->axis,
+        result->detail
+    );
+}
+
+/* Takes the snapshot of the printing stream and answers the moves it has played or cut off. */
+static void motion_task_process_move_results(void) {
+    StepGeneratorProgress_t progress = {0};
+    step_generator_instance_get_progress(step_generator_task_get_print_instance(), &progress);
+    const MoveResultProgress_t input = {
+        .generation = progress.generation,
+        .played_blocks = progress.played_blocks,
+        .played_order = progress.played_order,
+        .stop_resolved = progress.stop_resolved,
+        /* STOP and a disconnect answer for themselves. */
+        .report_stop = progress.halt_cause != STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL ? 1U : 0U,
+        .has_unplayed = progress.has_unplayed,
+        .unplayed_order = progress.unplayed_order,
+        .cause = (uint8_t)progress.halt_cause,
+        .axis =
+            progress.halt_axis == STEP_GENERATOR_TASK_NO_AXIS ? COMMAND_ERROR_AXIS_NONE : (uint8_t)progress.halt_axis,
+        .detail = (uint8_t)progress.halt_detail,
+    };
+    move_result_tracker_update(&motion_task_move_tracker, &input, motion_task_emit_move_result, NULL);
+}
+
+static void motion_task_signal(uint32_t flags) {
+    const osThreadId_t thread_id = motion_task_thread_id;
+    if (thread_id != NULL) {
+        (void)osThreadFlagsSet(thread_id, flags);
+    }
+}
+
+void motion_task_notify_command(void) { motion_task_signal(MOTION_TASK_FLAG_COMMAND); }
+
+void motion_task_notify_progress(void) { motion_task_signal(MOTION_TASK_FLAG_PROGRESS); }
+
 /* Returns 0 when the axes did not come to rest in time or the printing stream is still halted after its reset. */
 static uint8_t motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
+    /* The moves that waited are cancelled with the stream; STOP is their answer. */
+    StepGeneratorProgress_t progress = {0};
+    step_generator_instance_get_progress(step_generator_task_get_print_instance(), &progress);
+    move_result_tracker_reset(&motion_task_move_tracker, progress.generation);
     (void)plan_buffer_clear(motion_task_plan_buffer);
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         /* The homing and calibration moves still queued were cut short as well. */
@@ -915,7 +996,8 @@ static MotionTaskDecision_t motion_task_execute_command(
         );
     }
     if (motion_task_is_xyz_move(command) != 0) {
-        if (context == NULL) {
+        /* A stream whose feeder was never built plays nothing, so a block queued for it would wait for good. */
+        if (context == NULL || step_generator_instance_is_ready(step_generator_task_get_print_instance()) == 0U) {
             return motion_task_decision_from_error(COMMAND_ERROR_NOT_CONFIGURED);
         }
         if (stream_halted != 0U) {
@@ -933,6 +1015,15 @@ void MotionTask(void *argument) {
     MotionTaskContext_t *context = argument;
     MotionTaskAxisState_t axes[MOTION_AXIS_HARDWARE_COUNT] = {0};
     motion_task_plan_buffer = context == NULL ? NULL : context->plan_buffer;
+    motion_task_thread_id = osThreadGetId();
+    {
+        /* A task that starts has no move waiting for a result. */
+        StepGeneratorProgress_t progress = {0};
+        step_generator_instance_get_progress(step_generator_task_get_print_instance(), &progress);
+        move_result_tracker_reset(&motion_task_move_tracker, progress.generation);
+    }
+    command_queue_set_put_listener(motion_task_notify_command);
+    step_generator_task_set_progress_listener(motion_task_notify_progress);
 
     /* Drive STEP/DIR/ENABLE of every axis to defined levels before any command can arrive. */
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
@@ -946,17 +1037,26 @@ void MotionTask(void *argument) {
     motion_task_publish_axes(axes, context);
 
     for (;;) {
+        motion_task_process_move_results();
         CommandDTO_t command = {0};
         const uint8_t busy_mask = motion_task_busy_axes(axes);
-        const uint32_t receive_timeout_ms = busy_mask != 0U ? MOTION_TASK_HOME_POLL_INTERVAL_MS : osWaitForever;
-        const osStatus_t receive_status = command_queue_receive(&command, receive_timeout_ms);
-        if (receive_status != osOK) {
+        /* The queue is read without waiting, and the task sleeps on its flags instead: a command and the progress of
+         * the stream both wake it, and a flag set between the read and the wait is not lost. */
+        const osStatus_t receive_status = command_queue_receive(&command, 0U);
+        if (receive_status == osErrorResource || receive_status == osErrorTimeout) {
+            const uint32_t wait_timeout_ms = busy_mask != 0U ? MOTION_TASK_HOME_POLL_INTERVAL_MS : osWaitForever;
+            const uint32_t flags = osThreadFlagsWait(MOTION_TASK_FLAGS_ALL, osFlagsWaitAny, wait_timeout_ms);
             /* Timeouts only occur while an axis homes or calibrates; the poll is a no-op once that has ended. */
-            if (receive_status == osErrorTimeout) {
+            if (flags == (uint32_t)osFlagsErrorTimeout) {
                 motion_task_poll_axes(axes, context);
                 motion_task_publish_axes(axes, context);
-                continue;
+            } else if ((flags & (uint32_t)osFlagsError) != 0U) {
+                motion_task_counter_increment(&motion_task_diagnostics.queue_receive_errors);
+                (void)osDelay(MOTION_TASK_ERROR_RETRY_DELAY_MS);
             }
+            continue;
+        }
+        if (receive_status != osOK) {
             motion_task_abort_axes(axes, context);
             motion_task_publish_axes(axes, context);
             motion_task_counter_increment(&motion_task_diagnostics.queue_receive_errors);
@@ -982,6 +1082,14 @@ void MotionTask(void *argument) {
         }
 
         const MotionTaskDecision_t decision = motion_task_execute_command(axes, context, &command, busy_mask);
+        if (motion_task_is_planner_refusal(&decision) != 0U) {
+            /* A move the planner refuses is a client bug, and what was queued behind it cannot be trusted: everything
+             * is stopped and emptied as by STOP (streams, rings, plan queues, command queue, results the client has not
+             * read), and only this command is answered, with the planner's reason. */
+            motion_task_request_stop();
+            (void)motion_task_stop(axes, context);
+            command_result_queue_discard_all();
+        }
         command_result_queue_post(command.sequence, decision.response_type, decision.code);
 
         motion_task_poll_axes(axes, context);

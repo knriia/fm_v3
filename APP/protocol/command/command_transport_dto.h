@@ -63,16 +63,32 @@ typedef enum {
 /* STOP did not bring every axis to rest in time, or the printing stream is still halted after the reset that follows
  * it; the step generator stays halted. */
 #define COMMAND_ERROR_STOP_NOT_SETTLED 0x0125U
-/* MotionTask has no machine context, so it cannot plan or home. */
+/* MotionTask has no machine context, so it cannot plan or home, or the step generator of the printing stream is not
+ * ready (it could not build its feeder) and would never play a queued move. */
 #define COMMAND_ERROR_NOT_CONFIGURED 0x0126U
 /* The step stream is halted (a limit switch, a generator fault): HOME, CALIBRATE and moves are refused until STOP. The
  * cause is the halt_cause of the step generator diagnostics (STEP_GENERATOR_TASK_HALT_CAUSE_*). STOP also cancels a
  * homing or calibration that is running; a move is refused with this code even while one runs. */
 #define COMMAND_ERROR_STREAM_HALTED 0x0127U
+/* A move that MotionTask had accepted (DONE with COMMAND_DONE_ACCEPTED) did not run to its end: the step stream
+ * stopped. The cause, axis and detail fields of the ERROR payload say why; STOP is needed to lift the stop. The answer
+ * comes after the move's DONE and only for the move that was playing when the stream stopped. */
+#define COMMAND_ERROR_STREAM_INTERRUPTED 0x0128U
 
 /* Result codes of a DONE frame. */
 #define COMMAND_DONE_ACCEPTED 0x0000U
 #define COMMAND_DONE_ALREADY_AT_TARGET 0x0001U
+/* The second DONE of a move: the move was played to its end.
+ * Answers of a motion operation (an XYZ move): ACK, DONE ACCEPTED (queued), then COMMAND_DONE_COMPLETED or ERROR
+ * COMMAND_ERROR_STREAM_INTERRUPTED. ALREADY_AT_TARGET, a refusal, HOME and CALIBRATE are answered once and get no
+ * second answer. */
+#define COMMAND_DONE_COMPLETED 0x0002U
+
+/* ERROR payload fields beyond the code. cause is a STEP_GENERATOR_TASK_HALT_CAUSE_* (0 for a refusal that is not a
+ * stop), axis the MotionAxis_t that the stop is blamed on or COMMAND_ERROR_AXIS_NONE (0 is X, so it needs its own
+ * value), detail depends on the cause: for a limit switch 2 (start) or 3 (end), for a group fault the stream axis
+ * fault, for a feeder error the feeder status. */
+#define COMMAND_ERROR_AXIS_NONE 0xFFU
 
 /* No client command has sequence 0 (the protocol rejects it), so the device uses it for commands it issues itself. They
  * get no response. */
@@ -86,8 +102,13 @@ typedef struct __attribute__((packed)) {
     uint32_t sequence;
 } CommandFrameHeaderDTO_t;
 
+/* The same size in every ERROR frame; a refusal that is not a stop has cause 0, COMMAND_ERROR_AXIS_NONE and detail 0.
+ * A payload only grows by appending: a parser takes any length of at least 2. */
 typedef struct __attribute__((packed)) {
     uint16_t error_code;
+    uint8_t cause;
+    uint8_t axis;
+    uint8_t detail;
 } CommandErrorPayloadDTO_t;
 
 typedef struct __attribute__((packed)) {
@@ -109,7 +130,7 @@ typedef struct {
 } CommandResponseDTO_t;
 
 _Static_assert(sizeof(CommandFrameHeaderDTO_t) == COMMAND_FRAME_HEADER_SIZE, "Invalid command frame header size");
-_Static_assert(sizeof(CommandErrorPayloadDTO_t) == 2U, "Invalid command error payload size");
+_Static_assert(sizeof(CommandErrorPayloadDTO_t) == 5U, "Invalid command error payload size");
 _Static_assert(sizeof(CommandDonePayloadDTO_t) == 2U, "Invalid command done payload size");
 
 #endif /* FM_V3_COMMAND_TRANSPORT_DTO_H */

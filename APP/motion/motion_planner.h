@@ -37,6 +37,9 @@ typedef struct {
 /* A constant-feedrate linear move block; timing is represented as an exact ratio. */
 typedef struct {
     uint32_t sequence;
+    /* Number of the block in the order in which the queue took it; the executor of the stream reports progress by it.
+     * The planner leaves it 0, the queue owner assigns it. */
+    uint32_t order;
     int64_t step_delta[MOTION_PLANNER_AXIS_COUNT];
     uint64_t path_length_um;
     uint64_t master_step_count;

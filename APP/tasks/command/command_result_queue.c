@@ -16,7 +16,25 @@ osStatus_t command_result_queue_init(void) {
 }
 
 void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_t code) {
-    const CommandResult_t result = {.sequence = sequence, .response_type = response_type, .code = code};
+    command_result_queue_post_detailed(sequence, response_type, code, 0U, COMMAND_ERROR_AXIS_NONE, 0U);
+}
+
+void command_result_queue_post_detailed(
+    uint32_t sequence,
+    uint8_t response_type,
+    uint16_t code,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail
+) {
+    const CommandResult_t result = {
+        .sequence = sequence,
+        .response_type = response_type,
+        .code = code,
+        .cause = cause,
+        .axis = axis,
+        .detail = detail,
+    };
     if (command_result_queue_handle == NULL ||
         osMessageQueuePut(command_result_queue_handle, &result, 0U, 0U) != osOK) {
         return;

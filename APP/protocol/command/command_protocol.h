@@ -76,7 +76,17 @@ size_t command_protocol_build_pong_response(uint8_t *frame, size_t frame_capacit
 size_t command_protocol_build_ack_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence);
 size_t
 command_protocol_build_done_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t result_code);
+/* A refusal that is not a stop: cause 0, axis COMMAND_ERROR_AXIS_NONE, detail 0. */
 size_t
 command_protocol_build_error_response(uint8_t *frame, size_t frame_capacity, uint32_t sequence, uint16_t error_code);
+size_t command_protocol_build_error_detail_response(
+    uint8_t *frame,
+    size_t frame_capacity,
+    uint32_t sequence,
+    uint16_t error_code,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail
+);
 
 #endif /* FM_V3_COMMAND_PROTOCOL_H */

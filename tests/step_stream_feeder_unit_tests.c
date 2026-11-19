@@ -1424,6 +1424,343 @@ static void test_reset_drops_state(void) {
     expect_u32(feeder.plan_epoch, 0U, "epoch dropped");
 }
 
+/* Block ends. One step is one 10000-tick record on the lane that moves, a block of up to 6 steps is one waiting record
+ * (60000 ticks, below the 65536 of the format) on a lane that does not move. */
+static void queue_ordered(MotionPlanBlock_t block, uint32_t order) {
+    block.order = order;
+    queue_block(&block);
+}
+
+static void play(StepStreamFeeder_t *feeder, uint32_t executed_lane0, uint32_t executed_lane1) {
+    const uint32_t executed[STEP_STREAM_FEEDER_MAX_LANES] = {executed_lane0, executed_lane1, 0U, 0U};
+    step_stream_feeder_update_played(feeder, executed);
+}
+
+static void expect_played(const StepStreamFeeder_t *feeder, uint32_t blocks, uint32_t order, const char *message) {
+    uint32_t actual_blocks = 0xAAAAAAAAU;
+    uint32_t actual_order = 0xBBBBBBBBU;
+    step_stream_feeder_get_played(feeder, &actual_blocks, &actual_order);
+    expect_u32(actual_blocks, blocks, message);
+    expect_u32(actual_order, order, message);
+}
+
+static void expect_first_unplayed(const StepStreamFeeder_t *feeder, uint32_t order, const char *message) {
+    uint32_t actual_order = 0xBBBBBBBBU;
+    expect_u32(step_stream_feeder_get_first_unplayed(feeder, &actual_order), 1U, message);
+    expect_u32(actual_order, order, message);
+}
+
+static void expect_no_unplayed(const StepStreamFeeder_t *feeder, const char *message) {
+    uint32_t actual_order = 0xBBBBBBBBU;
+    expect_u32(step_stream_feeder_get_first_unplayed(feeder, &actual_order), 0U, message);
+    expect_u32(actual_order, 0xBBBBBBBBU, message);
+}
+
+/* Both blocks end inside one half: A on record 3, B on record 5. */
+static void test_played_two_blocks_in_one_half(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(3, 0), 11U);
+    queue_ordered(make_block(2, 0), 22U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    expect_u32(count_step_records(0U), 5U, "3 + 2 step records in the half");
+
+    expect_played(&feeder, 0U, 0U, "nothing is played before the first update");
+    expect_first_unplayed(&feeder, 11U, "the oldest started block is the first one");
+
+    play(&feeder, 2U, 0U);
+    expect_played(&feeder, 0U, 0U, "record 2 is before the end of A (record 3)");
+    expect_first_unplayed(&feeder, 11U, "A is still unplayed");
+
+    play(&feeder, 4U, 0U);
+    expect_played(&feeder, 1U, 11U, "record 4 is past A (3) and before B (5)");
+    expect_first_unplayed(&feeder, 22U, "B is the oldest unplayed now");
+
+    play(&feeder, 4U, 0U);
+    expect_played(&feeder, 1U, 11U, "the same record again changes nothing");
+
+    play(&feeder, 5U, 0U);
+    expect_played(&feeder, 2U, 22U, "record 5 is exactly the end of B");
+    expect_no_unplayed(&feeder, "nothing is left");
+}
+
+/* The blocks behind an unplayed one do not count even when their own end has been passed. Real ends only grow, so the
+ * head is made later than B by hand. */
+static void test_played_blocks_behind_an_unplayed_one_do_not_count(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(3, 0), 11U);
+    queue_ordered(make_block(2, 0), 22U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    feeder.block_ends[feeder.block_end_head].end_record[0] = 50U;
+
+    play(&feeder, 5U, 0U);
+    expect_played(&feeder, 0U, 0U, "B is past its end (5) but A (50) is not");
+    expect_first_unplayed(&feeder, 11U, "A is still the oldest");
+    play(&feeder, 50U, 0U);
+    expect_played(&feeder, 2U, 22U, "both count once A is passed");
+}
+
+/* Lane 0 (X) is dense, lane 1 (Y) is sparse: for block A of 6 X steps Y writes one waiting record. A ends on X
+ * record 6 and Y record 1, B on X record 8 and Y record 2. */
+static void test_played_needs_every_lane(void) {
+    StepStreamFeeder_t feeder;
+    setup_lanes(&feeder, 2U);
+    queue_ordered(make_block(6, 0), 1U);
+    queue_ordered(make_block(2, 0), 2U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    expect_u32(count_step_records_of(0U, 0U), 8U, "X: 6 + 2 step records fill the half");
+    expect_u32(count_step_records_of(1U, 0U), 0U, "Y does not step");
+    expect_u32(block_ticks_of(1U, 0U), 80000U, "Y covers both blocks with 2 waiting records");
+    expect_u32(feeder.lane[1].next_block, 2U, "Y has started both blocks");
+
+    play(&feeder, 5U, 1U);
+    expect_played(&feeder, 0U, 0U, "X has not reached the end of A (6)");
+    play(&feeder, 6U, 0U);
+    expect_played(&feeder, 0U, 0U, "Y has not reached the end of A (1)");
+    expect_first_unplayed(&feeder, 1U, "A is unplayed");
+    play(&feeder, 6U, 1U);
+    expect_played(&feeder, 1U, 1U, "both lanes passed A");
+    expect_first_unplayed(&feeder, 2U, "B is next");
+    play(&feeder, 8U, 1U);
+    expect_played(&feeder, 1U, 1U, "X passed B (8), Y has not (2)");
+    play(&feeder, 7U, 2U);
+    expect_played(&feeder, 1U, 1U, "Y passed B, X has not");
+    play(&feeder, 8U, 2U);
+    expect_played(&feeder, 2U, 2U, "both lanes passed B");
+    expect_no_unplayed(&feeder, "nothing is left");
+}
+
+/* X is still inside block A (20 steps, two halves of 8 records) while Y has written its 4 waiting records: the end
+ * of A is known on Y only. */
+static void test_played_unknown_end_is_not_played(void) {
+    StepStreamFeeder_t feeder;
+    setup_lanes(&feeder, 2U);
+    queue_ordered(make_block(20, 0), 1U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    expect_u32(feeder.lane[0].generator_active, 1U, "X is still in block A");
+    expect_u32(feeder.lane[1].generator_active, 0U, "Y has finished it");
+    expect_u32(block_ticks_of(1U, 0U), 200000U, "Y waits 200000 ticks in 4 records");
+
+    play(&feeder, 1000U, 1000U);
+    expect_played(&feeder, 0U, 0U, "the end on X is unknown, however far the lanes are");
+    expect_first_unplayed(&feeder, 1U, "A is unplayed");
+
+    /* X writes the last 4 steps: its end is 16 (records of the two halves before) + 4. */
+    release(0U, 0U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "X refills its half");
+    expect_u32(count_step_records(0U), 4U, "the last 4 steps");
+    play(&feeder, 19U, 4U);
+    expect_played(&feeder, 0U, 0U, "X is one record before its end (20)");
+    play(&feeder, 20U, 3U);
+    expect_played(&feeder, 0U, 0U, "Y is one record before its end (4)");
+    play(&feeder, 20U, 4U);
+    expect_played(&feeder, 1U, 1U, "both ends are known and passed");
+}
+
+/* The end of the stream counts what the axes have not reported, and not twice what they have. */
+static void test_played_stream_end_counts_the_rest_and_next_stream_clears(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(3, 0), 7U);
+    queue_ordered(make_block(2, 0), 8U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    play(&feeder, 3U, 0U);
+    expect_played(&feeder, 1U, 7U, "A is reported by the axis");
+
+    release(0U, 0U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "idle refill");
+    expect_u32(fake_stop_calls, 0U, "the other half has not been played");
+    expect_played(&feeder, 1U, 7U, "B is not counted while the stream runs");
+    expect_first_unplayed(&feeder, 8U, "B is unplayed");
+
+    release(0U, 1U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "stop");
+    expect_u32(fake_stop_calls, 1U, "the stream stopped");
+    expect_u32(step_stream_feeder_get_phase(&feeder), STEP_STREAM_FEEDER_PHASE_IDLE, "idle");
+    expect_played(&feeder, 2U, 8U, "the stream end counts B");
+    expect_no_unplayed(&feeder, "no block is left");
+    play(&feeder, 1000U, 0U);
+    expect_played(&feeder, 2U, 8U, "a late report does not count anything twice");
+    expect_u32(feeder.block_end_head, 2U, "the ring advanced by two");
+    expect_u32(feeder.block_end_first_block, 2U, "and so did the first block");
+
+    /* The next stream numbers its blocks and records from the start again; the played count goes on. */
+    queue_ordered(make_block(3, 0), 9U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "next stream");
+    expect_u32(fake_prepare_calls, 2U, "second stream prepared");
+    expect_u32(feeder.block_end_head, 0U, "ring head cleared by the new stream");
+    expect_u32(feeder.block_end_first_block, 0U, "first block cleared by the new stream");
+    expect_u32(feeder.block_end_count, 1U, "one block of the new stream");
+    expect_first_unplayed(&feeder, 9U, "the new block");
+    expect_played(&feeder, 2U, 8U, "the played count is kept");
+    play(&feeder, 3U, 0U);
+    expect_played(&feeder, 3U, 9U, "the new block ends on record 3 of the new stream");
+}
+
+/* 128 blocks of one record fill the ring; the 129th does not start and closes the stream. */
+static void test_played_ring_overflow_closes_the_stream(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    for (uint32_t index = 0U; index < 16U; ++index) {
+        queue_ordered(make_block(1, 0), index);
+    }
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start with 16 blocks");
+    expect_u32(feeder.block_end_count, 16U, "two halves of 8 blocks");
+    for (uint32_t round = 0U; round < 14U; ++round) {
+        for (uint32_t index = 0U; index < 8U; ++index) {
+            queue_ordered(make_block(1, 0), 16U + round * 8U + index);
+        }
+        release(0U, (uint8_t)(round % 2U));
+        expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "refill");
+    }
+    expect_u32(feeder.block_end_count, STEP_STREAM_FEEDER_BLOCK_END_CAPACITY, "the ring is full");
+    expect_u32(feeder.lane[0].next_block, 128U, "128 blocks started");
+
+    for (uint32_t index = 0U; index < 8U; ++index) {
+        queue_ordered(make_block(1, 0), 128U + index);
+    }
+    release(0U, 0U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "refill at the full ring");
+    StepStreamFeederDiagnostics_t diagnostics;
+    step_stream_feeder_get_diagnostics(&feeder, &diagnostics);
+    expect_u32(diagnostics.block_end_overflows, 1U, "the overflow is counted");
+    expect_u32(feeder.end_block, 128U, "the stream is closed at block 128");
+    expect_u32(feeder.lane[0].next_block, 128U, "block 128 did not start");
+    expect_u32(count_step_records(0U), 0U, "the half is filler");
+    expect_u32(fake_plan_count, 8U, "the blocks wait in the plan");
+    expect_u32(feeder.block_end_count, STEP_STREAM_FEEDER_BLOCK_END_CAPACITY, "no entry was added");
+    expect_u32(step_stream_feeder_get_phase(&feeder), STEP_STREAM_FEEDER_PHASE_STREAMING, "it is no fault");
+
+    release(0U, 1U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "refill behind the closed end");
+    step_stream_feeder_get_diagnostics(&feeder, &diagnostics);
+    expect_u32(diagnostics.block_end_overflows, 1U, "the closed stream does not overflow again");
+    expect_u32(fake_plan_count, 8U, "the blocks still wait");
+
+    expect_first_unplayed(&feeder, 0U, "the oldest block of the full ring");
+    play(&feeder, 128U, 0U);
+    expect_played(&feeder, 128U, 127U, "block i ends on record i + 1, so record 128 plays all of them");
+    expect_no_unplayed(&feeder, "the ring is empty");
+}
+
+/* The ring wraps many times while blocks are played: 176 blocks pass through 128 places. */
+static void test_played_ring_wraps_around(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    for (uint32_t index = 0U; index < 16U; ++index) {
+        queue_ordered(make_block(1, 0), index);
+    }
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start with 16 blocks");
+    for (uint32_t round = 0U; round < 20U; ++round) {
+        /* The half that the axis has just played ends on record 8 * (round + 1); block i ends on record i + 1. */
+        play(&feeder, 8U * (round + 1U), 0U);
+        expect_played(&feeder, 8U * (round + 1U), 8U * (round + 1U) - 1U, "the played blocks follow the records");
+        for (uint32_t index = 0U; index < 8U; ++index) {
+            queue_ordered(make_block(1, 0), 16U + round * 8U + index);
+        }
+        release(0U, (uint8_t)(round % 2U));
+        expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "refill");
+    }
+    StepStreamFeederDiagnostics_t diagnostics;
+    step_stream_feeder_get_diagnostics(&feeder, &diagnostics);
+    expect_u32(diagnostics.block_end_overflows, 0U, "the ring never fills up");
+    expect_u32(diagnostics.blocks_started, 176U, "176 blocks started");
+    expect_u32(feeder.block_end_count, 16U, "16 blocks are unplayed");
+    expect_u32(feeder.block_end_head, 32U, "160 played blocks, wrapped at 128");
+    expect_first_unplayed(&feeder, 160U, "the oldest unplayed block");
+}
+
+/* The record numbers wrap: block A ends on record 0 of the wrapped numbering, block B on record 2. */
+static void test_played_record_numbers_wrap(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(20, 0), 5U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    queue_ordered(make_block(2, 0), 6U);
+    feeder.lane[0].record_base = 0xFFFFFFFCU;
+    release(0U, 0U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "refill");
+    expect_u32(count_step_records(0U), 6U, "4 steps of A and 2 of B");
+
+    play(&feeder, 0xFFFFFFFBU, 0U);
+    expect_played(&feeder, 0U, 0U, "5 records before the end of A");
+    play(&feeder, 0xFFFFFFFFU, 0U);
+    expect_played(&feeder, 0U, 0U, "1 record before the end of A, which is 0");
+    play(&feeder, 0U, 0U);
+    expect_played(&feeder, 1U, 5U, "exactly the end of A after the wrap");
+    play(&feeder, 1U, 0U);
+    expect_played(&feeder, 1U, 5U, "1 record before the end of B (2)");
+    play(&feeder, 2U, 0U);
+    expect_played(&feeder, 2U, 6U, "exactly the end of B");
+}
+
+/* The count of played blocks wraps at 2^32 instead of saturating: the client compares differences. */
+static void test_played_blocks_count_wraps(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(3, 0), 3U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    feeder.played_blocks = UINT32_MAX;
+    play(&feeder, 3U, 0U);
+    expect_played(&feeder, 0U, 3U, "UINT32_MAX + 1 wraps to 0");
+}
+
+static void test_played_null_arguments(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(3, 0), 11U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    const uint32_t executed[STEP_STREAM_FEEDER_MAX_LANES] = {3U, 0U, 0U, 0U};
+
+    step_stream_feeder_update_played(NULL, executed);
+    step_stream_feeder_update_played(&feeder, NULL);
+    expect_played(&feeder, 0U, 0U, "a NULL argument of update changes nothing");
+    expect_first_unplayed(&feeder, 11U, "the block is still unplayed");
+
+    uint32_t blocks = 0xAAAAAAAAU;
+    uint32_t order = 0xBBBBBBBBU;
+    step_stream_feeder_get_played(NULL, &blocks, &order);
+    expect_u32(blocks, 0xAAAAAAAAU, "no feeder: blocks untouched");
+    expect_u32(order, 0xBBBBBBBBU, "no feeder: order untouched");
+    step_stream_feeder_get_played(&feeder, NULL, &order);
+    expect_u32(order, 0xBBBBBBBBU, "no blocks pointer: order untouched");
+    step_stream_feeder_get_played(&feeder, &blocks, NULL);
+    expect_u32(blocks, 0xAAAAAAAAU, "no order pointer: blocks untouched");
+
+    expect_u32(step_stream_feeder_get_first_unplayed(NULL, &order), 0U, "no feeder");
+    expect_u32(order, 0xBBBBBBBBU, "no feeder: order untouched");
+    expect_u32(step_stream_feeder_get_first_unplayed(&feeder, NULL), 0U, "no order pointer, a block is waiting");
+
+    play(&feeder, 3U, 0U);
+    expect_played(&feeder, 1U, 11U, "the block was there all the time");
+}
+
+static void test_played_reset_clears(void) {
+    StepStreamFeeder_t feeder;
+    setup(&feeder);
+    queue_ordered(make_block(3, 0), 11U);
+    queue_ordered(make_block(2, 0), 22U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    play(&feeder, 4U, 0U);
+    expect_played(&feeder, 1U, 11U, "A played");
+    expect_first_unplayed(&feeder, 22U, "B unplayed");
+    expect_u32(feeder.block_end_head, 1U, "the ring head moved");
+
+    step_stream_feeder_reset(&feeder);
+    expect_played(&feeder, 0U, 0U, "reset drops the played count and order");
+    expect_no_unplayed(&feeder, "reset drops the unplayed blocks");
+    expect_u32(feeder.block_end_head, 0U, "reset drops the ring head");
+    expect_u32(feeder.block_end_count, 0U, "reset empties the ring");
+    expect_u32(feeder.block_end_first_block, 0U, "reset drops the first block");
+
+    queue_ordered(make_block(3, 0), 9U);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start again");
+    expect_first_unplayed(&feeder, 9U, "only the new block");
+    play(&feeder, 3U, 0U);
+    expect_played(&feeder, 1U, 9U, "counting starts from zero");
+}
+
 int main(void) {
     test_make_generator_config();
     test_make_config();
@@ -1453,6 +1790,17 @@ int main(void) {
     test_axis_errors_on_the_second_lane();
     test_counters_saturate();
     test_reset_drops_state();
+    test_played_two_blocks_in_one_half();
+    test_played_blocks_behind_an_unplayed_one_do_not_count();
+    test_played_needs_every_lane();
+    test_played_unknown_end_is_not_played();
+    test_played_stream_end_counts_the_rest_and_next_stream_clears();
+    test_played_ring_overflow_closes_the_stream();
+    test_played_ring_wraps_around();
+    test_played_record_numbers_wrap();
+    test_played_blocks_count_wraps();
+    test_played_null_arguments();
+    test_played_reset_clears();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "%lu test(s) failed\n", (unsigned long)test_failures);

@@ -148,6 +148,12 @@ StepStreamFeederStatus_t step_stream_feeder_init(
     return STEP_STREAM_FEEDER_STATUS_OK;
 }
 
+static void step_stream_feeder_clear_block_ends(StepStreamFeeder_t *feeder) {
+    feeder->block_end_head = 0U;
+    feeder->block_end_count = 0U;
+    feeder->block_end_first_block = 0U;
+}
+
 void step_stream_feeder_reset(StepStreamFeeder_t *feeder) {
     if (feeder == NULL) {
         return;
@@ -160,6 +166,9 @@ void step_stream_feeder_reset(StepStreamFeeder_t *feeder) {
     feeder->end_block = STEP_STREAM_FEEDER_STREAM_OPEN;
     feeder->direction_known_mask = 0U;
     feeder->direction_positive_mask = 0U;
+    step_stream_feeder_clear_block_ends(feeder);
+    feeder->played_blocks = 0U;
+    feeder->played_order = 0U;
 }
 
 static StepStreamFeederStatus_t step_stream_feeder_fault(StepStreamFeeder_t *feeder, StepStreamFeederStatus_t status) {
@@ -274,6 +283,33 @@ static uint8_t step_stream_feeder_retire_blocks(StepStreamFeeder_t *feeder) {
     return 1U;
 }
 
+static void step_stream_feeder_play_all_block_ends(StepStreamFeeder_t *feeder);
+
+static StepStreamFeederBlockEnd_t *step_stream_feeder_block_end_at(StepStreamFeeder_t *feeder, uint32_t block) {
+    const uint32_t position =
+        (feeder->block_end_head + (block - feeder->block_end_first_block)) % STEP_STREAM_FEEDER_BLOCK_END_CAPACITY;
+    return &feeder->block_ends[position];
+}
+
+/* The lane that starts a block first opens its entry; the others find it there. A full queue closes the stream at this
+ * block like the end of the plan does, so that no lane starts a block whose end could not be told. 0: no entry. */
+static uint8_t
+step_stream_feeder_open_block_end(StepStreamFeeder_t *feeder, uint32_t index, const MotionPlanBlock_t *block) {
+    if (index != feeder->block_end_first_block + feeder->block_end_count) {
+        return 1U;
+    }
+    if (feeder->block_end_count == STEP_STREAM_FEEDER_BLOCK_END_CAPACITY) {
+        feeder->end_block = index;
+        step_stream_feeder_counter_increment(&feeder->diagnostics.block_end_overflows);
+        return 0U;
+    }
+    StepStreamFeederBlockEnd_t *const entry = step_stream_feeder_block_end_at(feeder, index);
+    memset(entry, 0, sizeof(*entry));
+    entry->order = block->order;
+    ++feeder->block_end_count;
+    return 1U;
+}
+
 /* Starts the generator of the lane on its next block; 1 when it runs, 0 when no block can start, -1 on an error. */
 static int8_t step_stream_feeder_begin_block(StepStreamFeeder_t *feeder, uint32_t lane) {
     MotionPlanBlock_t block;
@@ -282,6 +318,10 @@ static int8_t step_stream_feeder_begin_block(StepStreamFeeder_t *feeder, uint32_
         return 0;
     }
     StepStreamFeederLane_t *state = &feeder->lane[lane];
+    if (next == STEP_STREAM_FEEDER_NEXT_JOINABLE &&
+        step_stream_feeder_open_block_end(feeder, state->next_block, &block) == 0U) {
+        return 0;
+    }
     if (next == STEP_STREAM_FEEDER_NEXT_ERROR || step_stream_generator_init_from_block(
                                                      &state->generator,
                                                      &feeder->config.generator,
@@ -344,11 +384,15 @@ step_stream_feeder_fill_half(StepStreamFeeder_t *feeder, uint32_t lane, uint16_t
             /* The carry was just read from an initialized generator, so it cannot fail. */
             (void)step_stream_generator_get_carry(&state->generator, &state->carry);
             state->generator_active = 0U;
+            StepStreamFeederBlockEnd_t *const entry = step_stream_feeder_block_end_at(feeder, state->next_block - 1U);
+            entry->end_record[lane] = state->record_base + used;
+            entry->end_known_mask = (uint8_t)(entry->end_known_mask | (1U << lane));
             if (lane == 0U) {
                 step_stream_feeder_counter_increment(&feeder->diagnostics.blocks_completed);
             }
         }
     }
+    state->record_base += capacity;
 
     step_stream_feeder_write_idle(feeder, &records[(size_t)used * STEP_STREAM_GENERATOR_RECORD_WORDS], capacity - used);
     return STEP_STREAM_FEEDER_STATUS_OK;
@@ -439,6 +483,7 @@ static StepStreamFeederStatus_t step_stream_feeder_begin_stream(StepStreamFeeder
     }
 
     memset(feeder->lane, 0, sizeof(feeder->lane));
+    step_stream_feeder_clear_block_ends(feeder);
     feeder->plan_epoch = epoch;
     feeder->front_block = 0U;
     feeder->end_block = STEP_STREAM_FEEDER_STREAM_OPEN;
@@ -477,6 +522,8 @@ static StepStreamFeederStatus_t step_stream_feeder_fill_released_halves(StepStre
             }
 
             if (feeder->phase == STEP_STREAM_FEEDER_PHASE_STREAMING && step_stream_feeder_stream_finished(feeder)) {
+                /* No half carries a block any more, so every block of the stream has been played. */
+                step_stream_feeder_play_all_block_ends(feeder);
                 feeder->ports.stop(feeder->ports.context);
                 feeder->phase = STEP_STREAM_FEEDER_PHASE_IDLE;
                 step_stream_feeder_counter_increment(&feeder->diagnostics.streams_stopped);
@@ -540,6 +587,57 @@ StepStreamFeederStatus_t step_stream_feeder_service(StepStreamFeeder_t *feeder) 
         }
         return STEP_STREAM_FEEDER_STATUS_OK;
     }
+}
+
+static void step_stream_feeder_pop_block_end(StepStreamFeeder_t *feeder) {
+    feeder->played_order = feeder->block_ends[feeder->block_end_head].order;
+    /* Modular, not saturating: the client compares differences. */
+    ++feeder->played_blocks;
+    feeder->block_end_head = (feeder->block_end_head + 1U) % STEP_STREAM_FEEDER_BLOCK_END_CAPACITY;
+    --feeder->block_end_count;
+    ++feeder->block_end_first_block;
+}
+
+static void step_stream_feeder_play_all_block_ends(StepStreamFeeder_t *feeder) {
+    while (feeder->block_end_count != 0U) {
+        step_stream_feeder_pop_block_end(feeder);
+    }
+}
+
+void step_stream_feeder_update_played(StepStreamFeeder_t *feeder, const uint32_t *executed_record) {
+    if (feeder == NULL || executed_record == NULL) {
+        return;
+    }
+    const uint8_t all_lanes = (uint8_t)((1U << feeder->config.lane_count) - 1U);
+    while (feeder->block_end_count != 0U) {
+        const StepStreamFeederBlockEnd_t *const entry = &feeder->block_ends[feeder->block_end_head];
+        if (entry->end_known_mask != all_lanes) {
+            return;
+        }
+        for (uint32_t lane = 0U; lane < feeder->config.lane_count; ++lane) {
+            /* Modular difference: the numbers wrap, the distance between them never exceeds half the range. */
+            if ((int32_t)(executed_record[lane] - entry->end_record[lane]) < 0) {
+                return;
+            }
+        }
+        step_stream_feeder_pop_block_end(feeder);
+    }
+}
+
+void step_stream_feeder_get_played(const StepStreamFeeder_t *feeder, uint32_t *blocks, uint32_t *last_order) {
+    if (feeder == NULL || blocks == NULL || last_order == NULL) {
+        return;
+    }
+    *blocks = feeder->played_blocks;
+    *last_order = feeder->played_order;
+}
+
+uint8_t step_stream_feeder_get_first_unplayed(const StepStreamFeeder_t *feeder, uint32_t *order) {
+    if (feeder == NULL || order == NULL || feeder->block_end_count == 0U) {
+        return 0U;
+    }
+    *order = feeder->block_ends[feeder->block_end_head].order;
+    return 1U;
 }
 
 StepStreamFeederPhase_t step_stream_feeder_get_phase(const StepStreamFeeder_t *feeder) {
