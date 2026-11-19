@@ -74,8 +74,12 @@ static uint32_t test_discarded_results;
 struct StepGeneratorInstance {
     uint8_t busy;
     uint8_t halted;
+    /* 1 once the feeder is built; an instance that is not ready is never reset and stays as it is. */
+    uint8_t ready;
     uint32_t halts;
     uint32_t resumes;
+    /* Resets that have finished, like the counter of the real instance. */
+    uint32_t reset_count;
     /* enqueued_total of the queue at the last block notification; a larger value means a block was queued since. */
     uint32_t enqueued_seen;
     PlanBuffer_t queue;
@@ -324,6 +328,13 @@ static uint32_t test_generator_all_halts;
 static uint32_t test_generator_all_resumes;
 /* After this many 1 ms waits the X axis reports READY; 0 keeps it moving. */
 static uint32_t test_axis_settles_after_delays;
+/* While set, the generator task has not yet reset the printing instance when the restart of all instances returns: the
+ * reset (the halt is lifted and the reset count rises together) happens in the wait number
+ * test_print_reset_after_delays, and never with 0. */
+static uint8_t test_print_reset_deferred;
+static uint32_t test_print_reset_after_delays;
+/* While set, the reset of the printing instance ends with the instance halted again, as when a channel still runs. */
+static uint8_t test_print_reset_fails;
 
 StepGeneratorInstance_t *step_generator_task_get_print_instance(void) { return &gen_print; }
 
@@ -339,6 +350,10 @@ uint8_t step_generator_instance_is_busy(const StepGeneratorInstance_t *instance)
 
 uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instance) { return instance->halted; }
 
+uint8_t step_generator_instance_is_ready(const StepGeneratorInstance_t *instance) { return instance->ready; }
+
+uint32_t step_generator_instance_reset_count(const StepGeneratorInstance_t *instance) { return instance->reset_count; }
+
 void step_generator_instance_halt(StepGeneratorInstance_t *instance) { ++instance->halts; }
 
 void step_generator_task_halt_all(void) {
@@ -348,13 +363,25 @@ void step_generator_task_halt_all(void) {
     ++test_generator_all_halts;
 }
 
-/* The reset of the real task leaves the instance idle. */
+/* The reset of the real task leaves the instance idle; an instance that is not ready is not touched by it. */
 static void fake_generator_reset(StepGeneratorInstance_t *instance) {
+    if (instance->ready == 0U) {
+        return;
+    }
     ++instance->resumes;
     if (test_generator_reset_keeps_busy == 0U) {
         instance->busy = 0U;
     }
     instance->halted = 0U;
+    ++instance->reset_count;
+}
+
+/* The reset of the printing instance, which may end with the instance halted again. */
+static void fake_print_reset(void) {
+    fake_generator_reset(&gen_print);
+    if (test_print_reset_fails != 0U && gen_print.ready != 0U) {
+        gen_print.halted = 1U;
+    }
 }
 
 void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance) {
@@ -363,8 +390,11 @@ void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance
 
 void step_generator_task_resume_all_after_stop(void) {
     ++test_generator_all_resumes;
-    for (uint32_t index = 0U; index < TEST_GENERATOR_COUNT; ++index) {
+    for (uint32_t index = 0U; index < TEST_PRINT_GENERATOR; ++index) {
         fake_generator_reset(&fake_generators[index]);
+    }
+    if (test_print_reset_deferred == 0U) {
+        fake_print_reset();
     }
 }
 
@@ -394,6 +424,10 @@ uint32_t osDelay(uint32_t milliseconds) {
     }
     if (test_generator_idle_after_delays != 0U && test_delay_calls == test_generator_idle_after_delays) {
         gen_x.busy = 0U;
+    }
+    if (test_print_reset_deferred != 0U && test_print_reset_after_delays != 0U &&
+        test_delay_calls == test_print_reset_after_delays) {
+        fake_print_reset();
     }
     if (test_jump_active != 0U && test_jump_on_delay != 0U) {
         longjmp(test_jump_buffer, 3);
@@ -603,6 +637,9 @@ uint8_t home_block_make(
 static void reset_receive_script(void) {
     (void)memset(fake_axes, 0, sizeof(fake_axes));
     (void)memset(fake_generators, 0, sizeof(fake_generators));
+    for (uint32_t index = 0U; index < TEST_GENERATOR_COUNT; ++index) {
+        fake_generators[index].ready = 1U;
+    }
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         (void)plan_buffer_init(
             &fake_generators[axis].queue,
@@ -648,6 +685,9 @@ static void reset_receive_script(void) {
     test_discard_calls = 0U;
     test_discarded_results = 0U;
     test_axis_settles_after_delays = 0U;
+    test_print_reset_deferred = 0U;
+    test_print_reset_after_delays = 0U;
+    test_print_reset_fails = 0U;
     test_calibration_load_status = CALIBRATION_STORE_STATUS_EMPTY;
     test_stored_calibration = (MachineCalibration_t){0};
     fake_calibration_begin_result = AXIS_CALIBRATION_RUN_RESULT_RUNNING;
@@ -4118,7 +4158,397 @@ static void test_request_stop_drops_the_commands_behind_it_silently(void) {
     expect_u32(fake_x_stop_requests, 1U, "the pulses are stopped as well");
 }
 
+/* Wire value of COMMAND_ERROR_STREAM_HALTED, written out like the other result codes. */
+#define TEST_ERROR_STREAM_HALTED 0x0127U
+
+static void test_move_is_refused_while_the_printing_stream_is_halted(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.position_um[0] = 500;
+    const MotionPlanBlock_t pending_plan = {.sequence = 90U};
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending_plan), PLAN_BUFFER_STATUS_OK, "one plan is pending");
+    const uint32_t enqueued_before = enqueued_blocks(&test_plan_buffer);
+    gen_print.halted = 1U;
+    const CommandDTO_t move = xyz_move_to(600U, 1000, 1000U);
+    run_commands(&context, &move, 1U);
+
+    expect_u32(test_result_count, 1U, "the refused move is answered once");
+    expect_result_at(0U, 600U, TEST_ERROR_STREAM_HALTED, "a move is refused while the stream is halted");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the pending plan stays and no block is added");
+    expect_u32(enqueued_blocks(&test_plan_buffer), enqueued_before, "nothing is enqueued");
+    expect_u32(test_block_ready_notifications, 0U, "the generator is not woken");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "the planner is not asked");
+    expect_i64(context.machine_state.position_um[0], 500, "the planned X position is unchanged");
+    expect_i64(context.machine_state.position_um[1], 0, "the planned Y position is unchanged");
+    expect_i64(context.machine_state.position_um[2], 0, "the planned Z position is unchanged");
+}
+
+static void check_axes_are_not_started_while_halted(const CommandDTO_t *command) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.position_um[0] = 500;
+    gen_print.halted = 1U;
+    run_commands(&context, command, 1U);
+
+    expect_u32(test_result_count, 1U, "the refused command is answered once");
+    expect_result_at(0U, command->sequence, TEST_ERROR_STREAM_HALTED, "the command is refused while the stream is halted");
+    expect_u32(fake_calibration_begin_calls, 0U, "no calibration begins");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(fake_axes[axis].bench_starts, 0U, "no homing move is built");
+        expect_u32(queued_blocks(&fake_generators[axis].queue), 0U, "no block is queued for the axis");
+        expect_u32(fake_axes[axis].release_stop_arms, 0U, "the axis is not armed");
+        expect_u32(fake_axes[axis].stop_requests, 0U, "the axis is not stopped");
+    }
+    expect_u32(test_block_ready_notifications, 0U, "no generator is woken");
+    expect_i64(context.machine_state.position_um[0], 500, "the position is unchanged");
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "the homed state is unchanged");
+}
+
+static void test_home_is_refused_while_the_printing_stream_is_halted(void) {
+    const CommandDTO_t home = {
+        .sequence = 601U,
+        .code = COMMAND_CODE_HOME,
+        .parameters.home.axes = MOTION_PLANNER_ALL_AXES_MASK,
+    };
+    check_axes_are_not_started_while_halted(&home);
+}
+
+static void test_calibrate_is_refused_while_the_printing_stream_is_halted(void) {
+    const CommandDTO_t calibrate = {
+        .sequence = 602U,
+        .code = COMMAND_CODE_CALIBRATE,
+        .parameters.calibrate.axes = MOTION_PLANNER_ALL_AXES_MASK,
+    };
+    check_axes_are_not_started_while_halted(&calibrate);
+}
+
+static void test_stop_is_accepted_while_halted_and_lifts_the_refusal(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const MotionPlanBlock_t pending_plan = {.sequence = 90U};
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending_plan), PLAN_BUFFER_STATUS_OK, "one plan is pending");
+    gen_print.halted = 1U;
+    const CommandDTO_t commands[] = {
+        xyz_move_to(610U, 1000, 1000U),
+        {.sequence = 611U, .code = COMMAND_CODE_STOP},
+        xyz_move_to(612U, 1000, 1000U),
+    };
+    run_commands(&context, commands, 3U);
+
+    expect_u32(test_discarded_results, 1U, "STOP erased the refusal of the first move");
+    expect_u32(test_result_count, 2U, "STOP and the move after it are answered");
+    expect_done_at(0U, 611U, COMMAND_DONE_ACCEPTED, "STOP is accepted while the stream is halted");
+    expect_done_at(1U, 612U, COMMAND_DONE_ACCEPTED, "a move is accepted after STOP");
+    expect_u32(test_generator_all_resumes, 1U, "STOP resets the generators");
+    expect_u32(gen_print.halted, 0U, "the printing stream is no longer halted");
+    expect_u32(cancelled_blocks(&test_plan_buffer), 1U, "STOP cancelled the pending plan");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "only the move after STOP is queued");
+    expect_i64(context.machine_state.position_um[0], 1000, "the move after STOP is planned from the reset position");
+}
+
+static void test_move_is_accepted_when_only_an_axis_instance_is_halted(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_x.halted = 1U;
+    gen_y.halted = 1U;
+    gen_z.halted = 1U;
+    const CommandDTO_t move = xyz_move_to(620U, 1000, 1000U);
+    run_commands(&context, &move, 1U);
+
+    expect_u32(test_result_count, 1U, "the move is answered once");
+    expect_done_at(0U, 620U, COMMAND_DONE_ACCEPTED, "only the printing stream decides the refusal");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
+    expect_i64(context.machine_state.position_um[0], 1000, "the planned X position moves");
+}
+
+static void check_no_axis_started_and_nothing_queued(const char *message) {
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(fake_axes[axis].bench_starts, 0U, message);
+        expect_u32(queued_blocks(&fake_generators[axis].queue), 0U, message);
+    }
+    expect_u32(queued_blocks(&test_plan_buffer), 0U, message);
+    expect_u32(test_block_ready_notifications, 0U, message);
+}
+
+/* The mistake of the client is reported before the state of the stream. */
+static void test_halted_stream_does_not_hide_invalid_axes(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_print.halted = 1U;
+    const CommandDTO_t commands[] = {
+        with_sequence(home_command_for(0x00U), 630U),
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK | 0x08U), 631U),
+        with_sequence(calibrate_command_for(0x00U), 632U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_X_MASK | 0x80U), 633U),
+    };
+    run_commands(&context, commands, 4U);
+
+    expect_u32(test_result_count, 4U, "every command is answered once");
+    expect_result_at(0U, 630U, TEST_ERROR_INVALID_PARAMETER, "HOME with an empty mask while halted");
+    expect_result_at(1U, 631U, TEST_ERROR_INVALID_PARAMETER, "HOME with an unknown axis while halted");
+    expect_result_at(2U, 632U, TEST_ERROR_INVALID_PARAMETER, "CALIBRATE with an empty mask while halted");
+    expect_result_at(3U, 633U, TEST_ERROR_INVALID_PARAMETER, "CALIBRATE with an unknown axis while halted");
+    check_no_axis_started_and_nothing_queued("a malformed command starts nothing");
+    expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "nothing is unhomed");
+}
+
+static void halt_print_stream_at_read_1(uint32_t read_index) {
+    if (read_index == 1U) {
+        gen_print.halted = 1U;
+    }
+}
+
+/* Halted is checked before busy: the client needs STOP, and the busy axis would only be a second reason. */
+static void test_halted_stream_is_reported_before_a_busy_axis(void) {
+    /* A homing X is busy; the stream becomes halted before the next command arrives. */
+    for (uint32_t second_is_move = 0U; second_is_move < 2U; ++second_is_move) {
+        reset_receive_script();
+        MotionTaskContext_t context = valid_motion_context();
+        const CommandDTO_t second = second_is_move != 0U
+                                        ? xyz_move_to(641U, 1000, 1000U)
+                                        : with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 641U);
+        script_read(0U, osOK, &test_home_x_command);
+        script_read(1U, osOK, &second);
+        test_block_when_empty = 1U;
+        test_receive_hook = halt_print_stream_at_read_1;
+        (void)run_motion_task_until_scripted_stop(&context);
+
+        expect_u32(test_result_count, 2U, "both commands are answered");
+        expect_result_at(1U, 641U, TEST_ERROR_STREAM_HALTED, "the halt is reported, not the busy axis");
+        expect_u32(fake_x_bench_starts, 1U, "X is started only by the first command");
+        expect_u32(motion_task_test_get_planner_call_count(), 0U, "the refused move is not planned");
+    }
+}
+
+static void test_halted_stream_does_not_hide_unsupported_commands(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_print.halted = 1U;
+    const CommandDTO_t commands[] = {
+        {
+            .sequence = 650U,
+            .code = COMMAND_CODE_SET_TEMPERATURE,
+            .parameters.set_temperature = {.heater_id = 2U, .temperature = 215U},
+        },
+        {.sequence = 651U, .code = COMMAND_CODE_SET_OUTPUT, .parameters.set_output = {.output_id = 4U, .state = 1U}},
+        {
+            .sequence = 652U,
+            .code = COMMAND_CODE_MOTION_OPERATION,
+            .parameters.motion_operation = {.operation_flags = COMMAND_MOTION_OPERATION_FLAG_RELATIVE, .x = 500},
+        },
+    };
+    run_commands(&context, commands, 3U);
+
+    expect_u32(test_result_count, 3U, "every command is answered once");
+    for (uint32_t index = 0U; index < 3U; ++index) {
+        expect_result_at(index, 650U + index, TEST_ERROR_NOT_SUPPORTED, "an unsupported command while halted");
+    }
+}
+
+static void test_halted_stream_does_not_hide_a_missing_context_of_a_move(void) {
+    reset_receive_script();
+    gen_print.halted = 1U;
+    const CommandDTO_t move = xyz_move_to(660U, 1000, 1000U);
+    run_commands(NULL, &move, 1U);
+
+    expect_u32(test_result_count, 1U, "the move is answered once");
+    expect_result_at(0U, 660U, TEST_ERROR_NOT_CONFIGURED, "a move without a context is not configured while halted");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "the move is not planned");
+}
+
+/* The check of a command that is valid by itself comes first for HOME and CALIBRATE: a missing context shows up only
+ * when the command would start. */
+static void test_halted_stream_is_reported_before_a_missing_context_of_home(void) {
+    reset_receive_script();
+    gen_print.halted = 1U;
+    const CommandDTO_t commands[] = {
+        with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 670U),
+        with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_Y_MASK), 671U),
+    };
+    run_commands(NULL, commands, 2U);
+
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 670U, TEST_ERROR_STREAM_HALTED, "HOME is refused as halted");
+    expect_result_at(1U, 671U, TEST_ERROR_STREAM_HALTED, "CALIBRATE is refused as halted");
+    expect_u32(fake_x_bench_starts, 0U, "nothing moves");
+}
+
+/* The generator task never finishes the reset: the reset count does not rise within the settle time, so STOP says so and
+ * the next move still finds the stream halted. The wait takes exactly the settle time. */
+static void test_stop_reports_not_settled_when_the_reset_does_not_finish(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_print.halted = 1U;
+    test_print_reset_deferred = 1U;
+    test_print_reset_after_delays = 0U;
+    const CommandDTO_t commands[] = {
+        {.sequence = 680U, .code = COMMAND_CODE_STOP},
+        xyz_move_to(681U, 1000, 1000U),
+    };
+    run_commands(&context, commands, 2U);
+
+    expect_u32(test_generator_all_resumes, 1U, "the generators were restarted");
+    expect_u32(test_delay_calls, MOTION_TASK_STOP_SETTLE_TIMEOUT_MS, "STOP waited exactly the settle time for the reset");
+    expect_u32(test_last_delay_ms, 1U, "the wait goes in steps of 1 ms");
+    expect_u32(test_result_count, 2U, "STOP and the move are answered");
+    expect_result_at(0U, 680U, TEST_ERROR_STOP_NOT_SETTLED, "STOP whose reset does not finish says so");
+    expect_result_at(1U, 681U, TEST_ERROR_STREAM_HALTED, "the stream is still halted for the next move");
+    expect_u32(gen_print.reset_count, 0U, "the reset never finished");
+    expect_u32(gen_print.halted, 1U, "the printing stream stays halted");
+    expect_u32(queued_blocks(&test_plan_buffer), 0U, "the refused move is not queued");
+    expect_i64(context.machine_state.position_um[0], 0, "the planned position is unchanged");
+}
+
+/* The generator task resets on its own pass: STOP waits for the reset count to rise, then the next move is accepted.
+ * The first wait, a typical one and the settle timeout itself, which is the last wait that still counts. */
+static void test_stop_waits_until_the_reset_has_finished(void) {
+    const uint32_t finished_after_delays[] = {1U, 3U, MOTION_TASK_STOP_SETTLE_TIMEOUT_MS};
+    for (uint32_t index = 0U; index < sizeof(finished_after_delays) / sizeof(finished_after_delays[0]); ++index) {
+        reset_receive_script();
+        MotionTaskContext_t context = valid_motion_context();
+        gen_print.halted = 1U;
+        test_print_reset_deferred = 1U;
+        test_print_reset_after_delays = finished_after_delays[index];
+        const CommandDTO_t commands[] = {
+            {.sequence = 690U, .code = COMMAND_CODE_STOP},
+            xyz_move_to(691U, 1000, 1000U),
+        };
+        run_commands(&context, commands, 2U);
+
+        expect_u32(test_delay_calls, finished_after_delays[index], "STOP waited exactly until the reset had finished");
+        expect_u32(test_result_count, 2U, "STOP and the move are answered");
+        expect_done_at(0U, 690U, COMMAND_DONE_ACCEPTED, "STOP is settled once the reset has finished");
+        expect_done_at(1U, 691U, COMMAND_DONE_ACCEPTED, "the move after STOP is accepted");
+        expect_u32(gen_print.reset_count, 1U, "the printing instance was reset once");
+        expect_u32(gen_print.halted, 0U, "the printing stream is running");
+        expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
+        expect_i64(context.machine_state.position_um[0], 1000, "the move is planned from the reset position");
+    }
+}
+
+/* A reset that finishes with the instance halted again (a channel still runs) ends the wait, because the count rose,
+ * but STOP is not settled: the next move is refused. No wait follows the rise of the count. */
+static void test_stop_reports_not_settled_when_the_reset_leaves_the_stream_halted(void) {
+    /* 0: the reset has finished when the restart returns; 2: it finishes in the second wait. */
+    const uint32_t finished_after_delays[] = {0U, 2U};
+    for (uint32_t index = 0U; index < sizeof(finished_after_delays) / sizeof(finished_after_delays[0]); ++index) {
+        reset_receive_script();
+        MotionTaskContext_t context = valid_motion_context();
+        gen_print.halted = 1U;
+        test_print_reset_fails = 1U;
+        test_print_reset_deferred = finished_after_delays[index] != 0U ? 1U : 0U;
+        test_print_reset_after_delays = finished_after_delays[index];
+        const CommandDTO_t commands[] = {
+            {.sequence = 700U, .code = COMMAND_CODE_STOP},
+            xyz_move_to(701U, 1000, 1000U),
+        };
+        run_commands(&context, commands, 2U);
+
+        expect_u32(test_delay_calls, finished_after_delays[index], "STOP stops waiting as soon as the reset count rises");
+        expect_u32(gen_print.reset_count, 1U, "the reset has finished");
+        expect_u32(test_result_count, 2U, "STOP and the move are answered");
+        expect_result_at(0U, 700U, TEST_ERROR_STOP_NOT_SETTLED, "STOP whose reset left the stream halted says so");
+        expect_result_at(1U, 701U, TEST_ERROR_STREAM_HALTED, "the next move finds the stream halted");
+        expect_u32(gen_print.halted, 1U, "the printing stream is halted again");
+        expect_u32(queued_blocks(&test_plan_buffer), 0U, "the refused move is not queued");
+        expect_i64(context.machine_state.position_um[0], 0, "the planned position is unchanged");
+    }
+}
+
+/* The wait is for the reset to finish, not for the halt: the reset count of an instance that was not halted rises
+ * all the same, and STOP waits for it. */
+static void test_stop_waits_for_the_reset_count_not_the_halt_flag(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_print.halted = 0U;
+    test_print_reset_deferred = 1U;
+    test_print_reset_after_delays = 4U;
+    const CommandDTO_t stop = {.sequence = 710U, .code = COMMAND_CODE_STOP};
+    run_commands(&context, &stop, 1U);
+
+    expect_u32(test_delay_calls, 4U, "STOP waited for the reset although the stream was not halted");
+    expect_done_at(0U, 710U, COMMAND_DONE_ACCEPTED, "STOP is settled once the reset has finished");
+    expect_u32(gen_print.reset_count, 1U, "the printing instance was reset once");
+}
+
+/* A printing instance whose feeder was never built stays halted for good and is never reset: it neither refuses the
+ * commands nor makes STOP wait. */
+static void test_not_ready_print_instance_refuses_nothing(void) {
+    /* HOME of X. */
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_print.ready = 0U;
+    gen_print.halted = 1U;
+    const CommandDTO_t home = with_sequence(home_command_for(MOTION_PLANNER_AXIS_X_MASK), 720U);
+    run_commands(&context, &home, 1U);
+    expect_u32(test_result_count, 1U, "HOME is answered once");
+    expect_result_at(0U, 720U, 0U, "HOME is accepted although the printing instance is halted but not ready");
+    expect_u32(fake_x_bench_starts, 1U, "X started its seek");
+    expect_u32(queued_blocks(&gen_x.queue), 1U, "the seek of X is queued");
+
+    /* CALIBRATE of Y. */
+    reset_receive_script();
+    context = valid_motion_context();
+    gen_print.ready = 0U;
+    gen_print.halted = 1U;
+    const CommandDTO_t calibrate = with_sequence(calibrate_command_for(MOTION_PLANNER_AXIS_Y_MASK), 721U);
+    run_commands(&context, &calibrate, 1U);
+    expect_u32(test_result_count, 1U, "CALIBRATE is answered once");
+    expect_result_at(0U, 721U, 0U, "CALIBRATE is accepted although the printing instance is halted but not ready");
+    expect_u32(fake_y.bench_starts, 1U, "Y started its seek");
+    expect_u32(queued_blocks(&gen_y.queue), 1U, "the seek of Y is queued");
+
+    /* A move. */
+    reset_receive_script();
+    context = valid_motion_context();
+    gen_print.ready = 0U;
+    gen_print.halted = 1U;
+    const CommandDTO_t move = xyz_move_to(722U, 1000, 1000U);
+    run_commands(&context, &move, 1U);
+    expect_u32(test_result_count, 1U, "the move is answered once");
+    expect_done_at(0U, 722U, COMMAND_DONE_ACCEPTED, "a move is accepted although the printing instance is not ready");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
+    expect_u32(test_block_ready_notifications, 1U, "the generator is woken for the move");
+    expect_i64(context.machine_state.position_um[0], 1000, "the planned X position moves");
+
+    /* STOP: no wait for a reset that never comes, and the move after it is accepted. */
+    reset_receive_script();
+    context = valid_motion_context();
+    gen_print.ready = 0U;
+    gen_print.halted = 1U;
+    const CommandDTO_t commands[] = {
+        {.sequence = 723U, .code = COMMAND_CODE_STOP},
+        xyz_move_to(724U, 1000, 1000U),
+    };
+    run_commands(&context, commands, 2U);
+    expect_u32(test_delay_calls, 0U, "STOP does not wait for the reset of an instance that is not ready");
+    expect_u32(test_generator_all_resumes, 1U, "the generators were restarted");
+    expect_u32(gen_print.resumes, 0U, "the instance that is not ready was not reset");
+    expect_u32(gen_print.reset_count, 0U, "its reset count did not rise");
+    expect_u32(gen_print.halted, 1U, "it stays halted");
+    expect_u32(test_result_count, 2U, "STOP and the move are answered");
+    expect_done_at(0U, 723U, COMMAND_DONE_ACCEPTED, "STOP is settled without a reset of the instance that is not ready");
+    expect_done_at(1U, 724U, COMMAND_DONE_ACCEPTED, "the move after STOP is accepted");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
+    expect_i64(context.machine_state.position_um[0], 1000, "the move is planned from the reset position");
+}
+
 int main(void) {
+    test_halted_stream_does_not_hide_invalid_axes();
+    test_halted_stream_is_reported_before_a_busy_axis();
+    test_halted_stream_does_not_hide_unsupported_commands();
+    test_halted_stream_does_not_hide_a_missing_context_of_a_move();
+    test_halted_stream_is_reported_before_a_missing_context_of_home();
+    test_stop_reports_not_settled_when_the_reset_does_not_finish();
+    test_stop_waits_until_the_reset_has_finished();
+    test_stop_reports_not_settled_when_the_reset_leaves_the_stream_halted();
+    test_stop_waits_for_the_reset_count_not_the_halt_flag();
+    test_not_ready_print_instance_refuses_nothing();
+    test_move_is_refused_while_the_printing_stream_is_halted();
+    test_home_is_refused_while_the_printing_stream_is_halted();
+    test_calibrate_is_refused_while_the_printing_stream_is_halted();
+    test_stop_is_accepted_while_halted_and_lifts_the_refusal();
+    test_move_is_accepted_when_only_an_axis_instance_is_halted();
     test_result_of_an_accepted_move_is_zero();
     test_result_of_a_planner_refusal_is_the_planner_code();
     test_result_of_a_move_to_the_current_position_is_done_at_target();

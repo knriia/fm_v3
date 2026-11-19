@@ -739,11 +739,22 @@ static uint8_t motion_task_stream_busy_axes(void) {
     return (uint8_t)(print_busy_mask | motion_task_axis_streams_busy_axes());
 }
 
+/* 1 while the printing stream is halted and STOP can lift it. An instance whose feeder was never built stays halted
+ * for good and does nothing, so it is not counted: refusing commands for it would only lock out the axes, whose
+ * HOME and CALIBRATE run on their own instances. */
+static uint8_t motion_task_print_stream_halted(void) {
+    const StepGeneratorInstance_t *const print = step_generator_task_get_print_instance();
+    return (uint8_t)(step_generator_instance_is_ready(print) != 0U && step_generator_instance_is_halted(print) != 0U);
+}
+
 /* HOME and CALIBRATE name axes that can home and are idle; anything else refuses the whole command. Returns 0 when the
  * command may start, otherwise the COMMAND_ERROR_* code of the refusal. */
-static uint16_t motion_task_axes_start_refusal(uint8_t axes_mask, uint8_t busy_mask) {
+static uint16_t motion_task_axes_start_refusal(uint8_t axes_mask, uint8_t busy_mask, uint8_t stream_halted) {
     if (axes_mask == 0U || (axes_mask & (uint8_t)~MOTION_TASK_HOME_AXES_MASK) != 0U) {
         return COMMAND_ERROR_INVALID_PARAMETER;
+    }
+    if (stream_halted != 0U) {
+        return COMMAND_ERROR_STREAM_HALTED;
     }
     return (axes_mask & busy_mask) != 0U ? COMMAND_ERROR_AXIS_BUSY : 0U;
 }
@@ -768,8 +779,9 @@ static uint8_t motion_task_any_hardware_is_active(void) {
     return 0U;
 }
 
-/* Second half of STOP: once every axis is at rest the step pipeline is emptied and restarted. If one does not come
- * to rest in time the generator stays halted, so nothing moves until the next STOP succeeds; returns 0 then. */
+/* Second half of STOP: once every axis is at rest the step pipeline is emptied and restarted. Returns 0 when an axis
+ * does not come to rest in time, or the printing stream is still or again halted after its reset: the generator stays
+ * halted, so nothing moves until the next STOP succeeds. */
 static uint8_t motion_task_finish_stop(MotionTaskContext_t *context) {
     for (uint32_t waited_ms = 0U; motion_task_any_hardware_is_active() != 0U; ++waited_ms) {
         if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
@@ -785,8 +797,23 @@ static uint8_t motion_task_finish_stop(MotionTaskContext_t *context) {
             context->machine_state.position_um[axis] = scale_um < 0 ? -scale_um : scale_um;
         }
     }
+    const StepGeneratorInstance_t *const print = step_generator_task_get_print_instance();
+    const uint32_t resets_before = step_generator_instance_reset_count(print);
     step_generator_task_resume_all_after_stop();
-    return 1U;
+    /* The generator task resets on its own pass, so the next command could still find the stream halted. The wait is
+     * bounded, and it ends only when the reset has finished: it lifts the halt first and a failing reset halts again.
+     * An instance that is not ready is never reset, so there is nothing to wait for. */
+    for (
+        uint32_t waited_ms = 0U;
+        step_generator_instance_is_ready(print) != 0U && step_generator_instance_reset_count(print) == resets_before;
+        ++waited_ms
+    ) {
+        if (waited_ms == MOTION_TASK_STOP_SETTLE_TIMEOUT_MS) {
+            return 0U;
+        }
+        (void)osDelay(1U);
+    }
+    return motion_task_print_stream_halted() == 0U ? 1U : 0U;
 }
 
 static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContext_t *context) {
@@ -805,7 +832,7 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
     motion_axis_hardware_reset_timing_peaks(state->axis);
 }
 
-/* Returns 0 when the axes did not come to rest in time. */
+/* Returns 0 when the axes did not come to rest in time or the printing stream is still halted after its reset. */
 static uint8_t motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
     (void)plan_buffer_clear(motion_task_plan_buffer);
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
@@ -871,6 +898,10 @@ static MotionTaskDecision_t motion_task_execute_command(
     const CommandDTO_t *command,
     uint8_t busy_mask
 ) {
+    /* A halted stream stays so until STOP, whatever the cause; a command taken now would only queue behind it (a move
+     * would even shift the planned position) while the client is not told that STOP is needed. A malformed or
+     * unsupported command is refused for that first, so the client sees its own mistake and not the state. */
+    const uint8_t stream_halted = motion_task_print_stream_halted();
     /* A stream owns the timers of its axes from the first queued block to its end, so HOME and CALIBRATE are
      * refused for those axes meanwhile like any other command that finds the axis busy. */
     const uint8_t start_busy_mask =
@@ -878,7 +909,7 @@ static MotionTaskDecision_t motion_task_execute_command(
     if (command->code == COMMAND_CODE_HOME || command->code == COMMAND_CODE_CALIBRATE) {
         const uint8_t calibrate = command->code == COMMAND_CODE_CALIBRATE ? 1U : 0U;
         const uint8_t axes_mask = calibrate != 0U ? command->parameters.calibrate.axes : command->parameters.home.axes;
-        const uint16_t refusal = motion_task_axes_start_refusal(axes_mask, start_busy_mask);
+        const uint16_t refusal = motion_task_axes_start_refusal(axes_mask, start_busy_mask, stream_halted);
         return motion_task_decision_from_error(
             refusal != 0U ? refusal : motion_task_start_axes(states, context, axes_mask, calibrate)
         );
@@ -886,6 +917,9 @@ static MotionTaskDecision_t motion_task_execute_command(
     if (motion_task_is_xyz_move(command) != 0) {
         if (context == NULL) {
             return motion_task_decision_from_error(COMMAND_ERROR_NOT_CONFIGURED);
+        }
+        if (stream_halted != 0U) {
+            return motion_task_decision_from_error(COMMAND_ERROR_STREAM_HALTED);
         }
         if (busy_mask != 0U || motion_task_axis_streams_busy_axes() != 0U) {
             return motion_task_decision_from_error(COMMAND_ERROR_AXIS_BUSY);
