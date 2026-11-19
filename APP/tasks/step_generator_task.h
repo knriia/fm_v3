@@ -119,6 +119,12 @@ uint8_t step_generator_instance_is_busy(const StepGeneratorInstance_t *instance)
 /* 1 while the instance does not feed its channels: after STOP, a stop on a limit switch or a fault, until the reset
  * below. A NULL instance reads as not halted. */
 uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instance);
+/* 1 once the feeder of the instance is built. One that is not ready cannot be reset by STOP and does nothing. A NULL
+ * instance is not ready. */
+uint8_t step_generator_instance_is_ready(const StepGeneratorInstance_t *instance);
+/* How many resets after STOP the instance has finished; the count rises after the reset ended, so a reset that failed
+ * has already halted the instance again. A NULL instance reads 0. */
+uint32_t step_generator_instance_reset_count(const StepGeneratorInstance_t *instance);
 /* After STOP, once the channels no longer move: drop the started block and the held one of this instance, then go on.
  * Other instances keep streaming. */
 void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance);

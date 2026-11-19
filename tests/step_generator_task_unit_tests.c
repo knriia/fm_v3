@@ -66,7 +66,9 @@ typedef enum {
     /* STOP of the instance of X after which the channel of X is still running. */
     TEST_ACTION_HALT_X_AXIS_INSTANCE_CHANNEL_RUNS,
     /* A block of X and Y arrives in the print queue while another instance already streams on X. */
-    TEST_ACTION_PUSH_PRINT_BLOCK_XY
+    TEST_ACTION_PUSH_PRINT_BLOCK_XY,
+    /* Records what MotionTask can read of the print instance (ready, halted, reset count) before the reset of this wait. */
+    TEST_ACTION_SAMPLE_PRINT
 } TestWaitAction_t;
 
 static uint32_t test_failures;
@@ -82,6 +84,10 @@ static uint32_t test_wait_results[TEST_WAIT_SCRIPT_LENGTH];
 static TestWaitAction_t test_wait_actions[TEST_WAIT_SCRIPT_LENGTH];
 static uint32_t test_wait_script_count;
 static uint32_t test_wait_last_timeout;
+/* What TEST_ACTION_SAMPLE_PRINT read in each wait, through the public functions of the print instance. */
+static uint32_t test_sampled_ready[TEST_WAIT_SCRIPT_LENGTH];
+static uint32_t test_sampled_halted[TEST_WAIT_SCRIPT_LENGTH];
+static uint32_t test_sampled_reset_count[TEST_WAIT_SCRIPT_LENGTH];
 static uint32_t test_kernel_lock_depth;
 static uint32_t test_delay_calls;
 
@@ -335,6 +341,11 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
             STEP_STREAM_GROUP_STATE_FAULT,
             "STOP does not clear a fault"
         );
+        break;
+    case TEST_ACTION_SAMPLE_PRINT:
+        test_sampled_ready[index] = step_generator_instance_is_ready(step_generator_task_get_print_instance());
+        test_sampled_halted[index] = step_generator_instance_is_halted(step_generator_task_get_print_instance());
+        test_sampled_reset_count[index] = step_generator_instance_reset_count(step_generator_task_get_print_instance());
         break;
     case TEST_ACTION_NONE:
     default:
@@ -643,6 +654,9 @@ static void reset_fixture(void) {
     test_wait_calls = 0U;
     test_wait_script_count = 0U;
     test_wait_last_timeout = 0U;
+    memset(test_sampled_ready, 0xFF, sizeof(test_sampled_ready));
+    memset(test_sampled_halted, 0xFF, sizeof(test_sampled_halted));
+    memset(test_sampled_reset_count, 0xFF, sizeof(test_sampled_reset_count));
     test_kernel_lock_depth = 0U;
     test_delay_calls = 0U;
     memset(test_halves, 0, sizeof(test_halves));
@@ -2696,6 +2710,161 @@ static void test_stop_reset_frees_the_channels(void) {
     expect_true(test_stream_owner[TEST_CH_X] == test_axis_context(MOTION_AXIS_X), "the owner keeps the channel of X");
 }
 
+/* MotionTask asks whether an instance can be reset at all: only one whose feeder was built can. */
+static void test_instance_is_ready_once_its_feeder_is_built(void) {
+    reset_fixture();
+    expect_u32(step_generator_instance_is_ready(NULL), 0U, "a NULL instance is not ready");
+    expect_u32(
+        step_generator_instance_is_ready(&step_generator_task_instance),
+        0U,
+        "an instance the task has not set up yet is not ready"
+    );
+
+    /* The setup of the print instance succeeds; an axis instance without a queue does not. */
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    test_wait_script_count = 1U;
+    test_wait_actions[0] = TEST_ACTION_SAMPLE_PRINT;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(test_sampled_ready[0], 1U, "the print instance is ready by the first wait of the task");
+    expect_u32(step_generator_instance_is_ready(step_generator_task_get_print_instance()), 1U, "the print instance stays ready");
+    expect_u32(
+        step_generator_instance_is_ready(step_generator_task_get_axis_instance(MOTION_AXIS_X)),
+        1U,
+        "the instance of X with a queue is ready"
+    );
+    expect_u32(
+        step_generator_instance_is_ready(step_generator_task_get_axis_instance(MOTION_AXIS_Y)),
+        0U,
+        "the instance of Y without a queue is not ready"
+    );
+    expect_u32(
+        step_generator_instance_is_ready(step_generator_task_get_axis_instance(MOTION_AXIS_Z)),
+        0U,
+        "the instance of Z without a queue is not ready"
+    );
+
+    /* Every way the setup fails leaves the print instance not ready, and halted. */
+    reset_fixture();
+    (void)run_task_until_jump(NULL);
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "no config, not ready");
+    expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 1U, "no config, halted");
+
+    reset_fixture();
+    test_task_config.plan_buffer = NULL;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "no queue, not ready");
+
+    reset_fixture();
+    test_task_config.step_pulse_width_ns = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "unusable timing, not ready");
+
+    reset_fixture();
+    test_timer_clock_hz[TEST_CH_Y] = TEST_TIMER_CLOCK_HZ / 2U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "clocks that differ, not ready");
+}
+
+/* MotionTask waits for this count after STOP: it rises once per finished reset, and only for an instance that is reset. */
+static void test_reset_count_rises_by_one_per_finished_reset(void) {
+    reset_fixture();
+    expect_u32(step_generator_instance_reset_count(NULL), 0U, "a NULL instance has no resets");
+    expect_u32(step_generator_instance_reset_count(&step_generator_task_instance), 0U, "a fresh instance has no resets");
+
+    /* Two resets with a pass in between that has no request. The samples are taken before the reset of their wait. */
+    reset_fixture();
+    step_generator_task_halt_all();
+    test_wait_script_count = 3U;
+    test_wait_actions[0] = TEST_ACTION_SAMPLE_PRINT;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    test_wait_actions[1] = TEST_ACTION_SAMPLE_PRINT;
+    test_wait_results[1] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    test_wait_actions[2] = TEST_ACTION_SAMPLE_PRINT;
+    test_wait_results[2] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(test_sampled_reset_count[0], 0U, "no reset has finished before the first request");
+    expect_u32(test_sampled_halted[0], 1U, "the instance is halted until the reset");
+    expect_u32(test_sampled_reset_count[1], 1U, "the first reset raised the count to 1");
+    expect_u32(test_sampled_halted[1], 0U, "the first reset lifted the halt");
+    expect_u32(test_sampled_reset_count[2], 1U, "a pass without a request does not raise the count");
+    expect_u32(
+        step_generator_instance_reset_count(&step_generator_task_instance),
+        2U,
+        "the second reset raised the count to 2"
+    );
+    expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 0U, "the second reset lifted the halt");
+    StepGeneratorTaskDiagnostics diagnostics = {0};
+    step_generator_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.stop_resets, 2U, "the count is the stop_resets of the diagnostics");
+
+    /* Without a request the halt stays and nothing is counted. */
+    reset_fixture();
+    step_generator_task_halt_all();
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_instance_reset_count(&step_generator_task_instance), 0U, "no request, no finished reset");
+    expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 1U, "no request, still halted");
+
+    /* An instance that was not set up is never reset, whatever is asked. */
+    reset_fixture();
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    expect_u32((uint32_t)run_task_until_jump(NULL), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_instance_reset_count(&step_generator_task_instance), 0U, "no feeder, no reset");
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "and it is not ready");
+    expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 1U, "and it stays halted");
+
+    /* Each instance counts its own resets: only the instance of X is asked here. */
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    step_generator_task_thread_id = TEST_THREAD_ID;
+    step_generator_instance_resume_after_stop(step_generator_task_get_axis_instance(MOTION_AXIS_X));
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(
+        step_generator_instance_reset_count(step_generator_task_get_axis_instance(MOTION_AXIS_X)),
+        1U,
+        "the instance of X was reset"
+    );
+    expect_u32(step_generator_instance_reset_count(&step_generator_task_instance), 0U, "the print instance was not asked");
+    expect_u32(
+        step_generator_instance_reset_count(step_generator_task_get_axis_instance(MOTION_AXIS_Y)),
+        0U,
+        "the instance of Y was not asked"
+    );
+}
+
+/* A channel that still runs makes the reset fail: the count rises all the same, after the instance is halted again. */
+static void test_reset_count_rises_when_the_reset_fails(void) {
+    reset_fixture();
+    step_generator_task_halt_all();
+    test_wait_script_count = 2U;
+    test_wait_actions[0] = TEST_ACTION_Y_STREAMING;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    test_wait_actions[1] = TEST_ACTION_SAMPLE_PRINT;
+    test_wait_results[1] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(test_sampled_reset_count[1], 0U, "no reset has finished before the request");
+    expect_u32(test_sampled_halted[1], 1U, "the instance is halted before the reset");
+    expect_u32(step_generator_instance_reset_count(&step_generator_task_instance), 1U, "the failed reset is counted");
+    expect_u32(
+        step_generator_instance_is_halted(&step_generator_task_instance),
+        1U,
+        "the instance is halted again once the count has risen"
+    );
+    /* The cause is recorded only when the halt was lifted first: the reset lifted it, then failed and halted again. */
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED,
+        "the halt after the count rose is the failed reset"
+    );
+    expect_u32(step_generator_task_instance.halts_total, 2U, "STOP halted once and the failed reset halted again");
+}
+
 int main(void) {
     for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         test_axis_markers[channel] = (int)channel;
@@ -2736,6 +2905,9 @@ int main(void) {
     test_instance_lookup_and_queues();
     test_halt_stops_only_the_channels_the_instance_holds();
     test_stop_reset_frees_the_channels();
+    test_instance_is_ready_once_its_feeder_is_built();
+    test_reset_count_rises_by_one_per_finished_reset();
+    test_reset_count_rises_when_the_reset_fails();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Step generator task unit tests failed: %u\n", (unsigned int)test_failures);

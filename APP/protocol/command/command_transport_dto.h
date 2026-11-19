@@ -60,10 +60,15 @@ typedef enum {
 #define COMMAND_ERROR_PLAN_QUEUE_FULL 0x0123U
 /* The command, or the part of it that MotionTask would run, is not implemented. */
 #define COMMAND_ERROR_NOT_SUPPORTED 0x0124U
-/* STOP did not bring every axis to rest in time; the step generator stays halted. */
+/* STOP did not bring every axis to rest in time, or the printing stream is still halted after the reset that follows
+ * it; the step generator stays halted. */
 #define COMMAND_ERROR_STOP_NOT_SETTLED 0x0125U
 /* MotionTask has no machine context, so it cannot plan or home. */
 #define COMMAND_ERROR_NOT_CONFIGURED 0x0126U
+/* The step stream is halted (a limit switch, a generator fault): HOME, CALIBRATE and moves are refused until STOP. The
+ * cause is the halt_cause of the step generator diagnostics (STEP_GENERATOR_TASK_HALT_CAUSE_*). STOP also cancels a
+ * homing or calibration that is running; a move is refused with this code even while one runs. */
+#define COMMAND_ERROR_STREAM_HALTED 0x0127U
 
 /* Result codes of a DONE frame. */
 #define COMMAND_DONE_ACCEPTED 0x0000U

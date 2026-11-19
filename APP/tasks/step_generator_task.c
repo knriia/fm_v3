@@ -223,6 +223,14 @@ uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instanc
     return instance == NULL ? 0U : instance->halted;
 }
 
+uint8_t step_generator_instance_is_ready(const StepGeneratorInstance_t *instance) {
+    return instance == NULL ? 0U : instance->ready;
+}
+
+uint32_t step_generator_instance_reset_count(const StepGeneratorInstance_t *instance) {
+    return instance == NULL ? 0U : instance->diagnostics.stop_resets;
+}
+
 void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance) {
     /* Before the task starts nothing runs yet and the task has not set the instance up, so there is nothing to reset; a
      * request kept from then would reset the instance on the first pass and lift a STOP that came in between. */
