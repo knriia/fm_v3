@@ -4,6 +4,7 @@
 #include "motion/axis_calibration_run.h"
 #include "motion/calibration_store.h"
 #include "motion/home_block.h"
+#include "motion/move_result_tracker.h"
 #include "motion/plan_buffer.h"
 #include "motion/step_executor.h"
 #include "motion_axis_hardware.h"
@@ -37,9 +38,13 @@ static uint32_t test_delay_calls;
 static uint32_t test_last_delay_ms;
 static uint32_t test_receive_calls;
 static uint32_t test_last_receive_timeout;
+static osStatus_t test_last_read_status;
 static uint32_t test_receive_script_count;
 static uint32_t test_receive_script_position;
-static TestQueueRead_t test_receive_script[16];
+/* Long enough for a run that fills the tracker of the moves that wait for their result (MOVE_RESULT_TRACKER_CAPACITY
+ * moves, one more that is refused, and a few reads after them). */
+#define TEST_RECEIVE_SCRIPT_CAPACITY 160U
+static TestQueueRead_t test_receive_script[TEST_RECEIVE_SCRIPT_CAPACITY];
 /* Called with the index of the read that is about to be served, to change the world while MotionTask is blocked. */
 static void (*test_receive_hook)(uint32_t read_index);
 
@@ -55,11 +60,14 @@ static uint32_t test_pending_receive_calls;
 static uint32_t test_pending_max_timeout;
 
 /* What MotionTask told the command result queue, in call order. */
-#define TEST_RESULT_CAPACITY 64U
+#define TEST_RESULT_CAPACITY 300U
 typedef struct {
     uint32_t sequence;
     uint8_t response_type;
     uint16_t code;
+    uint8_t cause;
+    uint8_t axis;
+    uint8_t detail;
 } TestResult_t;
 static TestResult_t test_results[TEST_RESULT_CAPACITY];
 static uint32_t test_result_count;
@@ -229,18 +237,114 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
         test_receive_hook(test_receive_calls);
     }
     ++test_receive_calls;
-    test_last_receive_timeout = timeout_ms;
+    /* MotionTask reads the queue without waiting and sleeps on its thread flags, so what the old tests meant by the
+     * timeout of the read is now the timeout of the flag wait below. */
     if (test_receive_script_position < test_receive_script_count) {
         const TestQueueRead_t *read = &test_receive_script[test_receive_script_position++];
         if (read->status == osOK) {
             *command = read->command;
         }
+        test_last_read_status = read->status;
         return read->status;
     }
-    if (test_block_when_empty != 0U && test_jump_active != 0U) {
+    test_last_read_status = osErrorResource;
+    return osErrorResource;
+}
+
+/* The task found the queue empty and waits for a command or for the progress of the stream. A scripted timeout read, and
+ * any finite wait, ends by the timeout (the poll of an active homing); an unbounded wait on an empty queue is where the
+ * task blocks for good. */
+#define TEST_WAIT_CAPACITY 8U
+static uint32_t test_flags_wait_calls;
+static uint32_t test_last_wait_flags;
+static uint32_t test_last_wait_options;
+/* The timeout of each wait, by the number of the wait since MotionTask started. */
+static uint32_t test_wait_timeouts[TEST_WAIT_CAPACITY];
+/* What the wait with that number returns instead of the default behavior; the first test_flags_wait_script_count waits. */
+static uint32_t test_flags_wait_script[TEST_WAIT_CAPACITY];
+static uint32_t test_flags_wait_script_count;
+/* Called with the number of the wait before it returns, to change the world while MotionTask sleeps. */
+static void (*test_flags_wait_hook)(uint32_t wait_index);
+
+uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
+    const uint32_t wait_index = test_flags_wait_calls++;
+    test_last_wait_flags = flags;
+    test_last_wait_options = options;
+    test_last_receive_timeout = timeout;
+    if (wait_index < TEST_WAIT_CAPACITY) {
+        test_wait_timeouts[wait_index] = timeout;
+    }
+    if (test_flags_wait_hook != NULL) {
+        test_flags_wait_hook(wait_index);
+    }
+    if (wait_index < test_flags_wait_script_count) {
+        return test_flags_wait_script[wait_index];
+    }
+    if (test_last_read_status == osErrorTimeout) {
+        return osFlagsErrorTimeout;
+    }
+    /* The script is read out and the queue is empty: the task would sleep here. A test with a hook on the waits ends
+     * the run itself and wants the finite waits (the poll of a homing) to return. */
+    if (test_block_when_empty != 0U && test_jump_active != 0U &&
+        (test_flags_wait_hook == NULL || timeout == osWaitForever)) {
         longjmp(test_jump_buffer, 2);
     }
-    return osErrorResource;
+    return osFlagsErrorTimeout;
+}
+
+static uint8_t test_thread_marker;
+/* While set, the task gets no thread id, as when the RTOS cannot tell it. */
+static uint8_t test_thread_id_is_null;
+osThreadId_t osThreadGetId(void) { return test_thread_id_is_null != 0U ? NULL : &test_thread_marker; }
+
+static uint32_t test_flags_set_calls;
+static osThreadId_t test_flags_set_thread;
+static uint32_t test_flags_set_flags;
+uint32_t osThreadFlagsSet(osThreadId_t thread_id, uint32_t flags) {
+    ++test_flags_set_calls;
+    test_flags_set_thread = thread_id;
+    test_flags_set_flags = flags;
+    return flags;
+}
+
+static CommandQueuePutListener_t test_put_listener;
+void command_queue_set_put_listener(CommandQueuePutListener_t listener) { test_put_listener = listener; }
+
+static StepGeneratorProgressListener_t test_progress_listener;
+void step_generator_task_set_progress_listener(StepGeneratorProgressListener_t listener) {
+    test_progress_listener = listener;
+}
+
+/* The blocks that MotionTask put into the printing queue and the test took out of it, in order. The order is what the
+ * stream reports its progress by, so the tests look it up by the sequence of the move. */
+#define TEST_BLOCK_RECORD_CAPACITY 160U
+static uint32_t test_block_record_sequences[TEST_BLOCK_RECORD_CAPACITY];
+static uint32_t test_block_record_orders[TEST_BLOCK_RECORD_CAPACITY];
+static uint32_t test_block_record_count;
+
+/* One change of the stream snapshot, applied while MotionTask sleeps on its flags. The played and unplayed blocks are
+ * named by the sequence of their move (0 for none): the step takes their order from the recorded blocks. */
+typedef struct {
+    uint32_t generation;
+    uint32_t played_blocks;
+    uint32_t played_sequence;
+    uint8_t stop_resolved;
+    uint32_t unplayed_sequence;
+    uint32_t halt_cause;
+    uint32_t halt_axis;
+    uint32_t halt_detail;
+} TestProgressStep_t;
+#define TEST_PROGRESS_STEP_CAPACITY 4U
+static TestProgressStep_t test_progress_steps[TEST_PROGRESS_STEP_CAPACITY];
+static uint32_t test_progress_step_count;
+
+/* The snapshot of the printing stream that the fake generator reports. */
+static StepGeneratorProgress_t test_progress;
+void step_generator_instance_get_progress(const StepGeneratorInstance_t *instance, StepGeneratorProgress_t *progress) {
+    if (instance == NULL || progress == NULL) {
+        return;
+    }
+    *progress = test_progress;
 }
 
 /* The plan buffer mutex is exercised in its own tests; here it only has to succeed. */
@@ -398,7 +502,14 @@ void step_generator_task_resume_all_after_stop(void) {
     }
 }
 
-void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_t code) {
+void command_result_queue_post_detailed(
+    uint32_t sequence,
+    uint8_t response_type,
+    uint16_t code,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail
+) {
     if (test_result_count >= TEST_RESULT_CAPACITY) {
         ++test_failures;
         (void)fprintf(stderr, "FAIL: more results than the test records\n");
@@ -407,7 +518,14 @@ void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_
     test_results[test_result_count].sequence = sequence;
     test_results[test_result_count].response_type = response_type;
     test_results[test_result_count].code = code;
+    test_results[test_result_count].cause = cause;
+    test_results[test_result_count].axis = axis;
+    test_results[test_result_count].detail = detail;
     ++test_result_count;
+}
+
+void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_t code) {
+    command_result_queue_post_detailed(sequence, response_type, code, 0U, COMMAND_ERROR_AXIS_NONE, 0U);
 }
 
 void command_result_queue_discard_all(void) {
@@ -661,6 +779,23 @@ static void reset_receive_script(void) {
     test_last_delay_ms = 0U;
     test_receive_calls = 0U;
     test_last_receive_timeout = 0U;
+    test_last_read_status = osOK;
+    (void)memset(&test_progress, 0, sizeof(test_progress));
+    test_flags_wait_calls = 0U;
+    test_last_wait_flags = 0U;
+    test_last_wait_options = UINT32_MAX;
+    (void)memset(test_wait_timeouts, 0, sizeof(test_wait_timeouts));
+    (void)memset(test_flags_wait_script, 0, sizeof(test_flags_wait_script));
+    test_flags_wait_script_count = 0U;
+    test_flags_wait_hook = NULL;
+    test_thread_id_is_null = 0U;
+    test_flags_set_calls = 0U;
+    test_flags_set_thread = NULL;
+    test_flags_set_flags = 0U;
+    test_put_listener = NULL;
+    test_progress_listener = NULL;
+    test_block_record_count = 0U;
+    test_progress_step_count = 0U;
     test_receive_script_count = 0U;
     test_receive_script_position = 0U;
     (void)memset(test_receive_script, 0, sizeof(test_receive_script));
@@ -763,11 +898,11 @@ static void test_successful_receive_marks_dequeue(void) {
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     expect_u32((uint32_t)run_motion_task_until_scripted_stop(&context), 3U, "queue error enters bounded retry path");
-    expect_u32(test_last_receive_timeout, osWaitForever, "consumer waits forever for a queue item");
+    expect_u32(test_last_receive_timeout, 0U, "the consumer reads the queue without waiting");
     expect_u32(test_delay_calls, 1U, "queue error applies one retry delay");
     expect_u32(test_last_delay_ms, MOTION_TASK_ERROR_RETRY_DELAY_MS, "retry delay is bounded");
 
@@ -890,7 +1025,7 @@ static void test_fifo_commands_are_dequeued_once(void) {
 static void test_receive_error_does_not_count_as_dequeue(void) {
     reset_receive_script();
     MotionTaskContext_t context = {.plan_buffer = &test_plan_buffer};
-    script_read(0U, osErrorResource, NULL);
+    script_read(0U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     expect_u32((uint32_t)run_motion_task_until_scripted_stop(&context), 3U, "receive error retries after delay");
@@ -927,7 +1062,7 @@ static void test_diagnostic_counters_saturate(void) {
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
     (void)run_motion_task_until_scripted_stop(&valid_context);
 
@@ -959,7 +1094,9 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
             },
     };
     script_read(0U, osOK, &command);
+    /* The planner refusal empties the command queue: this read ends that, the next one is the error under test. */
     script_read(1U, osErrorResource, NULL);
+    script_read(2U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -989,6 +1126,11 @@ static void test_xyz_command_reports_unconfigured_planner_inputs(void) {
     (void)plan_buffer_get_diagnostics(&test_plan_buffer, &plan_buffer_diagnostics);
     expect_u32(plan_buffer_diagnostics.queued, 0U, "planner error clears pending plans");
     expect_u32(plan_buffer_diagnostics.cancelled_blocks, 1U, "planner error counts cancelled plans");
+    expect_u32(test_generator_all_halts, 1U, "the planner refusal halts every generator instance");
+    expect_u32(test_result_count, 1U, "only the refused command is answered");
+    expect_u32(test_results[0].sequence, 108U, "the answer carries the sequence of the refused move");
+    expect_u32(test_results[0].response_type, COMMAND_MESSAGE_TYPE_ERROR, "the refused move is answered with ERROR");
+    expect_u32(test_results[0].code, 0x0103U, "the code is the planner base 0x0100 plus INVALID_CONFIGURATION (3)");
 }
 
 static void test_xyz_command_without_position_change_counts_no_motion(void) {
@@ -1013,7 +1155,7 @@ static void test_xyz_command_without_position_change_counts_no_motion(void) {
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -1055,7 +1197,7 @@ static void test_relative_move_without_increment_is_already_at_target(void) {
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -1095,7 +1237,7 @@ static void test_full_plan_buffer_rejects_new_block_without_losing_existing_plan
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
 
@@ -1137,7 +1279,7 @@ static void test_xyz_command_with_null_context_is_not_configured(void) {
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(NULL);
@@ -1166,7 +1308,7 @@ static void test_motion_operation_without_xyz_flag_does_not_call_planner(void) {
             },
     };
     script_read(0U, osOK, &command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -1181,7 +1323,7 @@ static void test_motion_operation_without_xyz_flag_does_not_call_planner(void) {
 static void test_x_hardware_is_initialized_before_first_command(void) {
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_read(0U, osErrorResource, NULL);
+    script_read(0U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -1194,7 +1336,7 @@ static void test_stream_event_source_is_registered_for_every_axis(void) {
     memset(test_event_source_registrations, 0, sizeof(test_event_source_registrations));
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
-    script_read(0U, osErrorResource, NULL);
+    script_read(0U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
 
     (void)run_motion_task_until_scripted_stop(&context);
@@ -2150,7 +2292,7 @@ static void test_commands_during_home(void) {
     reset_receive_script();
     context = valid_motion_context();
     script_read(0U, osOK, &test_home_x_command);
-    script_read(1U, osErrorResource, NULL);
+    script_read(1U, osErrorParameter, NULL);
     test_jump_on_delay = 1U;
     (void)run_motion_task_until_scripted_stop(&context);
     expect_u32(fake_x_stop_requests, 1U, "queue failure aborts active homing");
@@ -4085,7 +4227,7 @@ static void test_stop_erases_unread_results_and_keeps_its_own(void) {
     MotionTaskContext_t context = valid_motion_context();
     const CommandDTO_t commands[] = {
         xyz_move_to(500U, 1000, 1000U),
-        xyz_move_to(501U, 0, 0U),
+        {.sequence = 501U, .code = COMMAND_CODE_SET_OUTPUT, .parameters.set_output = {.output_id = 3U, .state = 1U}},
         {.sequence = 502U, .code = COMMAND_CODE_SET_OUTPUT, .parameters.set_output = {.output_id = 4U, .state = 1U}},
         {.sequence = 503U, .code = COMMAND_CODE_STOP},
     };
@@ -4160,6 +4302,156 @@ static void test_request_stop_drops_the_commands_behind_it_silently(void) {
 
 /* Wire value of COMMAND_ERROR_STREAM_HALTED, written out like the other result codes. */
 #define TEST_ERROR_STREAM_HALTED 0x0127U
+
+static const CommandDTO_t test_unsupported_output_command = {
+    .code = COMMAND_CODE_SET_OUTPUT,
+    .parameters.set_output = {.output_id = 4U, .state = 1U},
+};
+
+/* Scale readings of the three axes; MotionTask takes their magnitude as the position after a STOP. */
+static void set_test_scale_readings(int32_t x_um, int32_t y_um, int32_t z_um) {
+    fake_encoder_x_um = x_um;
+    fake_y.encoder_um = y_um;
+    fake_z.encoder_um = z_um;
+}
+
+/* A planner refusal is handled like a malformed command: the machine is stopped and emptied as by STOP, the command
+ * queue and the unread results are dropped, and only the refused command is answered, with the planner's code. */
+static void test_planner_refusal_stops_and_empties_everything(void) {
+    for (uint32_t index = 0U; index < sizeof(test_planner_refusals) / sizeof(test_planner_refusals[0]); ++index) {
+        const TestPlannerRefusal_t *refusal = &test_planner_refusals[index];
+        reset_receive_script();
+        MotionTaskContext_t context = valid_motion_context();
+        context.machine_state.homed_axes_mask = refusal->homed_axes_mask;
+        set_test_scale_readings(-1500, 700, -300);
+        const MotionPlanBlock_t pending = {.sequence = 90U};
+        expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending), PLAN_BUFFER_STATUS_OK, "a printing block waits");
+        expect_u32(plan_buffer_try_push(&gen_x.queue, &pending), PLAN_BUFFER_STATUS_OK, "an X block waits");
+        gen_print.busy = 1U;
+
+        const CommandDTO_t first = with_sequence(test_unsupported_output_command, 710U + index);
+        const CommandDTO_t refused = xyz_move_to(720U + index, refusal->x_um, refusal->speed_um_per_s);
+        const CommandDTO_t behind = xyz_move_to(730U + index, 2000, 1000U);
+        script_read(0U, osOK, &first);
+        script_read(1U, osOK, &refused);
+        script_read(2U, osOK, &behind);
+        script_read(3U, osErrorResource, NULL);
+        test_block_when_empty = 1U;
+        expect_u32((uint32_t)run_motion_task_until_scripted_stop(&context), 2U, "the task ends blocked on its flags");
+
+        expect_u32(motion_task_test_get_planner_call_count(), 1U, refusal->name);
+        expect_u32(test_receive_script_position, 4U, "the refusal read the command queue up to its end");
+        expect_u32(test_result_count, 1U, "only the refused command is answered; the command behind it is dropped");
+        expect_result_at(0U, 720U + index, refusal->expected_code, refusal->name);
+        expect_u32(test_discard_calls, 1U, "the unread results are discarded once");
+        expect_u32(test_discarded_results, 1U, "the answer of the earlier command was erased");
+        expect_u32(test_generator_all_halts, 1U, "every generator instance is halted once");
+        expect_u32(test_generator_all_resumes, 1U, "every generator instance is restarted once");
+        expect_u32(gen_print.halts, 1U, "the printing instance is halted");
+        expect_u32(gen_print.resumes, 1U, "the printing instance is reset");
+        expect_u32(gen_print.busy, 0U, "the printing stream is empty after the reset");
+        expect_u32(queued_blocks(&test_plan_buffer), 0U, "the printing queue is emptied");
+        expect_u32(cancelled_blocks(&test_plan_buffer), 1U, "the printing block was cancelled");
+        expect_u32(queued_blocks(&gen_x.queue), 0U, "the queue of X is emptied");
+        expect_u32(cancelled_blocks(&gen_x.queue), 1U, "the X block was cancelled");
+        for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+            expect_u32(fake_axes[axis].stop_requests, 2U, "the pulses are stopped at once and again by the STOP part");
+            expect_u32(fake_axes[axis].timing_peak_resets, 1U, "the STOP part ran for every axis");
+        }
+        expect_u32(test_block_ready_notifications, 0U, "a refusal wakes no generator");
+        expect_u32(context.machine_state.homed_axes_mask, refusal->homed_axes_mask, "the refusal changes no homing");
+        /* Like after STOP: a homed axis continues from the magnitude of its scale; with nothing homed the planned
+         * position is left alone. */
+        const uint8_t homed = refusal->homed_axes_mask != 0U ? 1U : 0U;
+        expect_i64(context.machine_state.position_um[0], homed != 0U ? 1500 : 0, "X position after the refusal");
+        expect_i64(context.machine_state.position_um[1], homed != 0U ? 700 : 0, "Y position after the refusal");
+        expect_i64(context.machine_state.position_um[2], homed != 0U ? 300 : 0, "Z position after the refusal");
+    }
+}
+
+static void test_planner_refusal_restores_only_homed_axes_from_the_scale(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.homed_axes_mask = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK;
+    set_test_scale_readings(-2500, 700, 300);
+    const CommandDTO_t refused = xyz_move_to(740U, 100001, 1000U);
+    run_commands(&context, &refused, 1U);
+
+    expect_result_at(0U, 740U, TEST_ERROR_PLANNER_OUT_OF_RANGE, "the move is refused by the planner");
+    expect_i64(context.machine_state.position_um[0], 2500, "homed X follows the magnitude of its scale");
+    expect_i64(context.machine_state.position_um[1], 0, "unhomed Y keeps its planned position");
+    expect_i64(context.machine_state.position_um[2], 300, "homed Z follows its scale");
+}
+
+typedef struct {
+    const char *name;
+    /* Blocks put into the printing queue before the command. */
+    uint32_t printing_blocks;
+    uint8_t x_stream_busy;
+    uint8_t print_halted;
+    int32_t x_um;
+    uint32_t speed_um_per_s;
+    /* 1 when the answer is DONE with `code`, 0 when it is ERROR. */
+    uint8_t answer_is_done;
+    uint16_t code;
+} TestNoCleanupCase_t;
+
+static const TestNoCleanupCase_t test_no_cleanup_cases[] = {
+    {"no movement", 1U, 0U, 0U, 0, 1000U, 1U, TEST_DONE_ALREADY_AT_TARGET},
+    {"an axis stream is busy", 1U, 1U, 0U, 1000, 1000U, 0U, TEST_ERROR_AXIS_BUSY},
+    {"the printing stream is halted", 1U, 0U, 1U, 1000, 1000U, 0U, TEST_ERROR_STREAM_HALTED},
+    {"the plan buffer is full", PLAN_BUFFER_CAPACITY, 0U, 0U, 1000, 1000U, 0U, TEST_ERROR_PLAN_QUEUE_FULL},
+};
+
+/* A move that needs no planner correction, or that MotionTask itself refuses, answers only itself: nothing is halted,
+ * emptied or dropped, and the commands behind it are still served. */
+static void test_other_move_outcomes_do_not_stop_or_empty_anything(void) {
+    for (uint32_t index = 0U; index < sizeof(test_no_cleanup_cases) / sizeof(test_no_cleanup_cases[0]); ++index) {
+        const TestNoCleanupCase_t *test_case = &test_no_cleanup_cases[index];
+        reset_receive_script();
+        MotionTaskContext_t context = valid_motion_context();
+        set_test_scale_readings(-1500, 700, -300);
+        const MotionPlanBlock_t pending = {.sequence = 90U};
+        for (uint32_t block = 0U; block < test_case->printing_blocks; ++block) {
+            expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending), PLAN_BUFFER_STATUS_OK, "a printing block waits");
+        }
+        expect_u32(plan_buffer_try_push(&gen_y.queue, &pending), PLAN_BUFFER_STATUS_OK, "a Y block waits");
+        gen_x.busy = test_case->x_stream_busy;
+        gen_print.halted = test_case->print_halted;
+
+        const CommandDTO_t before = with_sequence(test_unsupported_output_command, 810U + index);
+        const CommandDTO_t move = xyz_move_to(820U + index, test_case->x_um, test_case->speed_um_per_s);
+        const CommandDTO_t behind = with_sequence(test_unsupported_output_command, 830U + index);
+        script_read(0U, osOK, &before);
+        script_read(1U, osOK, &move);
+        script_read(2U, osOK, &behind);
+        test_block_when_empty = 1U;
+        expect_u32((uint32_t)run_motion_task_until_scripted_stop(&context), 2U, "the task ends blocked on its flags");
+
+        expect_u32(test_result_count, 3U, test_case->name);
+        expect_result_at(0U, 810U + index, TEST_ERROR_NOT_SUPPORTED, "the earlier answer stays unread");
+        if (test_case->answer_is_done != 0U) {
+            expect_done_at(1U, 820U + index, test_case->code, test_case->name);
+        } else {
+            expect_result_at(1U, 820U + index, test_case->code, test_case->name);
+        }
+        expect_result_at(2U, 830U + index, TEST_ERROR_NOT_SUPPORTED, "the command behind the move is still served");
+        expect_u32(test_discard_calls, 0U, "no result is discarded");
+        expect_u32(test_generator_all_halts, 0U, "no generator is halted");
+        expect_u32(test_generator_all_resumes, 0U, "no generator is restarted");
+        expect_u32(queued_blocks(&test_plan_buffer), test_case->printing_blocks, "the printing queue keeps its blocks");
+        expect_u32(cancelled_blocks(&test_plan_buffer), 0U, "no printing block is cancelled");
+        expect_u32(queued_blocks(&gen_y.queue), 1U, "the queue of Y keeps its block");
+        expect_u32(cancelled_blocks(&gen_y.queue), 0U, "no Y block is cancelled");
+        for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+            expect_u32(fake_axes[axis].stop_requests, 0U, "no axis is stopped");
+            expect_u32(fake_axes[axis].timing_peak_resets, 0U, "the STOP part did not run");
+        }
+        for (uint32_t axis = 0U; axis < (uint32_t)MOTION_PLANNER_AXIS_COUNT; ++axis) {
+            expect_i64(context.machine_state.position_um[axis], 0, "the planned position is not taken from the scale");
+        }
+    }
+}
 
 static void test_move_is_refused_while_the_printing_stream_is_halted(void) {
     reset_receive_script();
@@ -4471,9 +4763,9 @@ static void test_stop_waits_for_the_reset_count_not_the_halt_flag(void) {
     expect_u32(gen_print.reset_count, 1U, "the printing instance was reset once");
 }
 
-/* A printing instance whose feeder was never built stays halted for good and is never reset: it neither refuses the
- * commands nor makes STOP wait. */
-static void test_not_ready_print_instance_refuses_nothing(void) {
+/* A printing instance whose feeder was never built stays halted for good and is never reset: it does not refuse HOME and
+ * CALIBRATE and does not make STOP wait, but a move is refused, because nothing would ever play its block. */
+static void test_not_ready_print_instance_refuses_only_moves(void) {
     /* HOME of X. */
     reset_receive_script();
     MotionTaskContext_t context = valid_motion_context();
@@ -4506,12 +4798,13 @@ static void test_not_ready_print_instance_refuses_nothing(void) {
     const CommandDTO_t move = xyz_move_to(722U, 1000, 1000U);
     run_commands(&context, &move, 1U);
     expect_u32(test_result_count, 1U, "the move is answered once");
-    expect_done_at(0U, 722U, COMMAND_DONE_ACCEPTED, "a move is accepted although the printing instance is not ready");
-    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
-    expect_u32(test_block_ready_notifications, 1U, "the generator is woken for the move");
-    expect_i64(context.machine_state.position_um[0], 1000, "the planned X position moves");
+    expect_result_at(0U, 722U, TEST_ERROR_NOT_CONFIGURED, "a move is refused while the printing instance is not ready");
+    expect_u32(queued_blocks(&test_plan_buffer), 0U, "the refused move is not queued");
+    expect_u32(test_block_ready_notifications, 0U, "the generator is not woken for the refused move");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "the refused move is not planned");
+    expect_i64(context.machine_state.position_um[0], 0, "the planned X position stays");
 
-    /* STOP: no wait for a reset that never comes, and the move after it is accepted. */
+    /* STOP: no wait for a reset that never comes; the move after it is refused as before. */
     reset_receive_script();
     context = valid_motion_context();
     gen_print.ready = 0U;
@@ -4528,12 +4821,804 @@ static void test_not_ready_print_instance_refuses_nothing(void) {
     expect_u32(gen_print.halted, 1U, "it stays halted");
     expect_u32(test_result_count, 2U, "STOP and the move are answered");
     expect_done_at(0U, 723U, COMMAND_DONE_ACCEPTED, "STOP is settled without a reset of the instance that is not ready");
-    expect_done_at(1U, 724U, COMMAND_DONE_ACCEPTED, "the move after STOP is accepted");
-    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
-    expect_i64(context.machine_state.position_um[0], 1000, "the move is planned from the reset position");
+    expect_result_at(1U, 724U, TEST_ERROR_NOT_CONFIGURED, "the move after STOP is refused: the instance is still not ready");
+    expect_u32(queued_blocks(&test_plan_buffer), 0U, "the refused move is not queued");
+    expect_i64(context.machine_state.position_um[0], 0, "the planned X position stays");
+
+    /* Not ready and halted at once is still a missing feeder, not a stream that STOP could lift. */
+    reset_receive_script();
+    context = valid_motion_context();
+    gen_print.ready = 0U;
+    gen_print.halted = 1U;
+    const CommandDTO_t halted_move = xyz_move_to(725U, 1000, 1000U);
+    run_commands(&context, &halted_move, 1U);
+    expect_u32(test_result_count, 1U, "the move is answered once");
+    expect_result_at(0U, 725U, TEST_ERROR_NOT_CONFIGURED, "a move is not configured, not halted, without a feeder");
+}
+
+/* ---- Final results of the planned moves: DONE COMPLETED or ERROR STREAM_INTERRUPTED ---- */
+
+#define TEST_DONE_COMPLETED 0x0002U
+#define TEST_ERROR_STREAM_INTERRUPTED 0x0128U
+#define TEST_AXIS_NONE 0xFFU
+#define TEST_FLAG_COMMAND 1U
+#define TEST_FLAG_PROGRESS 2U
+/* Stop causes and the stop reasons of a limit switch, as the client sees them (STEP_GENERATOR_TASK_HALT_CAUSE_*). */
+#define TEST_CAUSE_HALT_CALL 1U
+#define TEST_CAUSE_LIMIT 2U
+#define TEST_CAUSE_GROUP_FAULT 3U
+#define TEST_CAUSE_FEEDER_ERROR 4U
+
+/* Takes every block out of the printing queue into the record. */
+static void record_print_blocks(void) {
+    MotionPlanBlock_t block = {0};
+    while (test_block_record_count < TEST_BLOCK_RECORD_CAPACITY &&
+           plan_buffer_try_pop(&test_plan_buffer, &block) == PLAN_BUFFER_STATUS_OK) {
+        test_block_record_sequences[test_block_record_count] = block.sequence;
+        test_block_record_orders[test_block_record_count] = block.order;
+        ++test_block_record_count;
+    }
+}
+
+static void record_print_blocks_at_read(uint32_t read_index) {
+    (void)read_index;
+    record_print_blocks();
+}
+
+static void record_block(uint32_t sequence, uint32_t order) {
+    test_block_record_sequences[test_block_record_count] = sequence;
+    test_block_record_orders[test_block_record_count] = order;
+    ++test_block_record_count;
+}
+
+/* The order that the block of the move with this sequence carried into the queue. */
+static uint32_t recorded_order_of(uint32_t sequence) {
+    for (uint32_t index = 0U; index < test_block_record_count; ++index) {
+        if (test_block_record_sequences[index] == sequence) {
+            return test_block_record_orders[index];
+        }
+    }
+    ++test_failures;
+    (void)fprintf(stderr, "FAIL: no block was recorded for sequence %lu\n", (unsigned long)sequence);
+    return 0U;
+}
+
+static void apply_progress_step(uint32_t wait_index) {
+    record_print_blocks();
+    if (wait_index >= test_progress_step_count) {
+        return;
+    }
+    const TestProgressStep_t *step = &test_progress_steps[wait_index];
+    test_progress = (StepGeneratorProgress_t){
+        .generation = step->generation,
+        .played_blocks = step->played_blocks,
+        .played_order = step->played_sequence != 0U ? recorded_order_of(step->played_sequence) : 0U,
+        .stop_resolved = step->stop_resolved,
+        .has_unplayed = step->unplayed_sequence != 0U ? 1U : 0U,
+        .unplayed_order = step->unplayed_sequence != 0U ? recorded_order_of(step->unplayed_sequence) : 0U,
+        .halt_cause = step->halt_cause,
+        .halt_axis = step->halt_axis,
+        .halt_detail = step->halt_detail,
+    };
+}
+
+/* The stream reports each step when MotionTask sleeps for the first, second, ... time, and wakes it with the progress
+ * flag. The blocks that the moves put into the printing queue are recorded on every read and every sleep. */
+static void script_progress_steps(const TestProgressStep_t *steps, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        test_progress_steps[index] = steps[index];
+        test_flags_wait_script[index] = TEST_FLAG_PROGRESS;
+    }
+    test_progress_step_count = count;
+    test_flags_wait_script_count = count;
+    test_flags_wait_hook = apply_progress_step;
+    test_receive_hook = record_print_blocks_at_read;
+}
+
+/* Runs until the task sleeps on its flags with nothing left to do; returns the jump code of that end. */
+static int run_until_blocked(MotionTaskContext_t *context) {
+    test_block_when_empty = 1U;
+    return run_motion_task_until_scripted_stop(context);
+}
+
+static void script_moves(const CommandDTO_t *moves, uint32_t count) {
+    for (uint32_t index = 0U; index < count; ++index) {
+        script_read(index, osOK, &moves[index]);
+    }
+    /* The read after the commands finds the queue empty. */
+    script_read(count, osErrorResource, NULL);
+}
+
+static void expect_completed_at(uint32_t index, uint32_t sequence, const char *message) {
+    expect_done_at(index, sequence, TEST_DONE_COMPLETED, message);
+    if (index < test_result_count) {
+        expect_u32(test_results[index].cause, 0U, message);
+        expect_u32(test_results[index].axis, TEST_AXIS_NONE, message);
+        expect_u32(test_results[index].detail, 0U, message);
+    }
+}
+
+static void expect_interrupted_at(
+    uint32_t index,
+    uint32_t sequence,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail,
+    const char *message
+) {
+    expect_result_at(index, sequence, TEST_ERROR_STREAM_INTERRUPTED, message);
+    if (index < test_result_count) {
+        expect_u32(test_results[index].cause, cause, message);
+        expect_u32(test_results[index].axis, axis, message);
+        expect_u32(test_results[index].detail, detail, message);
+    }
+}
+
+static void test_accepted_moves_get_consecutive_block_orders(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(800U, 1000, 1000U),
+        xyz_move_to(801U, 2000, 1000U),
+        xyz_move_to(802U, 1000, 1000U),
+    };
+    run_commands(&context, moves, 3U);
+    record_print_blocks();
+
+    expect_u32(test_result_count, 3U, "each move is answered once");
+    expect_u32(test_block_record_count, 3U, "each accepted move queued one block");
+    expect_u32(test_block_record_sequences[0], 800U, "the first block is the first move");
+    expect_u32(test_block_record_sequences[1], 801U, "the second block is the second move");
+    expect_u32(test_block_record_sequences[2], 802U, "the third block is the third move");
+    /* The tracker keeps counting across runs, so only the distance between the orders is fixed. */
+    expect_u32(test_block_record_orders[0] != 0U ? 1U : 0U, 1U, "order 0 never names a block");
+    expect_u32(test_block_record_orders[1], test_block_record_orders[0] + 1U, "the second block has the next order");
+    expect_u32(test_block_record_orders[2], test_block_record_orders[0] + 2U, "the third block has the next order");
+}
+
+static void test_played_moves_are_answered_completed_in_order(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(810U, 1000, 1000U),
+        xyz_move_to(811U, 2000, 1000U),
+        xyz_move_to(812U, 1000, 1000U),
+    };
+    script_moves(moves, 3U);
+    const TestProgressStep_t steps[] = {
+        /* No block played yet: the played order means nothing. */
+        {.played_blocks = 0U, .played_sequence = 812U},
+        {.played_blocks = 2U, .played_sequence = 811U},
+        {.played_blocks = 3U, .played_sequence = 812U},
+    };
+    script_progress_steps(steps, 3U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 6U, "three acceptances and three completions");
+    expect_done_at(0U, 810U, COMMAND_DONE_ACCEPTED, "the first move is accepted");
+    expect_done_at(1U, 811U, COMMAND_DONE_ACCEPTED, "the second move is accepted");
+    expect_done_at(2U, 812U, COMMAND_DONE_ACCEPTED, "the third move is accepted");
+    expect_completed_at(3U, 810U, "the first played move is completed first");
+    expect_completed_at(4U, 811U, "the second played move is completed next");
+    expect_completed_at(5U, 812U, "the third move is completed once it has been played");
+}
+
+static void test_limit_stop_answers_the_first_unplayed_move_with_its_details(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(820U, 1000, 1000U),
+        xyz_move_to(821U, 2000, 1000U),
+        xyz_move_to(822U, 1000, 1000U),
+    };
+    script_moves(moves, 3U);
+    /* The limit switch of Z (axis 2) stopped the stream with the reason END_LIMIT (3) after the first block. The same
+     * snapshot is seen again by the next wake-up. */
+    const TestProgressStep_t stop = {
+        .played_blocks = 1U,
+        .played_sequence = 820U,
+        .stop_resolved = 1U,
+        .unplayed_sequence = 821U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT,
+        .halt_axis = 2U,
+        .halt_detail = 3U,
+    };
+    const TestProgressStep_t steps[] = {stop, stop};
+    script_progress_steps(steps, 2U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 5U, "three acceptances, one completion and one error: the stop is told once");
+    expect_completed_at(3U, 820U, "the block played before the stop is completed");
+    expect_interrupted_at(
+        4U,
+        821U,
+        TEST_CAUSE_LIMIT,
+        2U,
+        3U,
+        "the first unplayed move gets the stop cause, the blamed axis and the detail"
+    );
+}
+
+static void test_stop_names_the_unplayed_block_not_the_oldest_waiting_move(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(830U, 1000, 1000U),
+        xyz_move_to(831U, 2000, 1000U),
+        xyz_move_to(832U, 1000, 1000U),
+    };
+    script_moves(moves, 3U);
+    const TestProgressStep_t steps[] = {{
+        .played_blocks = 1U,
+        .played_sequence = 830U,
+        .stop_resolved = 1U,
+        .unplayed_sequence = 832U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT,
+        .halt_axis = 1U,
+        .halt_detail = 4U,
+    }};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 5U, "three acceptances, one completion and one error");
+    expect_completed_at(3U, 830U, "the played move is completed");
+    expect_interrupted_at(4U, 832U, TEST_CAUSE_GROUP_FAULT, 1U, 4U, "the move of the unplayed block is interrupted");
+}
+
+static void test_stop_without_an_unplayed_block_answers_the_oldest_waiting_move(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {xyz_move_to(840U, 1000, 1000U), xyz_move_to(841U, 2000, 1000U)};
+    script_moves(moves, 2U);
+    /* Axis 0 is X: it must stay 0 and not become "no axis". */
+    const TestProgressStep_t steps[] = {{
+        .stop_resolved = 1U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT,
+        .halt_axis = 0U,
+        .halt_detail = 1U,
+    }};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 3U, "two acceptances and one error");
+    expect_interrupted_at(2U, 840U, TEST_CAUSE_GROUP_FAULT, 0U, 1U, "the oldest move is interrupted, with X as the axis");
+}
+
+static void test_halt_call_stop_is_not_reported_but_played_moves_still_are(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {xyz_move_to(850U, 1000, 1000U), xyz_move_to(851U, 2000, 1000U)};
+    script_moves(moves, 2U);
+    const TestProgressStep_t steps[] = {{
+        .played_blocks = 1U,
+        .played_sequence = 850U,
+        .stop_resolved = 1U,
+        .unplayed_sequence = 851U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL,
+        .halt_axis = STEP_GENERATOR_TASK_NO_AXIS,
+    }};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 3U, "two acceptances and one completion; the halt call gets no error");
+    expect_completed_at(2U, 850U, "the move played before the halt call is completed");
+}
+
+static void test_stop_without_a_blamed_axis_reports_axis_none(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t move = xyz_move_to(860U, 1000, 1000U);
+    script_moves(&move, 1U);
+    const TestProgressStep_t steps[] = {{
+        .stop_resolved = 1U,
+        .unplayed_sequence = 860U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        .halt_axis = STEP_GENERATOR_TASK_NO_AXIS,
+        .halt_detail = 7U,
+    }};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 2U, "one acceptance and one error");
+    expect_interrupted_at(1U, 860U, TEST_CAUSE_FEEDER_ERROR, TEST_AXIS_NONE, 7U, "no blamed axis is sent as 0xFF");
+}
+
+static void test_a_new_generation_drops_the_waiting_moves_without_answers(void) {
+    /* A progress that would complete the waiting moves. */
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    test_progress.generation = 5U;
+    const CommandDTO_t moves[] = {
+        xyz_move_to(870U, 1000, 1000U),
+        xyz_move_to(871U, 2000, 1000U),
+        xyz_move_to(872U, 3000, 1000U),
+    };
+    /* 872 arrives only after the new generation has been seen. */
+    script_read(0U, osOK, &moves[0]);
+    script_read(1U, osOK, &moves[1]);
+    script_read(2U, osErrorResource, NULL);
+    script_read(3U, osOK, &moves[2]);
+    const TestProgressStep_t completing[] = {
+        {.generation = 6U, .played_blocks = 2U, .played_sequence = 871U},
+        {.generation = 6U, .played_blocks = 1U, .played_sequence = 872U},
+    };
+    script_progress_steps(completing, 2U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 4U, "three acceptances and one completion");
+    expect_completed_at(3U, 872U, "only the move accepted after the generation change is completed");
+
+    /* A progress that would report an interruption. */
+    reset_receive_script();
+    context = valid_motion_context();
+    test_progress.generation = 5U;
+    const CommandDTO_t pair[] = {xyz_move_to(873U, 1000, 1000U), xyz_move_to(874U, 2000, 1000U)};
+    script_moves(pair, 2U);
+    const TestProgressStep_t interrupting[] = {{
+        .generation = 6U,
+        .stop_resolved = 1U,
+        .unplayed_sequence = 873U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT,
+        .halt_axis = 1U,
+        .halt_detail = 2U,
+    }};
+    script_progress_steps(interrupting, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    expect_u32(test_result_count, 2U, "the moves of a cancelled stream get no error");
+}
+
+static void test_stop_drops_the_waiting_moves_without_answers(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {xyz_move_to(880U, 1000, 1000U), {.sequence = 881U, .code = COMMAND_CODE_STOP}};
+    script_moves(commands, 2U);
+    /* The stream of the generation that STOP leaves reports the block of the dropped move as played. */
+    const TestProgressStep_t steps[] = {{.played_blocks = 1U, .played_sequence = 880U}};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_discarded_results, 1U, "STOP erased the acceptance of the move");
+    expect_u32(test_result_count, 1U, "only the answer of STOP is left: the dropped move is not completed");
+    expect_done_at(0U, 881U, COMMAND_DONE_ACCEPTED, "STOP is accepted");
+}
+
+static void test_a_started_task_has_no_waiting_moves(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t move = xyz_move_to(890U, 1000, 1000U);
+    run_commands(&context, &move, 1U);
+    record_print_blocks();
+    const uint32_t order = recorded_order_of(890U);
+    expect_u32(test_result_count, 1U, "the first run accepted the move");
+
+    /* The next start knows nothing of the move; the stream of the same generation reports its block as played. */
+    reset_receive_script();
+    context = valid_motion_context();
+    record_block(890U, order);
+    const TestProgressStep_t steps[] = {{.played_blocks = 1U, .played_sequence = 890U}};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    expect_u32(test_result_count, 0U, "a move of the earlier run is not completed after the restart");
+}
+
+static void test_moves_that_are_not_queued_are_not_tracked(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(900U, 1000, 1000U),
+        /* To where the planner already is. */
+        xyz_move_to(901U, 1000, 1000U),
+        xyz_move_to(903U, 2000, 1000U),
+        /* Beyond the travel: stops and empties everything. */
+        xyz_move_to(902U, 100001, 1000U),
+        xyz_move_to(904U, 3000, 1000U),
+    };
+    /* Reads 0 to 3 are the first four moves. Read 4 ends the emptying of the command queue by the refusal. Read 5 finds
+     * the queue empty, so the task sleeps (wait 0) and the stream reports the blocks of the dropped moves. Read 6 is
+     * the move after the refusal, read 7 sends the task to sleep again (wait 1). */
+    for (uint32_t index = 0U; index < 4U; ++index) {
+        script_read(index, osOK, &moves[index]);
+    }
+    script_read(4U, osErrorResource, NULL);
+    script_read(5U, osErrorResource, NULL);
+    script_read(6U, osOK, &moves[4]);
+    script_read(7U, osErrorResource, NULL);
+    const TestProgressStep_t steps[] = {
+        /* The block of 903 was dropped by the refusal: nothing is waiting for it. */
+        {.played_blocks = 2U, .played_sequence = 903U},
+        {.played_blocks = 1U, .played_sequence = 904U},
+    };
+    script_progress_steps(steps, 2U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(motion_task_test_get_planner_call_count(), 5U, "every move reached the planner");
+    expect_u32(test_block_record_count, 3U, "only 900, 903 and 904 queued a block");
+    expect_u32(test_generator_all_halts, 1U, "the refusal halted every generator once");
+    expect_u32(test_discard_calls, 1U, "the refusal discarded the unread results once");
+    expect_u32(test_discarded_results, 3U, "the answers of 900, 901 and 903 were erased");
+    expect_u32(test_result_count, 3U, "the refused move, the move after it and its completion");
+    expect_result_at(0U, 902U, TEST_ERROR_PLANNER_OUT_OF_RANGE, "a move beyond the travel is refused, and alone answered");
+    expect_done_at(1U, 904U, COMMAND_DONE_ACCEPTED, "the move after the refusal is accepted");
+    /* The refusal dropped the waiting moves: 903 gets no completion, only 904 does. */
+    expect_completed_at(2U, 904U, "the move after the refusal is completed; the move dropped by it is not");
+    expect_u32(
+        test_block_record_orders[1],
+        test_block_record_orders[0] + 1U,
+        "the move to the planned position queued no block and took no order"
+    );
+    expect_u32(
+        test_block_record_orders[2],
+        test_block_record_orders[1] + 1U,
+        "the refused move took no order, and the numbering goes on after the refusal"
+    );
+}
+
+static uint32_t test_queued_after_refusal;
+static uint32_t test_cancelled_after_refusal;
+
+/* Notes the first two blocks without taking them out of the queue (a fresh queue fills from entry 0), so that the
+ * refusal of the third move is what empties it; then reads the queue at read 5, the first read after the refusal has
+ * emptied everything (reads 3 and 4 are the emptying of the command queue). */
+static void watch_refusal_at_reads_2_and_5(uint32_t read_index) {
+    if (read_index == 2U) {
+        record_block(test_plan_buffer_entries[0].sequence, test_plan_buffer_entries[0].order);
+        record_block(test_plan_buffer_entries[1].sequence, test_plan_buffer_entries[1].order);
+    } else if (read_index == 5U) {
+        test_queued_after_refusal = queued_blocks(&test_plan_buffer);
+        test_cancelled_after_refusal = cancelled_blocks(&test_plan_buffer);
+    }
+}
+
+static void test_planner_refusal_drops_the_waiting_moves_and_the_next_move_completes(void) {
+    reset_receive_script();
+    test_queued_after_refusal = UINT32_MAX;
+    test_cancelled_after_refusal = UINT32_MAX;
+    MotionTaskContext_t context = valid_motion_context();
+    /* The third move is faster than the axis; the fourth goes to the same target at an allowed speed, and arrives only
+     * after the stream has reported the blocks of the first two. */
+    const CommandDTO_t moves[] = {
+        xyz_move_to(1100U, 1000, 1000U),
+        xyz_move_to(1101U, 2000, 1000U),
+        xyz_move_to(1102U, 3000, 200000U),
+        xyz_move_to(1103U, 3000, 1000U),
+        /* Waits in the command queue behind the refusal, which drops it unanswered. */
+        xyz_move_to(1104U, 1000, 1000U),
+    };
+    script_read(0U, osOK, &moves[0]);
+    script_read(1U, osOK, &moves[1]);
+    script_read(2U, osOK, &moves[2]);
+    script_read(3U, osOK, &moves[4]);
+    /* Ends the emptying of the command queue by the refusal. */
+    script_read(4U, osErrorResource, NULL);
+    /* The queue is empty: the task sleeps (wait 0) and the stream reports the blocks of the dropped moves. */
+    script_read(5U, osErrorResource, NULL);
+    script_read(6U, osOK, &moves[3]);
+    script_read(7U, osErrorResource, NULL);
+    const TestProgressStep_t steps[] = {
+        /* The blocks of both first moves are played. */
+        {.played_blocks = 2U, .played_sequence = 1101U},
+        {.played_blocks = 1U, .played_sequence = 1103U},
+    };
+    script_progress_steps(steps, 2U);
+    test_receive_hook = watch_refusal_at_reads_2_and_5;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_block_record_count, 3U, "two blocks were queued before the refusal and one after it");
+    expect_u32(test_block_record_sequences[0], 1100U, "the first queued block is the first move");
+    expect_u32(test_block_record_sequences[1], 1101U, "the second queued block is the second move");
+    expect_u32(test_queued_after_refusal, 0U, "the refusal emptied the plan buffer");
+    expect_u32(test_cancelled_after_refusal, 2U, "the refusal cancelled the two queued blocks");
+    expect_u32(test_generator_all_halts, 1U, "the refusal halted every generator once");
+    expect_u32(test_generator_all_resumes, 1U, "the refusal restarted the generators once the axes were at rest");
+    expect_u32(motion_task_test_get_planner_call_count(), 4U, "the move behind the refusal was dropped, not planned");
+    expect_u32(test_discard_calls, 1U, "the refusal discarded the unread results once");
+    expect_u32(test_discarded_results, 2U, "the answers of the two accepted moves were erased");
+    expect_u32(test_result_count, 3U, "the refused move, the move after it and its completion; nothing else");
+    expect_result_at(0U, 1102U, TEST_ERROR_PLANNER_AXIS_SPEED_LIMIT, "the refused move gets the planner code, alone");
+    expect_done_at(1U, 1103U, COMMAND_DONE_ACCEPTED, "the report of the dropped blocks gave no completion before it");
+    expect_completed_at(2U, 1103U, "the move accepted after the refusal is completed by its own order");
+    expect_u32(
+        recorded_order_of(1103U) != recorded_order_of(1101U) ? 1U : 0U,
+        1U,
+        "the new block has an order of its own"
+    );
+    expect_i64(context.machine_state.position_um[0], 3000, "the planned position follows the accepted moves only");
+}
+
+static void test_full_tracker_refuses_the_next_move(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const uint32_t capacity = MOVE_RESULT_TRACKER_CAPACITY;
+    for (uint32_t index = 0U; index <= capacity; ++index) {
+        /* Alternating targets, so that every move changes the planned position. */
+        const CommandDTO_t move = xyz_move_to(1000U + index, index % 2U == 0U ? 1000 : 2000, 1000U);
+        script_read(index, osOK, &move);
+    }
+    script_read(capacity + 1U, osErrorResource, NULL);
+    /* After the results have been given there is room again. */
+    const CommandDTO_t later = xyz_move_to(1000U + capacity + 1U, 3000, 1000U);
+    script_read(capacity + 2U, osOK, &later);
+    const TestProgressStep_t steps[] = {{.played_blocks = capacity, .played_sequence = 1000U + capacity - 1U}};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    record_print_blocks();
+
+    expect_u32(test_result_count, 2U * capacity + 2U, "every move is answered; the played ones twice");
+    for (uint32_t index = 0U; index < capacity; ++index) {
+        expect_done_at(index, 1000U + index, COMMAND_DONE_ACCEPTED, "a move that fits is accepted");
+    }
+    expect_result_at(capacity, 1000U + capacity, TEST_ERROR_PLAN_QUEUE_FULL, "the move beyond the capacity is refused");
+    expect_u32(test_results[capacity].cause, 0U, "a refusal has no stop cause");
+    expect_u32(test_results[capacity].axis, TEST_AXIS_NONE, "a refusal blames no axis");
+    expect_u32(test_results[capacity].detail, 0U, "a refusal has no detail");
+    for (uint32_t index = 0U; index < capacity; ++index) {
+        expect_completed_at(capacity + 1U + index, 1000U + index, "the waiting moves are completed in order");
+    }
+    expect_done_at(2U * capacity + 1U, 1000U + capacity + 1U, COMMAND_DONE_ACCEPTED, "a move fits once results are given");
+
+    expect_u32(test_block_record_count, capacity + 1U, "the refused move queued no block");
+    for (uint32_t index = 1U; index < test_block_record_count; ++index) {
+        expect_u32(
+            test_block_record_orders[index],
+            test_block_record_orders[index - 1U] + 1U,
+            "the orders follow each other; the refused move took none"
+        );
+    }
+    expect_u32(test_block_ready_notifications, capacity + 1U, "the generator is not woken for the refused move");
+}
+
+static void drain_at_read_2(uint32_t read_index) {
+    if (read_index == 2U) {
+        record_print_blocks();
+    }
+}
+
+static void test_a_block_that_does_not_fit_takes_its_move_back_from_the_tracker(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    /* One place is left in the plan buffer. */
+    for (uint32_t index = 1U; index < PLAN_BUFFER_CAPACITY; ++index) {
+        const MotionPlanBlock_t filler = {.sequence = index};
+        expect_u32(plan_buffer_try_push(&test_plan_buffer, &filler), PLAN_BUFFER_STATUS_OK, "the filler is queued");
+    }
+    const CommandDTO_t moves[] = {
+        xyz_move_to(910U, 1000, 1000U),
+        /* Finds the plan buffer full. */
+        xyz_move_to(911U, 2000, 1000U),
+        /* Fits after the buffer was emptied before the third read. */
+        xyz_move_to(912U, 2000, 1000U),
+    };
+    script_moves(moves, 3U);
+    const TestProgressStep_t steps[] = {{.played_blocks = 2U, .played_sequence = 912U}};
+    script_progress_steps(steps, 1U);
+    test_receive_hook = drain_at_read_2;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 5U, "three answers and two completions");
+    expect_done_at(0U, 910U, COMMAND_DONE_ACCEPTED, "the move that fills the buffer is accepted");
+    expect_result_at(1U, 911U, TEST_ERROR_PLAN_QUEUE_FULL, "the move that finds the buffer full is refused");
+    expect_done_at(2U, 912U, COMMAND_DONE_ACCEPTED, "the next move is accepted");
+    expect_completed_at(3U, 910U, "the first accepted move is completed");
+    expect_completed_at(4U, 912U, "the refused move is not completed: it is no longer waiting");
+    expect_u32(
+        recorded_order_of(912U),
+        recorded_order_of(910U) + 1U,
+        "the refused move gave its order back, so the next block carries the following one"
+    );
+    expect_i64(context.machine_state.position_um[0], 2000, "the planned position follows the accepted moves only");
+}
+
+static void make_print_instance_ready_at_read_1(uint32_t read_index) {
+    if (read_index == 1U) {
+        gen_print.ready = 1U;
+    }
+}
+
+static void test_move_without_a_feeder_is_refused_before_it_is_tracked(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    gen_print.ready = 0U;
+    const CommandDTO_t moves[] = {xyz_move_to(920U, 1000, 1000U), xyz_move_to(921U, 1000, 1000U)};
+    script_moves(moves, 2U);
+    const TestProgressStep_t steps[] = {{.played_blocks = 1U, .played_sequence = 921U}};
+    script_progress_steps(steps, 1U);
+    /* The feeder is built before the second move arrives; the blocks are recorded by the hook of the wait. */
+    test_receive_hook = make_print_instance_ready_at_read_1;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 3U, "two answers and one completion");
+    expect_result_at(0U, 920U, TEST_ERROR_NOT_CONFIGURED, "a move is not configured while the feeder is not built");
+    expect_done_at(1U, 921U, COMMAND_DONE_ACCEPTED, "the move after the feeder is built is accepted");
+    expect_completed_at(2U, 921U, "only the accepted move is completed");
+    expect_u32(motion_task_test_get_planner_call_count(), 1U, "the refused move was not planned");
+}
+
+/* ---- Wake-up of MotionTask ---- */
+
+/* This must be the first test of the run: the task has not been started yet, as it has not in the firmware before the
+ * scheduler runs. */
+static void test_notify_before_the_task_started_does_nothing(void) {
+    reset_receive_script();
+    motion_task_notify_command();
+    motion_task_notify_progress();
+    expect_u32(test_flags_set_calls, 0U, "no thread flag is set before the task has started");
+}
+
+static void test_notify_sets_the_flag_of_the_task_thread(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    expect_u32(test_flags_set_calls, 0U, "starting the task sets no flag");
+
+    motion_task_notify_command();
+    expect_u32(test_flags_set_calls, 1U, "a command notification sets one flag");
+    expect_u32((uint32_t)(test_flags_set_thread == &test_thread_marker), 1U, "the flag goes to the task thread");
+    expect_u32(test_flags_set_flags, TEST_FLAG_COMMAND, "a command notification sets the command flag");
+
+    motion_task_notify_progress();
+    expect_u32(test_flags_set_calls, 2U, "a progress notification sets one flag");
+    expect_u32(test_flags_set_flags, TEST_FLAG_PROGRESS, "a progress notification sets the progress flag");
+}
+
+static void test_the_task_registers_its_listeners_that_set_the_flags(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    expect_u32((uint32_t)(test_put_listener == motion_task_notify_command), 1U, "the command queue wakes the task");
+    expect_u32(
+        (uint32_t)(test_progress_listener == motion_task_notify_progress),
+        1U,
+        "the step generator wakes the task with progress"
+    );
+    expect_u32(test_last_wait_flags, TEST_FLAG_COMMAND | TEST_FLAG_PROGRESS, "the task waits for both flags");
+    expect_u32(test_last_wait_options, osFlagsWaitAny, "either flag wakes the task");
+
+    test_put_listener();
+    expect_u32(test_flags_set_flags, TEST_FLAG_COMMAND, "a queued command sets the command flag");
+    test_progress_listener();
+    expect_u32(test_flags_set_flags, TEST_FLAG_PROGRESS, "progress of the stream sets the progress flag");
+    expect_u32(test_flags_set_calls, 2U, "each listener set one flag");
+}
+
+static void test_notify_does_nothing_when_the_task_has_no_thread_id(void) {
+    reset_receive_script();
+    test_thread_id_is_null = 1U;
+    MotionTaskContext_t context = valid_motion_context();
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    motion_task_notify_command();
+    motion_task_notify_progress();
+    expect_u32(test_flags_set_calls, 0U, "no flag is set for a task without a thread id");
+}
+
+/* ---- The loop of MotionTask ---- */
+
+static void jump_at_wait_2(uint32_t wait_index) {
+    if (wait_index == 2U) {
+        longjmp(test_jump_buffer, 2);
+    }
+}
+
+static void jump_at_wait_1(uint32_t wait_index) {
+    if (wait_index == 1U) {
+        longjmp(test_jump_buffer, 2);
+    }
+}
+
+static void test_queue_read_error_is_counted_and_delays_the_retry(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    script_read(0U, osErrorParameter, NULL);
+    test_jump_on_delay = 1U;
+    expect_u32((uint32_t)run_until_blocked(&context), 3U, "a read error ends in the retry delay");
+
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queue_receive_errors, 1U, "the read error is counted");
+    expect_u32(diagnostics.commands_dequeued, 0U, "a read error dequeues nothing");
+    expect_u32(test_delay_calls, 1U, "the retry is delayed once");
+    expect_u32(test_last_delay_ms, MOTION_TASK_ERROR_RETRY_DELAY_MS, "the delay is the retry delay");
+    expect_u32(test_flags_wait_calls, 0U, "the task does not sleep on its flags after a read error");
+}
+
+static void test_wait_is_polled_every_millisecond_while_an_axis_homes(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    script_read(0U, osOK, &test_home_x_command);
+    test_flags_wait_hook = jump_at_wait_2;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the test ends the run at the third wait");
+
+    expect_u32(fake_x_bench_starts, 1U, "X started homing");
+    expect_u32(test_flags_wait_calls, 3U, "the task waited three times");
+    expect_u32(test_wait_timeouts[0], 1U, "the first wait is 1 ms while an axis homes");
+    expect_u32(test_wait_timeouts[1], 1U, "the next wait is 1 ms as well");
+    expect_u32(test_last_wait_flags, TEST_FLAG_COMMAND | TEST_FLAG_PROGRESS, "the poll also waits for both flags");
+    expect_u32(test_receive_calls, 4U, "the queue is read for HOME and once before each wait");
+}
+
+static void test_wait_is_unbounded_when_no_axis_is_busy(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_flags_wait_calls, 1U, "the task waited once");
+    expect_u32(test_wait_timeouts[0], osWaitForever, "an idle task waits without a timeout");
+    expect_u32(test_receive_calls, 1U, "the queue was read once, without waiting");
+    expect_u32(test_last_receive_timeout, osWaitForever, "the wait is the one that blocks");
+}
+
+static void test_wait_error_is_counted_and_delays_the_retry(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    test_flags_wait_script[0] = osFlagsErrorParameter;
+    test_flags_wait_script_count = 1U;
+    test_jump_on_delay = 1U;
+    expect_u32((uint32_t)run_until_blocked(&context), 3U, "a failed wait ends in the retry delay");
+
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queue_receive_errors, 1U, "the failed wait is counted as a receive error");
+    expect_u32(test_delay_calls, 1U, "the retry is delayed once");
+    expect_u32(test_last_delay_ms, MOTION_TASK_ERROR_RETRY_DELAY_MS, "the delay is the retry delay");
+    expect_u32(test_receive_calls, 1U, "the queue is not read again before the delay");
+}
+
+static void test_wait_timeout_is_no_error(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    test_flags_wait_script[0] = osFlagsErrorTimeout;
+    test_flags_wait_script_count = 1U;
+    test_flags_wait_hook = jump_at_wait_1;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the test ends the run at the second wait");
+
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queue_receive_errors, 0U, "a timeout of the wait is not a receive error");
+    expect_u32(test_delay_calls, 0U, "a timeout does not delay the task");
+    expect_u32(test_receive_calls, 2U, "the task reads the queue again after the timeout");
+}
+
+static void test_a_woken_wait_reads_the_queue_again(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    test_flags_wait_script[0] = TEST_FLAG_COMMAND;
+    test_flags_wait_script[1] = TEST_FLAG_PROGRESS;
+    test_flags_wait_script_count = 2U;
+    test_flags_wait_hook = jump_at_wait_2;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the test ends the run at the third wait");
+
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.queue_receive_errors, 0U, "a wake-up by a flag is not an error");
+    expect_u32(test_delay_calls, 0U, "a wake-up by a flag does not delay the task");
+    expect_u32(test_receive_calls, 3U, "each wake-up is followed by a read of the queue");
 }
 
 int main(void) {
+    test_notify_before_the_task_started_does_nothing();
+    test_accepted_moves_get_consecutive_block_orders();
+    test_played_moves_are_answered_completed_in_order();
+    test_limit_stop_answers_the_first_unplayed_move_with_its_details();
+    test_stop_names_the_unplayed_block_not_the_oldest_waiting_move();
+    test_stop_without_an_unplayed_block_answers_the_oldest_waiting_move();
+    test_halt_call_stop_is_not_reported_but_played_moves_still_are();
+    test_stop_without_a_blamed_axis_reports_axis_none();
+    test_a_new_generation_drops_the_waiting_moves_without_answers();
+    test_stop_drops_the_waiting_moves_without_answers();
+    test_a_started_task_has_no_waiting_moves();
+    test_moves_that_are_not_queued_are_not_tracked();
+    test_planner_refusal_drops_the_waiting_moves_and_the_next_move_completes();
+    test_full_tracker_refuses_the_next_move();
+    test_a_block_that_does_not_fit_takes_its_move_back_from_the_tracker();
+    test_move_without_a_feeder_is_refused_before_it_is_tracked();
+    test_notify_sets_the_flag_of_the_task_thread();
+    test_the_task_registers_its_listeners_that_set_the_flags();
+    test_notify_does_nothing_when_the_task_has_no_thread_id();
+    test_queue_read_error_is_counted_and_delays_the_retry();
+    test_wait_is_polled_every_millisecond_while_an_axis_homes();
+    test_wait_is_unbounded_when_no_axis_is_busy();
+    test_wait_error_is_counted_and_delays_the_retry();
+    test_wait_timeout_is_no_error();
+    test_a_woken_wait_reads_the_queue_again();
     test_halted_stream_does_not_hide_invalid_axes();
     test_halted_stream_is_reported_before_a_busy_axis();
     test_halted_stream_does_not_hide_unsupported_commands();
@@ -4543,7 +5628,7 @@ int main(void) {
     test_stop_waits_until_the_reset_has_finished();
     test_stop_reports_not_settled_when_the_reset_leaves_the_stream_halted();
     test_stop_waits_for_the_reset_count_not_the_halt_flag();
-    test_not_ready_print_instance_refuses_nothing();
+    test_not_ready_print_instance_refuses_only_moves();
     test_move_is_refused_while_the_printing_stream_is_halted();
     test_home_is_refused_while_the_printing_stream_is_halted();
     test_calibrate_is_refused_while_the_printing_stream_is_halted();
@@ -4566,6 +5651,9 @@ int main(void) {
     test_internal_stop_discards_results_and_posts_none();
     test_unsettled_internal_stop_posts_nothing();
     test_request_stop_drops_the_commands_behind_it_silently();
+    test_planner_refusal_stops_and_empties_everything();
+    test_planner_refusal_restores_only_homed_axes_from_the_scale();
+    test_other_move_outcomes_do_not_stop_or_empty_anything();
     test_move_goes_to_the_queue_of_the_context();
     test_move_without_a_queue_is_dropped();
     test_stored_calibration_sets_planner_limits();

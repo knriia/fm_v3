@@ -244,10 +244,69 @@ static void test_command_queue_fifo_full_and_copy_semantics(void) {
     expect_u32(diagnostics.enqueue_errors, UINT32_MAX, "enqueue error counter saturates");
 }
 
+static uint32_t test_put_listener_calls;
+static uint32_t test_put_listener_free_slots;
+
+static void test_put_listener(void) {
+    ++test_put_listener_calls;
+    test_put_listener_free_slots = command_queue_free_slots();
+}
+
+static void test_command_queue_put_listener(void) {
+    CommandDTO_t output = {0};
+    while (command_queue_receive(&output, 0U) == osOK) {
+    }
+    expect_u32(command_queue_free_slots(), COMMAND_QUEUE_CAPACITY, "drained queue has every slot free");
+
+    command_queue_set_put_listener(test_put_listener);
+    CommandDTO_t input = make_command(400U);
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "command is queued for the put listener");
+    expect_u32(test_put_listener_calls, 1U, "a queued command calls the put listener once");
+    expect_u32(
+        test_put_listener_free_slots,
+        COMMAND_QUEUE_CAPACITY - 1U,
+        "the listener is called after the command is in the queue"
+    );
+    input = make_command(401U);
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "a second command is queued");
+    expect_u32(test_put_listener_calls, 2U, "each queued command calls the listener");
+    expect_u32(test_put_listener_free_slots, COMMAND_QUEUE_CAPACITY - 2U, "the listener sees the second command queued");
+
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osOK, "a command is received");
+    expect_u32(test_put_listener_calls, 2U, "taking a command does not call the put listener");
+
+    /* Fill the queue: every accepted command, and only those, calls the listener. */
+    uint32_t accepted = 2U;
+    for (uint32_t sequence = 402U; command_queue_free_slots() != 0U; ++sequence) {
+        input = make_command(sequence);
+        expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "command is queued while space remains");
+        ++accepted;
+    }
+    expect_u32(test_put_listener_calls, accepted, "the listener was called once per accepted command");
+    expect_u32(test_put_listener_free_slots, 0U, "the last accepted command filled the queue before the call");
+
+    const uint32_t calls_when_full = test_put_listener_calls;
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_FULL, "a full queue rejects the command");
+    expect_u32(test_put_listener_calls, calls_when_full, "a rejected command does not call the listener");
+    test_next_put_status = osErrorParameter;
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_ERROR, "an RTOS send error is reported");
+    expect_u32(test_put_listener_calls, calls_when_full, "a failed send does not call the listener");
+    expect_u32(command_queue_try_send(NULL), COMMAND_QUEUE_PUT_ERROR, "a null command is rejected");
+    expect_u32(test_put_listener_calls, calls_when_full, "a null command does not call the listener");
+
+    /* Without a listener nothing is called. */
+    command_queue_set_put_listener(NULL);
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osOK, "a command is received to make room");
+    input = make_command(900U);
+    expect_u32(command_queue_try_send(&input), COMMAND_QUEUE_PUT_OK, "a command is queued without a listener");
+    expect_u32(test_put_listener_calls, calls_when_full, "a removed listener is not called");
+}
+
 int main(void) {
     test_command_queue_initialization_and_arguments();
     test_command_queue_fifo_full_and_copy_semantics();
     test_command_queue_space_listener();
+    test_command_queue_put_listener();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Command queue unit tests failed: %u\n", test_failures);

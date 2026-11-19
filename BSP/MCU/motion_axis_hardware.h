@@ -143,9 +143,14 @@ void motion_axis_hardware_limit_irq(uint32_t pending_lines);
 void motion_axis_hardware_poll_stream_limit(void);
 
 /* Who decides what a limit switch does to a running planned stream. The listener runs in the switch interrupt with the
- * axis that reached the switch, after the switch point is latched; it must not block and must start the braking.
+ * axis that reached the switch and the reason (START_LIMIT, END_LIMIT or START_LIMIT_RELEASE), after the switch point
+ * is latched; it must not block and must start the braking.
  * Without a listener the axis brakes itself. */
-typedef void (*MotionAxisHardwareStreamLimitListener_t)(void *context, MotionAxis_t axis);
+typedef void (*MotionAxisHardwareStreamLimitListener_t)(
+    void *context,
+    MotionAxis_t axis,
+    MotionAxisHardwareStopReason_t reason
+);
 /* Makes the listener the owner of the stream channel of one axis: its switch reaches only this listener, so streams of
  * different axes can have different owners at the same time. The owner changes only while the channel is IDLE (timer
  * stopped, braking played): returns 1 when taken, 0 when the channel is busy (the old owner stays), another owner

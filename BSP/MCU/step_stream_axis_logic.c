@@ -97,6 +97,10 @@ uint8_t step_stream_axis_logic_poll(uint8_t (*is_done)(const void *context), con
     return 0U;
 }
 
+uint32_t step_stream_axis_logic_brake_plan_end(uint32_t steps_done, uint32_t margin_records) {
+    return steps_done + 1U + margin_records;
+}
+
 void step_stream_axis_logic_brake_reset(StepStreamAxisBrake_t *brake) {
     if (brake == NULL) {
         return;

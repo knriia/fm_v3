@@ -96,6 +96,9 @@ StepStreamAxisBrakeBegin_t step_stream_axis_logic_brake_begin(
     uint32_t margin_records,
     uint8_t held_half
 );
+/* Records of the plan that are played when a braking starts at steps_done: the ramp begins at the record after the one
+ * that is in the DMA's hands, margin_records further on (see brake_begin), so every record before it is the plan's. */
+uint32_t step_stream_axis_logic_brake_plan_end(uint32_t steps_done, uint32_t margin_records);
 /* The DMA has played the half and the ring has released it (EMPTY): fills it from the ramp and marks it FULL. */
 StepStreamAxisBrakeEvent_t step_stream_axis_logic_brake_half_released(
     StepStreamAxisBrake_t *brake,

@@ -592,6 +592,14 @@ static void test_brake_half_release_rejects_inconsistent_input(void) {
            STEP_STREAM_AXIS_LOGIC_BRAKE_EVENT_FAULT);
 }
 
+static void test_brake_plan_end(void) {
+    /* The record in the DMA's hands (steps_done + 1) plus the margin. */
+    assert(step_stream_axis_logic_brake_plan_end(100U, 8U) == 109U);
+    assert(step_stream_axis_logic_brake_plan_end(0U, 0U) == 1U);
+    /* The record counter wraps, the plan end wraps with it. */
+    assert(step_stream_axis_logic_brake_plan_end(0xFFFFFFFFU, 8U) == 8U);
+}
+
 int main(void) {
     test_prepare_stand_ring();
     test_stand_mode_refills_every_half();
@@ -619,6 +627,7 @@ int main(void) {
     test_brake_waits_for_an_unhandled_half_event();
     test_brake_rejects_inconsistent_input();
     test_brake_half_release_rejects_inconsistent_input();
+    test_brake_plan_end();
     (void)printf("Step stream axis logic unit tests passed.\n");
     return 0;
 }

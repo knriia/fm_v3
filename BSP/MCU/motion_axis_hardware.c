@@ -1529,7 +1529,7 @@ static void motion_axis_stream_limit_irq(Ctx_t *c, uint32_t pending_lines) {
     }
     const MotionAxisHardwareStreamLimitListener_t listener = owner->listener;
     if (listener != NULL) {
-        listener(owner->context, axis);
+        listener(owner->context, axis, reason);
         return;
     }
     /* Safety net for a stream that runs with no owner registered: the axis brakes itself. */

@@ -28,8 +28,9 @@
     (COMMAND_TASK_FLAG_RX | COMMAND_TASK_FLAG_TX | COMMAND_TASK_FLAG_ERROR | COMMAND_TASK_FLAG_QUEUE_SPACE |           \
         COMMAND_TASK_FLAG_RESULT)
 
-/* The largest responses are ERROR and DONE: header, a 16-bit code and CRC. */
-#define COMMAND_TASK_MAX_RESPONSE_SIZE (COMMAND_FRAME_HEADER_SIZE + 2U + COMMAND_FRAME_CRC_SIZE)
+/* The largest response is ERROR: header, the error payload (code, cause, axis, detail) and CRC. */
+#define COMMAND_TASK_MAX_RESPONSE_SIZE                                                                                 \
+    (COMMAND_FRAME_HEADER_SIZE + sizeof(CommandErrorPayloadDTO_t) + COMMAND_FRAME_CRC_SIZE)
 #define COMMAND_TASK_TX_BUFFER_SIZE 256U
 /* Input is read only while a held ACK and the reply to one new frame still fit into the send buffer. */
 #define COMMAND_TASK_TX_RESERVE_SIZE (2U * COMMAND_TASK_MAX_RESPONSE_SIZE)
@@ -86,7 +87,8 @@ static uint8_t command_task_send_protocol_response(
     CommandTaskAssemblerContext_t *assembler_context,
     uint8_t response_type,
     uint32_t sequence,
-    uint16_t code
+    uint16_t code,
+    const CommandResult_t *stop_details
 ) {
     uint8_t frame[COMMAND_MAX_FRAME_SIZE];
     size_t response_length = 0U;
@@ -97,7 +99,17 @@ static uint8_t command_task_send_protocol_response(
     } else if (response_type == COMMAND_MESSAGE_TYPE_DONE) {
         response_length = command_protocol_build_done_response(frame, sizeof(frame), sequence, code);
     } else if (response_type == COMMAND_MESSAGE_TYPE_ERROR) {
-        response_length = command_protocol_build_error_response(frame, sizeof(frame), sequence, code);
+        response_length = stop_details == NULL
+                              ? command_protocol_build_error_response(frame, sizeof(frame), sequence, code)
+                              : command_protocol_build_error_detail_response(
+                                    frame,
+                                    sizeof(frame),
+                                    sequence,
+                                    code,
+                                    stop_details->cause,
+                                    stop_details->axis,
+                                    stop_details->detail
+                                );
     }
 
     return command_task_send_response(assembler_context, frame, response_length);
@@ -164,7 +176,8 @@ command_task_finalize_incomplete_frame(CommandTaskAssemblerContext_t *assembler_
             assembler_context,
             COMMAND_MESSAGE_TYPE_ERROR,
             sequence,
-            COMMAND_ERROR_TRUNCATED_FRAME
+            COMMAND_ERROR_TRUNCATED_FRAME,
+            NULL
         );
     }
     assembler_context->partial_frame_active = 0U;
@@ -486,7 +499,8 @@ static uint8_t command_task_send_pending_ack(CommandTaskAssemblerContext_t *asse
             assembler_context,
             COMMAND_MESSAGE_TYPE_ACK,
             assembler_context->pending_ack_sequence,
-            0U
+            0U,
+            NULL
         ) == 0U) {
         assembler_context->disconnect_requested = 1U;
         return 0U;
@@ -504,8 +518,13 @@ static uint8_t command_task_send_results(CommandTaskAssemblerContext_t *assemble
         if (command_result_queue_try_receive(&result) != osOK) {
             return 1U;
         }
-        const uint8_t sent =
-            command_task_send_protocol_response(assembler_context, result.response_type, result.sequence, result.code);
+        const uint8_t sent = command_task_send_protocol_response(
+            assembler_context,
+            result.response_type,
+            result.sequence,
+            result.code,
+            &result
+        );
         if (sent == 0U) {
             assembler_context->disconnect_requested = 1U;
             return 0U;
@@ -528,7 +547,8 @@ static uint8_t command_task_handle_assembly_event(
                 assembler_context,
                 COMMAND_MESSAGE_TYPE_ERROR,
                 assembly_event->sequence,
-                assembly_event->error_code
+                assembly_event->error_code,
+                NULL
             ) == 0U) {
             assembler_context->disconnect_requested = 1U;
             return 0U;
@@ -581,7 +601,8 @@ static uint8_t command_task_handle_assembly_event(
                 queue_result == COMMAND_QUEUE_PUT_FULL ? COMMAND_ERROR_QUEUE_FULL : COMMAND_ERROR_INVALID_STATE;
         }
     }
-    if (command_task_send_protocol_response(assembler_context, response_type, response_sequence, error_code) == 0U) {
+    if (command_task_send_protocol_response(assembler_context, response_type, response_sequence, error_code, NULL) ==
+        0U) {
         assembler_context->disconnect_requested = 1U;
         return 0U;
     }

@@ -47,7 +47,7 @@ StepStreamAxis_t *step_stream_axis_get(MotionAxis_t axis);
 
 /* All callbacks run in the DMA interrupt and must not block; each gets `context` back. */
 typedef struct {
-    /* A half has been played and is EMPTY: wake the task that fills it. */
+    /* A half has been played and is EMPTY, or the braking has been played out and the axis is IDLE: wake the task. */
     void (*on_half_released)(void *context);
     /* The axis has already stopped itself; the owner must stop the other axes and report the fault. */
     void (*on_fault)(void *context, StepStreamAxisFault_t fault);
@@ -107,6 +107,11 @@ void step_stream_axis_exit_critical(uint32_t primask);
 uint32_t step_stream_axis_get_timer_clock_hz(const StepStreamAxis_t *axis);
 void step_stream_axis_stop(StepStreamAxis_t *axis);
 uint32_t step_stream_axis_steps_done(const StepStreamAxis_t *axis);
+/* Records of the plan (the records the feeder wrote) that the axis has played or will play, counted from the start of
+ * the stream, modulo 2^32. Without a braking it is steps_done. Once a braking has started it is fixed at the record
+ * where the ramp took over, because steps_done then also counts the ramp, which the plan blocks do not contain. A stop
+ * at once or an underrun end the plan at steps_done. Valid until the next start. */
+uint32_t step_stream_axis_plan_records_played(const StepStreamAxis_t *axis);
 StepStreamAxisState_t step_stream_axis_get_state(const StepStreamAxis_t *axis);
 
 /* Braking on a limit switch (stream mode only). configure_brake builds the ramp once, while IDLE; without it a

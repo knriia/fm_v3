@@ -75,6 +75,10 @@ struct StepStreamAxis {
     volatile StepStreamAxisState_t state;
     volatile uint32_t completed_half_buffers;
     volatile uint32_t last_steps_done;
+    /* The braking latches how many records of the plan the axis plays before the ramp replaces the rest. Written once
+     * by the DMA interrupt (the value first, then the flag), cleared at the launch. */
+    volatile uint32_t plan_end_steps;
+    volatile uint8_t plan_end_valid;
     volatile uint32_t last_stale_steps;
     StepStreamRing_t ring;
     volatile StepStreamAxisFault_t fault;
@@ -441,6 +445,7 @@ step_stream_axis_launch(StepStreamAxis_t *axis, uint32_t period_ticks, uint32_t 
     step_stream_axis_configure_timer(axis, period_ticks, pulse_ticks);
     axis->completed_half_buffers = 0U;
     axis->last_steps_done = 0U;
+    axis->plan_end_valid = 0U;
     axis->last_stale_steps = 0U;
     axis->fault = STEP_STREAM_AXIS_FAULT_NONE;
     axis->auto_refill = stand;
@@ -513,6 +518,7 @@ StepStreamAxisStatus_t step_stream_axis_prepare_stream(StepStreamAxis_t *axis) {
     axis->held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF;
     axis->fault = STEP_STREAM_AXIS_FAULT_NONE;
     axis->last_steps_done = 0U;
+    axis->plan_end_valid = 0U;
     axis->last_stale_steps = 0U;
     step_stream_axis_exit_critical(primask);
     return STEP_STREAM_AXIS_STATUS_OK;
@@ -730,6 +736,17 @@ uint32_t step_stream_axis_steps_done(const StepStreamAxis_t *axis) {
     return step_stream_axis_current_steps(axis);
 }
 
+uint32_t step_stream_axis_plan_records_played(const StepStreamAxis_t *axis) {
+    if (axis == NULL) {
+        return 0U;
+    }
+    if (axis->plan_end_valid != 0U) {
+        __DMB();
+        return axis->plan_end_steps;
+    }
+    return step_stream_axis_steps_done(axis);
+}
+
 StepStreamAxisState_t step_stream_axis_get_state(const StepStreamAxis_t *axis) {
     return axis != NULL ? axis->state : STEP_STREAM_AXIS_STATE_IDLE;
 }
@@ -814,18 +831,22 @@ static void step_stream_axis_run_brake(StepStreamAxis_t *axis) {
         return;
     }
 
+    const uint32_t steps_done = step_stream_axis_current_steps(axis);
     const StepStreamAxisBrakeBegin_t result = step_stream_axis_logic_brake_begin(
         &axis->brake,
         &axis->brake_table,
         &axis->ring,
         axis->dma_buffer,
         STEP_STREAM_AXIS_RECORD_COUNT,
-        step_stream_axis_current_steps(axis),
+        steps_done,
         STEP_STREAM_AXIS_BRAKE_MARGIN_RECORDS,
         axis->held_half
     );
     switch (result) {
     case STEP_STREAM_AXIS_LOGIC_BRAKE_STARTED:
+        axis->plan_end_steps = step_stream_axis_logic_brake_plan_end(steps_done, STEP_STREAM_AXIS_BRAKE_MARGIN_RECORDS);
+        __DMB();
+        axis->plan_end_valid = 1U;
         axis->brake_requested = 0U;
         axis->brake_attempt = 0U;
         ++axis->brake_stats.brakes_started;
@@ -872,6 +893,10 @@ static uint8_t step_stream_axis_handle_half_event(StepStreamAxis_t *axis, uint8_
             if (event == STEP_STREAM_AXIS_LOGIC_BRAKE_EVENT_COMPLETE) {
                 ++axis->brake_stats.brakes_completed;
                 step_stream_axis_halt(axis, STEP_STREAM_AXIS_FAULT_NONE);
+                /* The axis is IDLE now: the owner resolves which blocks were played. */
+                if (axis->on_half_released != NULL) {
+                    axis->on_half_released(axis->listener_context);
+                }
                 return 1U;
             }
             if (event == STEP_STREAM_AXIS_LOGIC_BRAKE_EVENT_FAULT) {

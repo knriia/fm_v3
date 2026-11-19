@@ -667,7 +667,8 @@ static size_t build_stop_command(uint8_t *frame, uint32_t sequence) {
 
 static void expect_single_response(uint8_t type, uint32_t sequence, uint16_t error_code) {
     const uint8_t has_code = type == COMMAND_MESSAGE_TYPE_ERROR || type == COMMAND_MESSAGE_TYPE_DONE ? 1U : 0U;
-    const size_t expected_length = has_code != 0U ? 16U : 14U;
+    /* Header 10 + payload (ERROR 5, DONE 2, others 0) + CRC 4. */
+    const size_t expected_length = type == COMMAND_MESSAGE_TYPE_ERROR ? 19U : (has_code != 0U ? 16U : 14U);
     expect_u32((uint32_t)test_captured_response_length, (uint32_t)expected_length, "exactly one response is sent");
     CommandFrameHeaderDTO_t header = {0};
     expect_u32(
@@ -681,6 +682,12 @@ static void expect_single_response(uint8_t type, uint32_t sequence, uint16_t err
         const uint16_t actual_error = (uint16_t)test_captured_response[COMMAND_FRAME_HEADER_SIZE] |
             ((uint16_t)test_captured_response[COMMAND_FRAME_HEADER_SIZE + 1U] << 8U);
         expect_u32(actual_error, error_code, "response contains the expected code");
+    }
+    if (type == COMMAND_MESSAGE_TYPE_ERROR) {
+        expect_u32(header.payload_length, 5U, "an ERROR payload is five bytes");
+        expect_u32(test_captured_response[COMMAND_FRAME_HEADER_SIZE + 2U], 0x00U, "a refusal has cause 0");
+        expect_u32(test_captured_response[COMMAND_FRAME_HEADER_SIZE + 3U], 0xFFU, "a refusal names no axis");
+        expect_u32(test_captured_response[COMMAND_FRAME_HEADER_SIZE + 4U], 0x00U, "a refusal has detail 0");
     }
 }
 
@@ -1341,7 +1348,11 @@ static void test_frame_errors_timeout_helpers_and_response_writes(void) {
         0U,
         "oversized response is rejected"
     );
-    expect_u32(command_task_send_protocol_response(&send_context, 0xFEU, 1U, 0U), 0U, "unsupported response type is rejected");
+    expect_u32(
+        command_task_send_protocol_response(&send_context, 0xFEU, 1U, 0U, NULL),
+        0U,
+        "unsupported response type is rejected"
+    );
 
     reset_fixture();
     send_context = test_context();
@@ -1625,7 +1636,7 @@ static void test_decoder_failure_and_error_response_send_failure(void) {
 }
 
 /* Checks one response frame in `data`: valid CRC, type, sequence, and for ERROR and DONE the 16-bit code, which is
- * the only payload and is little endian. */
+ * little endian. An ERROR payload has three more bytes, which here must be those of a refusal: 00 FF 00. */
 static void expect_frame_in(
     const uint8_t *data,
     size_t data_length,
@@ -1636,7 +1647,9 @@ static void expect_frame_in(
     const char *message
 ) {
     const uint8_t has_code = type == COMMAND_MESSAGE_TYPE_ERROR || type == COMMAND_MESSAGE_TYPE_DONE ? 1U : 0U;
-    const size_t length = has_code != 0U ? 16U : 14U;
+    const uint32_t payload_length =
+        type == COMMAND_MESSAGE_TYPE_ERROR ? 5U : (has_code != 0U ? 2U : 0U);
+    const size_t length = COMMAND_FRAME_HEADER_SIZE + payload_length + COMMAND_FRAME_CRC_SIZE;
     const uint8_t present = data_length >= offset + length ? 1U : 0U;
     expect_true(present, message);
     if (present == 0U) {
@@ -1646,12 +1659,17 @@ static void expect_frame_in(
     expect_u32(command_protocol_validate_frame(&data[offset], length, &header), COMMAND_FRAME_VALID, message);
     expect_u32(header.type, type, message);
     expect_u32(header.sequence, sequence, message);
-    expect_u32(header.payload_length, has_code != 0U ? 2U : 0U, message);
+    expect_u32(header.payload_length, payload_length, message);
     if (has_code != 0U) {
         const uint16_t actual_error =
             (uint16_t)data[offset + COMMAND_FRAME_HEADER_SIZE] |
             (uint16_t)((uint16_t)data[offset + COMMAND_FRAME_HEADER_SIZE + 1U] << 8U);
         expect_u32(actual_error, error_code, message);
+    }
+    if (type == COMMAND_MESSAGE_TYPE_ERROR) {
+        expect_u32(data[offset + COMMAND_FRAME_HEADER_SIZE + 2U], 0x00U, message);
+        expect_u32(data[offset + COMMAND_FRAME_HEADER_SIZE + 3U], 0xFFU, message);
+        expect_u32(data[offset + COMMAND_FRAME_HEADER_SIZE + 4U], 0x00U, message);
     }
 }
 
@@ -1659,11 +1677,32 @@ static void expect_frame_at(size_t offset, uint8_t type, uint32_t sequence, uint
     expect_frame_in(test_captured_response, test_captured_response_length, offset, type, sequence, error_code, message);
 }
 
+/* A result as command_result_queue_post makes it: cause 0, no axis, detail 0. */
 static void script_result(uint32_t index, uint32_t sequence, uint8_t response_type, uint16_t code) {
-    test_result_script[index] = (CommandResult_t){.sequence = sequence, .response_type = response_type, .code = code};
+    test_result_script[index] = (CommandResult_t){
+        .sequence = sequence,
+        .response_type = response_type,
+        .code = code,
+        .axis = COMMAND_ERROR_AXIS_NONE,
+    };
     if (test_result_script_count <= index) {
         test_result_script_count = index + 1U;
     }
+}
+
+static void script_detailed_result(
+    uint32_t index,
+    uint32_t sequence,
+    uint8_t response_type,
+    uint16_t code,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail
+) {
+    script_result(index, sequence, response_type, code);
+    test_result_script[index].cause = cause;
+    test_result_script[index].axis = axis;
+    test_result_script[index].detail = detail;
 }
 
 /* A DONE result goes to the client as a DONE frame with the sequence of its command and its result code. */
@@ -1702,25 +1741,90 @@ static void test_result_error_frames_and_order(void) {
     set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "several results are sent in one wake-up");
-    expect_u32((uint32_t)test_captured_response_length, 4U * 16U, "four 16-byte frames were sent");
+    expect_u32((uint32_t)test_captured_response_length, 19U + 16U + 16U + 19U, "two 19-byte ERROR and two 16-byte DONE frames");
     expect_frame_at(0U, COMMAND_MESSAGE_TYPE_ERROR, 510U, 0x0121U, "a refused command gets ERROR with its code");
-    expect_frame_at(16U, COMMAND_MESSAGE_TYPE_DONE, 511U, 0U, "an accepted command gets DONE with code 0");
-    expect_frame_at(32U, COMMAND_MESSAGE_TYPE_DONE, 512U, 1U, "a move to the current point gets DONE with code 1");
-    expect_u32(test_captured_response[32U + COMMAND_FRAME_HEADER_SIZE], 0x01U, "ALREADY_AT_TARGET payload is 01 00 (low)");
-    expect_u32(test_captured_response[32U + COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "ALREADY_AT_TARGET payload is 01 00 (high)");
-    expect_frame_at(48U, COMMAND_MESSAGE_TYPE_ERROR, 513U, 0x0126U, "the last refusal gets its own code");
+    expect_frame_at(19U, COMMAND_MESSAGE_TYPE_DONE, 511U, 0U, "an accepted command gets DONE with code 0");
+    expect_frame_at(35U, COMMAND_MESSAGE_TYPE_DONE, 512U, 1U, "a move to the current point gets DONE with code 1");
+    expect_u32(test_captured_response[35U + COMMAND_FRAME_HEADER_SIZE], 0x01U, "ALREADY_AT_TARGET payload is 01 00 (low)");
+    expect_u32(test_captured_response[35U + COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "ALREADY_AT_TARGET payload is 01 00 (high)");
+    expect_frame_at(51U, COMMAND_MESSAGE_TYPE_ERROR, 513U, 0x0126U, "the last refusal gets its own code");
     expect_u32(test_result_receive_calls, 6U, "one empty read after the socket, four results and one empty read");
 }
 
-/* A result stays queued while fewer than 32 bytes are free and is sent once the TX flag drained the buffer. */
+/* Checks one ERROR frame at `offset` of the captured response, down to the three bytes after the code. */
+static void expect_error_details_at(
+    size_t offset,
+    uint32_t sequence,
+    uint16_t error_code,
+    uint8_t cause,
+    uint8_t axis,
+    uint8_t detail,
+    const char *message
+) {
+    const size_t length = COMMAND_FRAME_HEADER_SIZE + 5U + COMMAND_FRAME_CRC_SIZE;
+    const uint8_t present = test_captured_response_length >= offset + length ? 1U : 0U;
+    expect_true(present, message);
+    if (present == 0U) {
+        return;
+    }
+    CommandFrameHeaderDTO_t header = {0};
+    expect_u32(
+        command_protocol_validate_frame(&test_captured_response[offset], length, &header),
+        COMMAND_FRAME_VALID,
+        message
+    );
+    expect_u32(header.type, 0xFFU, message);
+    expect_u32(header.sequence, sequence, message);
+    expect_u32(header.payload_length, 5U, message);
+    expect_u32(test_captured_response[offset + COMMAND_FRAME_HEADER_SIZE], (uint32_t)(error_code & 0xFFU), message);
+    expect_u32(test_captured_response[offset + COMMAND_FRAME_HEADER_SIZE + 1U], (uint32_t)(error_code >> 8U), message);
+    expect_u32(test_captured_response[offset + COMMAND_FRAME_HEADER_SIZE + 2U], cause, message);
+    expect_u32(test_captured_response[offset + COMMAND_FRAME_HEADER_SIZE + 3U], axis, message);
+    expect_u32(test_captured_response[offset + COMMAND_FRAME_HEADER_SIZE + 4U], detail, message);
+}
+
+/* The final results of a move: DONE COMPLETED, and ERROR STREAM_INTERRUPTED with the cause, axis and detail of the
+ * stop, which are the three bytes after the code. */
+static void test_result_stream_interrupted_and_completed_frames(void) {
+    NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
+
+    reset_fixture();
+    /* A limit switch (cause 2) of Z (axis 2), the end switch (detail 3). */
+    script_detailed_result(0U, 520U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 2U, 2U, 3U);
+    /* A group fault (cause 3) of X: axis 0 is X and must not be sent as "no axis". */
+    script_detailed_result(1U, 521U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 3U, 0U, 0x7EU);
+    /* A stop that no axis is to blame for. */
+    script_detailed_result(2U, 522U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 4U, 0xFFU, 9U);
+    script_result(3U, 523U, COMMAND_MESSAGE_TYPE_DONE, 0x0002U);
+    /* The stop fields of a DONE result are not part of its frame. */
+    script_detailed_result(4U, 524U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED, 2U, 2U, 3U);
+    test_result_visible_from_wait = 1U;
+    set_receive_result(0U, ERR_WOULDBLOCK);
+    set_flags_wait(0U, COMMAND_TASK_FLAG_RESULT);
+    test_jump_after_accept_calls = 1U;
+    expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the final results of moves are sent");
+
+    expect_u32((uint32_t)test_captured_response_length, 3U * 19U + 2U * 16U, "three 19-byte ERROR and two 16-byte DONE frames");
+    expect_error_details_at(0U, 520U, 0x0128U, 2U, 2U, 3U, "the limit stop carries cause, axis and detail");
+    expect_error_details_at(19U, 521U, 0x0128U, 3U, 0U, 0x7EU, "axis X is sent as 0");
+    expect_error_details_at(38U, 522U, 0x0128U, 4U, 0xFFU, 9U, "no blamed axis is sent as 0xFF");
+    expect_frame_at(57U, COMMAND_MESSAGE_TYPE_DONE, 523U, 2U, "the completed move gets DONE with code 2");
+    expect_u32(test_captured_response[57U + COMMAND_FRAME_HEADER_SIZE], 0x02U, "COMPLETED payload is 02 00 (low)");
+    expect_u32(test_captured_response[57U + COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "COMPLETED payload is 02 00 (high)");
+    expect_frame_at(73U, COMMAND_MESSAGE_TYPE_DONE, 524U, 0U, "a DONE result keeps its two-byte payload");
+    expect_u32(command_task_diagnostics.response_send_errors, 0U, "nothing fails");
+}
+
+/* A result stays queued while fewer than 38 bytes (two 19-byte ERROR frames) are free and is sent once the TX flag
+ * drained the buffer. */
 static void test_result_waits_for_send_buffer_space(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    static uint8_t pings[17][COMMAND_MAX_FRAME_SIZE];
-    const uint32_t ping_count = 17U;
+    static uint8_t pings[16][COMMAND_MAX_FRAME_SIZE];
+    const uint32_t ping_count = 16U;
     const size_t pong_length = 14U;
 
     reset_fixture();
-    /* 17 PONGs fill 238 of 256 bytes while LwIP takes nothing; reading stops with 18 bytes free. */
+    /* 16 PONGs fill 224 of 256 bytes while LwIP takes nothing; reading stops with 32 bytes free, below the 38 kept. */
     for (uint32_t index = 0U; index < ping_count; ++index) {
         const size_t ping_length = build_ping(pings[index], 200U + index);
         set_buffer(index, pings[index], (u16_t)ping_length, NULL, 0U, NULL, 0U);
@@ -1738,23 +1842,24 @@ static void test_result_waits_for_send_buffer_space(void) {
 
     expect_u32(test_thread_flags_wait_calls, 2U, "the task waited for the RESULT and the TX flags");
     expect_u32(test_results_taken_at_wait[0], 0U, "no result is taken before the RESULT flag");
-    expect_u32(test_results_taken_at_wait[1], 0U, "18 free bytes are below the 32 reserved, so no result is taken");
+    expect_u32(test_results_taken_at_wait[1], 0U, "32 free bytes are below the 38 kept, so no result is taken");
     expect_u32(test_result_script_position, 3U, "the TX flag brought the waiting results");
     expect_u32(test_result_receive_calls, 4U, "three results and one empty read");
     expect_u32(
         (uint32_t)test_captured_response_length,
-        ping_count * (uint32_t)pong_length + 3U * 16U,
-        "the PONGs and the three 16-byte results reach the client"
+        ping_count * (uint32_t)pong_length + 16U + 19U + 16U,
+        "the PONGs, two 16-byte DONE and one 19-byte ERROR reach the client"
     );
     for (uint32_t index = 0U; index < ping_count; ++index) {
         expect_frame_at(index * pong_length, COMMAND_MESSAGE_TYPE_PONG, 200U + index, 0U, "PONGs keep their order");
     }
-    expect_frame_at(238U, COMMAND_MESSAGE_TYPE_DONE, 600U, 0U, "the first result follows the PONGs");
-    expect_frame_at(254U, COMMAND_MESSAGE_TYPE_ERROR, 601U, 0x0122U, "the second result follows the first");
-    expect_frame_at(270U, COMMAND_MESSAGE_TYPE_DONE, 602U, 0U, "the third result is last");
+    expect_frame_at(224U, COMMAND_MESSAGE_TYPE_DONE, 600U, 0U, "the first result follows the PONGs");
+    expect_frame_at(240U, COMMAND_MESSAGE_TYPE_ERROR, 601U, 0x0122U, "the second result follows the first");
+    expect_frame_at(259U, COMMAND_MESSAGE_TYPE_DONE, 602U, 0U, "the third result is last");
 }
 
-/* The send buffer must keep 32 bytes free (a held ACK plus the reply to a new frame) before a result is taken. */
+/* The send buffer must keep 38 bytes free (a held ACK plus the reply to a new frame, as the largest response is the
+ * 19-byte ERROR) before a result is taken. */
 static void test_result_needs_room_for_the_largest_frame(void) {
     CommandTaskAssemblerContext_t context;
 
@@ -1763,21 +1868,21 @@ static void test_result_needs_room_for_the_largest_frame(void) {
     script_result(1U, 701U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED);
     context = test_context();
     test_write_blocked = 1U;
-    context.tx_length = 225U;
+    context.tx_length = 219U;
     expect_u32(command_task_send_results(&context), 1U, "a nearly full send buffer keeps the client");
-    expect_u32(test_result_receive_calls, 0U, "no result is taken with 31 bytes free");
+    expect_u32(test_result_receive_calls, 0U, "no result is taken with 37 bytes free");
     expect_u32(test_result_script_position, 0U, "the results stay queued");
     expect_u32(test_netconn_write_calls, 0U, "nothing is written without a result");
 
-    context.tx_length = 224U;
-    expect_u32(command_task_send_results(&context), 1U, "32 free bytes take one result");
-    expect_u32(test_result_receive_calls, 1U, "exactly one result is taken with 32 bytes free");
+    context.tx_length = 218U;
+    expect_u32(command_task_send_results(&context), 1U, "38 free bytes take one result");
+    expect_u32(test_result_receive_calls, 1U, "exactly one result is taken with 38 free bytes");
     expect_u32(test_result_script_position, 1U, "the second result stays queued behind it");
-    expect_u32((uint32_t)context.tx_length, 240U, "the 16-byte DONE frame is appended after the 224 buffered bytes");
+    expect_u32((uint32_t)context.tx_length, 234U, "the 16-byte DONE frame is appended after the 218 buffered bytes");
     expect_frame_in(
         context.tx_buffer,
         context.tx_length,
-        224U,
+        218U,
         COMMAND_MESSAGE_TYPE_DONE,
         700U,
         0U,
@@ -1852,7 +1957,7 @@ static void test_result_is_sent_after_reading_input(void) {
     test_jump_after_accept_calls = 1U;
     expect_u32((uint32_t)run_task_until_jump(&context), 1U, "the client is served with a result already queued");
     expect_u32(test_results_taken_at_wait[0], 1U, "the result was taken before the first wait for flags");
-    expect_u32((uint32_t)test_captured_response_length, 14U + 16U, "PONG and the result reach the client");
+    expect_u32((uint32_t)test_captured_response_length, 14U + 19U, "the PONG and the 19-byte ERROR reach the client");
     expect_frame_at(0U, COMMAND_MESSAGE_TYPE_PONG, 300U, 0U, "the reply to the frame comes first");
     expect_frame_at(14U, COMMAND_MESSAGE_TYPE_ERROR, 310U, 0x0121U, "the queued result follows the reply");
     expect_u32(command_task_diagnostics.response_send_errors, 0U, "sending after reading is not an error");
@@ -1895,17 +2000,17 @@ static void test_held_ack_goes_before_results_after_reading(void) {
     expect_u32(command_task_diagnostics.response_send_errors, 0U, "nothing fails");
 }
 
-/* A held ACK must still fit into an almost full send buffer: results leave 32 bytes free and go after the ACK. */
+/* A held ACK must still fit into an almost full send buffer: results leave 38 bytes free and go after the ACK. */
 static void test_results_do_not_starve_held_ack(void) {
     NetworkTaskContext context = {.lwip_flags = (osEventFlagsId_t)(uintptr_t)1U};
-    static uint8_t pings[17][COMMAND_MAX_FRAME_SIZE];
-    const uint32_t ping_count = 17U;
+    static uint8_t pings[16][COMMAND_MAX_FRAME_SIZE];
+    const uint32_t ping_count = 16U;
     const size_t pong_length = 14U;
     uint8_t stop[COMMAND_MAX_FRAME_SIZE];
     const size_t stop_length = build_stop_command(stop, 101U);
 
     reset_fixture();
-    /* The STOP fills the command queue and its ACK is held. 17 PONGs then occupy 238 of 256 bytes. */
+    /* The STOP fills the command queue and its ACK is held. 16 PONGs then occupy 224 of 256 bytes. */
     test_queue_free_slots[0] = 0U;
     set_buffer(0U, stop, (u16_t)stop_length, NULL, 0U, NULL, 0U);
     set_receive_result(0U, ERR_OK);
@@ -1927,21 +2032,21 @@ static void test_results_do_not_starve_held_ack(void) {
     expect_u32(command_task_diagnostics.acks_deferred, 1U, "the ACK is held");
     expect_u32(test_thread_flags_wait_calls, 2U, "the task waited for QUEUE_SPACE with RESULT and then for TX");
     expect_u32(test_results_taken_at_wait[0], 0U, "no result is taken while the ACK is held");
-    expect_u32(test_results_taken_at_wait[1], 0U, "the ACK took the room: 4 bytes are left, so no result is taken");
+    expect_u32(test_results_taken_at_wait[1], 0U, "the ACK took the room: 18 bytes are left, below the 38 kept, so no result is taken");
     expect_u32(command_task_diagnostics.response_send_errors, 0U, "the held ACK is not refused for lack of room");
     expect_u32(test_result_script_position, 3U, "the TX flag brought all three results");
     expect_u32(
         (uint32_t)test_captured_response_length,
-        ping_count * (uint32_t)pong_length + 14U + 3U * 16U,
-        "the PONGs, the 14-byte ACK and the three 16-byte results reach the client"
+        ping_count * (uint32_t)pong_length + 14U + 16U + 19U + 16U,
+        "the PONGs, the 14-byte ACK, two 16-byte DONE and one 19-byte ERROR reach the client"
     );
     for (uint32_t index = 0U; index < ping_count; ++index) {
         expect_frame_at(index * pong_length, COMMAND_MESSAGE_TYPE_PONG, 200U + index, 0U, "PONGs keep their order");
     }
-    expect_ack_at(238U, 101U, "the held ACK follows the PONGs");
-    expect_frame_at(252U, COMMAND_MESSAGE_TYPE_DONE, 600U, 0U, "the first result goes after the ACK");
-    expect_frame_at(268U, COMMAND_MESSAGE_TYPE_ERROR, 601U, 0x0122U, "the second result follows the first");
-    expect_frame_at(284U, COMMAND_MESSAGE_TYPE_DONE, 602U, 0U, "the third result is last");
+    expect_ack_at(224U, 101U, "the held ACK follows the PONGs");
+    expect_frame_at(238U, COMMAND_MESSAGE_TYPE_DONE, 600U, 0U, "the first result goes after the ACK");
+    expect_frame_at(254U, COMMAND_MESSAGE_TYPE_ERROR, 601U, 0x0122U, "the second result follows the first");
+    expect_frame_at(273U, COMMAND_MESSAGE_TYPE_DONE, 602U, 0U, "the third result is last");
 }
 
 /* Nothing of a client outlives its connection: after the socket is closed and deleted the motion is stopped and a STOP
@@ -2010,6 +2115,7 @@ static void test_result_listener_sets_its_flag(void) {
 int main(void) {
     test_result_done_frame();
     test_result_error_frames_and_order();
+    test_result_stream_interrupted_and_completed_frames();
     test_result_waits_for_send_buffer_space();
     test_result_needs_room_for_the_largest_frame();
     test_result_send_failure_closes_the_client();

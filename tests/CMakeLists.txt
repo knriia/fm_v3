@@ -66,6 +66,7 @@ add_executable(motion_task_unit_tests
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/motion_task.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/plan_buffer.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/move_result_tracker.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/axis_calibration.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/protocol/command/command_protocol.c
 )
@@ -130,6 +131,11 @@ add_executable(step_stream_feeder_unit_tests
     step_stream_feeder_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/step_stream_feeder.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/step_stream_generator.c
+)
+
+add_executable(move_result_tracker_unit_tests
+    move_result_tracker_unit_tests.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/move_result_tracker.c
 )
 
 add_executable(step_stream_group_unit_tests
@@ -309,6 +315,11 @@ target_include_directories(step_stream_feeder_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../BSP/MCU
 )
 
+target_include_directories(move_result_tracker_unit_tests PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../APP
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
+)
+
 target_include_directories(step_stream_group_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../APP
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion
@@ -444,6 +455,11 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
     )
+    target_compile_options(move_result_tracker_unit_tests PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
     target_compile_options(step_stream_group_unit_tests PRIVATE
         -Wall
         -Wextra
@@ -531,3 +547,4 @@ add_test(NAME step_stream_brake_unit_tests COMMAND step_stream_brake_unit_tests)
 add_test(NAME home_block_unit_tests COMMAND home_block_unit_tests)
 add_test(NAME step_stream_ring_unit_tests COMMAND step_stream_ring_unit_tests)
 add_test(NAME step_stream_feeder_unit_tests COMMAND step_stream_feeder_unit_tests)
+add_test(NAME move_result_tracker_unit_tests COMMAND move_result_tracker_unit_tests)

@@ -92,12 +92,26 @@ typedef struct StepGeneratorInstance {
     volatile uint32_t halt_member;
     volatile uint32_t halt_fault;
     volatile uint32_t halts_total;
+    /* The axis (member) and the MotionAxisHardwareStopReason_t of the first switch reported since the last reset:
+     * on_limit brakes every member, so the member that brakes first is not necessarily the one whose switch tripped.
+     * Written inside a critical section by the switch interrupt, cleared where the halt is lifted. */
+    volatile uint32_t limit_member;
+    volatile uint32_t limit_reason;
     /* Written by the generator task only. */
     volatile uint32_t feeder_status;
     /* Resets after STOP that left a channel running; counted into axis_errors with the feeder's errors. */
     volatile uint32_t reset_failures;
     /* Counted inside a critical section: the switch interrupt and the poll at the stream start both report. */
     volatile uint32_t limit_trips[STEP_GENERATOR_TASK_MEMBER_COUNT];
+    /* Increases in step_generator_instance_halt (STOP, disconnect), inside a critical section. */
+    volatile uint32_t generation;
+    /* The progress snapshot: only the task writes it, inside a critical section, so a reader gets a consistent copy.
+     * The stop part is cleared when the halt is lifted. */
+    volatile uint32_t played_blocks;
+    volatile uint32_t played_order;
+    volatile uint8_t stop_resolved;
+    volatile uint8_t stop_has_unplayed;
+    volatile uint32_t stop_unplayed_order;
 } StepGeneratorInstance_t;
 
 /* The printing stream of X, Y and Z. */
@@ -135,6 +149,8 @@ static void step_generator_counter_increment(volatile uint32_t *counter) {
     }
 }
 
+static void step_generator_task_signal(uint32_t flags);
+
 /* The only place that sets halted, so every halt leaves its cause behind. Callable from tasks and interrupts. Only the
  * first halt since the last reset records its cause: a later one (MotionTask ending the move after a switch stopped it)
  * would hide what stopped the stream. Every halt is counted. */
@@ -149,6 +165,9 @@ step_generator_task_set_halted(StepGeneratorInstance_t *self, uint32_t cause, ui
     step_generator_counter_increment(&self->halts_total);
     self->halted = 1U;
     step_stream_axis_exit_critical(primask);
+    /* The task resolves what was played once the channels are at rest; a halt from a DMA interrupt (priority 5) may
+     * wake it, a switch interrupt may not and does not come this way. */
+    step_generator_task_signal(STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED);
 }
 
 static void step_generator_task_signal(uint32_t flags) {
@@ -187,6 +206,9 @@ void step_generator_instance_halt(StepGeneratorInstance_t *instance) {
     if (instance == NULL) {
         return;
     }
+    const uint32_t generation_primask = step_stream_axis_enter_critical();
+    ++instance->generation;
+    step_stream_axis_exit_critical(generation_primask);
     step_generator_task_set_halted(
         instance,
         STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL,
@@ -399,12 +421,26 @@ static void step_generator_task_channel_braking(void *context) {
 }
 
 /* Limit switch interrupt: the group decides which channels brake. */
-static void step_generator_task_limit_reached(void *context, MotionAxis_t axis) {
+static void step_generator_task_limit_reached(void *context, MotionAxis_t axis, MotionAxisHardwareStopReason_t reason) {
     StepGeneratorInstance_t *const self = context;
     for (uint32_t member = 0U; member < self->member_count; ++member) {
         if (self->member_axes[member] == axis) {
             const uint32_t primask = step_stream_axis_enter_critical();
             step_generator_counter_increment(&self->limit_trips[member]);
+            /* Only a switch the group acts on is latched: one that finds the group idle, stopping or faulted brakes
+             * nothing, so no halt follows it and a latch would blame a later, unrelated brake. A real limit replaces a
+             * latched start switch release, which is the weaker reason. */
+            const StepStreamGroupState_t group_state = step_stream_group_get_state(&self->group);
+            const uint8_t acted_on = (uint8_t)(group_state == STEP_STREAM_GROUP_STATE_PRIMING ||
+                                               group_state == STEP_STREAM_GROUP_STATE_RUNNING);
+            const uint8_t latch_free = (uint8_t)(self->limit_member == STEP_GENERATOR_TASK_NO_MEMBER);
+            const uint8_t outranks_release =
+                (uint8_t)(self->limit_reason == (uint32_t)MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE &&
+                          reason != MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE);
+            if (acted_on != 0U && (latch_free != 0U || outranks_release != 0U)) {
+                self->limit_member = member;
+                self->limit_reason = (uint32_t)reason;
+            }
             step_stream_axis_exit_critical(primask);
             step_stream_group_on_limit(&self->group, member);
             return;
@@ -414,7 +450,18 @@ static void step_generator_task_limit_reached(void *context, MotionAxis_t axis) 
 
 /* Group, in an interrupt: the stream stopped for a limit switch or a fault, so stop feeding until STOP resets us. */
 static void step_generator_task_group_member_stopping(void *context, uint32_t member) {
-    step_generator_task_set_halted(context, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, member, 0U);
+    StepGeneratorInstance_t *const self = context;
+    /* The member that brakes first is blamed only when no switch was reported (a brake the task requested itself).
+     * The read and the halt share one critical section, so a switch cannot latch in between. */
+    const uint32_t primask = step_stream_axis_enter_critical();
+    const uint32_t limit_member = self->limit_member;
+    step_generator_task_set_halted(
+        self,
+        STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT,
+        limit_member != STEP_GENERATOR_TASK_NO_MEMBER ? limit_member : member,
+        0U
+    );
+    step_stream_axis_exit_critical(primask);
 }
 
 static void step_generator_task_group_fault(void *context, uint32_t member, uint32_t fault) {
@@ -525,6 +572,7 @@ static void step_generator_task_critical_exit(void *context, uint32_t saved) {
                 STEP_GENERATOR_TASK_MEMBER_LISTENER(instance, 2U),                                                     \
             },                                                                                                         \
         .halt_member = STEP_GENERATOR_TASK_NO_MEMBER,                                                                  \
+        .limit_member = STEP_GENERATOR_TASK_NO_MEMBER,                                                                 \
     }
 
 #define STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(axis)                                                                \
@@ -724,6 +772,104 @@ static void step_generator_task_setup_instance(
     }
 }
 
+/* 1 when no channel of the instance's members runs. */
+static uint8_t step_generator_task_members_at_rest(const StepGeneratorInstance_t *self) {
+    for (uint32_t member = 0U; member < self->member_count; ++member) {
+        if (step_stream_axis_get_state(step_generator_task_member_axis(self, member)) ==
+            STEP_STREAM_AXIS_STATE_STREAMING) {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+/* The order of the first block of the plan buffer: the one that is cut off when no started block is. */
+static uint8_t step_generator_task_plan_front_order(const StepGeneratorInstance_t *self, uint32_t *order) {
+    MotionPlanBlock_t block;
+    const uint32_t epoch = plan_buffer_get_epoch(self->plan_buffer);
+    if (plan_buffer_try_peek(self->plan_buffer, epoch, 0U, &block) != PLAN_BUFFER_STATUS_OK) {
+        return 0U;
+    }
+    *order = block.order;
+    return 1U;
+}
+
+/* Turns what the channels have played into the snapshot. The records played come from the channels of the instance
+ * while it holds them; after a halt they are final once every channel is at rest, which is when the stop is resolved:
+ * the blocks that were played completely are counted, and the first one that was cut off is named. */
+/* Written once by MotionTask at its start and read by this task. */
+static volatile StepGeneratorProgressListener_t step_generator_task_progress_listener;
+
+void step_generator_task_set_progress_listener(StepGeneratorProgressListener_t listener) {
+    step_generator_task_progress_listener = listener;
+}
+
+static void step_generator_task_publish_progress(StepGeneratorInstance_t *self) {
+    uint32_t executed[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U};
+    if (self->channels_held != 0U) {
+        for (uint32_t member = 0U; member < self->member_count; ++member) {
+            executed[member] = step_stream_axis_plan_records_played(step_generator_task_member_axis(self, member));
+        }
+    }
+    const uint8_t resolve =
+        (uint8_t)(self->halted != 0U && self->stop_resolved == 0U && step_generator_task_members_at_rest(self) != 0U);
+    if (self->channels_held != 0U && (resolve != 0U || self->halted == 0U)) {
+        step_stream_feeder_update_played(&self->feeder, executed);
+    }
+    uint32_t blocks = 0U;
+    uint32_t order = 0U;
+    step_stream_feeder_get_played(&self->feeder, &blocks, &order);
+    uint32_t unplayed_order = 0U;
+    uint8_t has_unplayed = 0U;
+    if (resolve != 0U) {
+        has_unplayed = step_stream_feeder_get_first_unplayed(&self->feeder, &unplayed_order);
+        if (has_unplayed == 0U) {
+            has_unplayed = step_generator_task_plan_front_order(self, &unplayed_order);
+        }
+    }
+    const uint8_t changed = (uint8_t)(resolve != 0U || blocks != self->played_blocks || order != self->played_order);
+    const uint32_t primask = step_stream_axis_enter_critical();
+    self->played_blocks = blocks;
+    self->played_order = order;
+    if (resolve != 0U) {
+        self->stop_has_unplayed = has_unplayed;
+        self->stop_unplayed_order = unplayed_order;
+        self->stop_resolved = 1U;
+    }
+    step_stream_axis_exit_critical(primask);
+    /* MotionTask turns the snapshot into answers to the client; only the printing stream has moves to answer. */
+    const StepGeneratorProgressListener_t listener = step_generator_task_progress_listener;
+    if (changed != 0U && listener != NULL && self == &step_generator_task_instance) {
+        listener();
+    }
+}
+
+void step_generator_instance_get_progress(const StepGeneratorInstance_t *instance, StepGeneratorProgress_t *progress) {
+    if (instance == NULL || progress == NULL) {
+        return;
+    }
+    const uint32_t primask = step_stream_axis_enter_critical();
+    progress->generation = instance->generation;
+    progress->played_blocks = instance->played_blocks;
+    progress->played_order = instance->played_order;
+    progress->stop_resolved = instance->stop_resolved;
+    progress->has_unplayed = instance->stop_has_unplayed;
+    progress->unplayed_order = instance->stop_unplayed_order;
+    progress->halt_cause = instance->halt_cause;
+    const uint32_t member = instance->halt_member;
+    progress->halt_detail = 0U;
+    if (instance->halt_cause == STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT) {
+        progress->halt_detail = instance->limit_reason;
+    } else if (instance->halt_cause == STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT) {
+        progress->halt_detail = instance->halt_fault;
+    } else if (instance->halt_cause == STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR) {
+        progress->halt_detail = instance->feeder_status;
+    }
+    step_stream_axis_exit_critical(primask);
+    progress->halt_axis =
+        member < instance->member_count ? (uint32_t)instance->member_axes[member] : STEP_GENERATOR_TASK_NO_AXIS;
+}
+
 /* One pass over an instance: the reset requested after STOP, then the feeding. */
 static void step_generator_task_run_instance(StepGeneratorInstance_t *self) {
     uint8_t reset_requested = 0U;
@@ -735,6 +881,10 @@ static void step_generator_task_run_instance(StepGeneratorInstance_t *self) {
         if (reset_requested != 0U) {
             self->reset_requested = 0U;
             self->halted = 0U;
+            self->limit_member = STEP_GENERATOR_TASK_NO_MEMBER;
+            self->limit_reason = (uint32_t)MOTION_AXIS_HARDWARE_STOP_REASON_NONE;
+            self->stop_resolved = 0U;
+            self->stop_has_unplayed = 0U;
         }
         step_stream_axis_exit_critical(primask);
     }
@@ -780,6 +930,7 @@ static void step_generator_task_run_instance(StepGeneratorInstance_t *self) {
     /* Also while halted: the counters of the stream that was cut off must reach the diagnostics. */
     if (self->ready != 0U) {
         step_generator_task_publish_diagnostics(self);
+        step_generator_task_publish_progress(self);
     }
 }
 

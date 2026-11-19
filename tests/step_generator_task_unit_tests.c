@@ -486,6 +486,16 @@ StepStreamAxisState_t step_stream_axis_get_state(const StepStreamAxis_t *axis) {
                                                           : STEP_STREAM_AXIS_STATE_IDLE;
 }
 
+/* Records of the plan that each channel reports as played, and how often the task asked for them. */
+static uint32_t test_records_played[TEST_CHANNELS];
+static uint32_t test_records_played_calls[TEST_CHANNELS];
+
+uint32_t step_stream_axis_plan_records_played(const StepStreamAxis_t *axis) {
+    const uint32_t channel = channel_index(axis);
+    ++test_records_played_calls[channel];
+    return test_records_played[channel];
+}
+
 static StepStreamAxisFault_t test_axis_fault[TEST_CHANNELS];
 static MotionAxisHardwareStatus_t test_hardware_status[TEST_CHANNELS];
 static MotionAxisHardwareStopReason_t test_hardware_stop_reason[TEST_CHANNELS];
@@ -690,6 +700,8 @@ static void reset_fixture(void) {
     memset(test_listener_releases, 0, sizeof(test_listener_releases));
     memset(test_stream_owner, 0, sizeof(test_stream_owner));
     memset(test_axis_stuck, 0, sizeof(test_axis_stuck));
+    memset(test_records_played, 0, sizeof(test_records_played));
+    memset(test_records_played_calls, 0, sizeof(test_records_played_calls));
     test_brake_config = (StepStreamBrakeConfig_t){0};
     test_configure_brake_result = STEP_STREAM_AXIS_STATUS_OK;
     test_task_config = (StepGeneratorTaskConfig_t){
@@ -1529,7 +1541,11 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     (void)run_task_until_jump(&test_task_config);
     test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listeners[MOTION_AXIS_Y](test_limit_contexts[MOTION_AXIS_Y], MOTION_AXIS_Y);
+    test_limit_listeners[MOTION_AXIS_Y](
+        test_limit_contexts[MOTION_AXIS_Y],
+        MOTION_AXIS_Y,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     /* The group halts the feeding once a channel reports that it brakes, not at the switch itself. */
     test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
     step_generator_task_get_stream_diagnostics(&stream);
@@ -1617,9 +1633,17 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     (void)run_task_until_jump(&test_task_config);
     test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     test_stream_listener[TEST_CH_Z].on_brake(test_stream_listener[TEST_CH_Z].context);
-    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     step_generator_task_get_stream_diagnostics(&stream);
     expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "a switch of Z is named as the cause");
     expect_u32(stream.halt_member, 2U, "the switch of Z is member 2");
@@ -1694,7 +1718,11 @@ static void test_limit_switch_brakes_through_the_group(void) {
     }
 
     run_group_prepared_and_started();
-    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_HARDWARE_COUNT);
+    test_limit_listeners[MOTION_AXIS_X](
+        test_limit_contexts[MOTION_AXIS_X],
+        MOTION_AXIS_HARDWARE_COUNT,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(
         test_brake_requests[TEST_CH_X] + test_brake_requests[TEST_CH_Y] + test_brake_requests[TEST_CH_Z],
         0U,
@@ -1714,7 +1742,11 @@ static void test_limit_switch_brakes_through_the_group(void) {
     );
 
     /* The group moves its axes together, so the switch of any axis brakes all channels. */
-    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_X);
+    test_limit_listeners[MOTION_AXIS_X](
+        test_limit_contexts[MOTION_AXIS_X],
+        MOTION_AXIS_X,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of X brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of X brakes the channel of Y too");
     expect_u32(test_brake_requests[TEST_CH_Z], 1U, "the switch of X brakes the channel of Z too");
@@ -1730,7 +1762,11 @@ static void test_limit_switch_brakes_through_the_group(void) {
     (void)run_task_until_jump(&test_task_config);
     test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listeners[MOTION_AXIS_Y](test_limit_contexts[MOTION_AXIS_Y], MOTION_AXIS_Y);
+    test_limit_listeners[MOTION_AXIS_Y](
+        test_limit_contexts[MOTION_AXIS_Y],
+        MOTION_AXIS_Y,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of Y brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of Y brakes the channel of Y");
     expect_u32(
@@ -1745,7 +1781,11 @@ static void test_limit_switch_brakes_through_the_group(void) {
     (void)run_task_until_jump(&test_task_config);
     test_claim_print_channels();
     run_group_prepared_and_started();
-    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of Z brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of Z brakes the channel of Y");
     expect_u32(test_brake_requests[TEST_CH_Z], 1U, "the switch of Z brakes the channel of Z");
@@ -1754,6 +1794,201 @@ static void test_limit_switch_brakes_through_the_group(void) {
         STEP_STREAM_GROUP_STATE_STOPPING,
         "the group stops when the switch of Z is reached"
     );
+}
+
+/* The switch that fired first is the cause of the halt, not the channel that happened to brake first. */
+static void test_halt_member_is_the_axis_whose_switch_fired(void) {
+    StepGeneratorTaskStreamDiagnostics_t stream = {0};
+
+    /* Z fires its end switch, but the channel of Y is the first to report braking. */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    expect_u32(step_generator_task_instance.limit_member, STEP_GENERATOR_TASK_NO_MEMBER, "no switch yet, no member");
+    expect_u32(step_generator_task_instance.limit_reason, 0U, "no switch yet, no reason");
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
+    test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "braking after a switch is named as a limit");
+    expect_u32(stream.halt_member, 2U, "the halt is blamed on Z whose switch fired, not on Y that braked first");
+    expect_u32(step_generator_task_instance.limit_member, 2U, "the instance latches member 2");
+    expect_u32(step_generator_task_instance.limit_reason, 3U, "the instance latches the END_LIMIT reason");
+
+    /* A second switch of another axis does not replace the first one, but it is counted. */
+    test_limit_listeners[MOTION_AXIS_Y](
+        test_limit_contexts[MOTION_AXIS_Y],
+        MOTION_AXIS_Y,
+        MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT
+    );
+    expect_u32(step_generator_task_instance.limit_member, 2U, "the first switch keeps the member");
+    expect_u32(step_generator_task_instance.limit_reason, 3U, "the first switch keeps the reason");
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.halt_member, 2U, "the halt stays blamed on Z");
+    expect_u32(stream.members[0].limit_trips, 0U, "X reported no switch");
+    expect_u32(stream.members[1].limit_trips, 1U, "Y switch is counted");
+    expect_u32(stream.members[2].limit_trips, 1U, "Z switch is counted");
+
+    /* A brake that the task asked for itself, with no switch, is blamed on the channel that brakes. */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "braking without a switch is named as a limit");
+    expect_u32(stream.halt_member, 1U, "without a switch the braking channel Y is blamed");
+    expect_u32(step_generator_task_instance.limit_member, STEP_GENERATOR_TASK_NO_MEMBER, "no switch, no latched member");
+    expect_u32(step_generator_task_instance.limit_reason, 0U, "no switch, no latched reason");
+
+    /* The reset after STOP forgets the latched switch; the next one is recorded anew. */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
+    expect_u32(step_generator_task_instance.limit_member, 2U, "the switch of Z is latched before the reset");
+    step_generator_task_instance.reset_requested = 1U;
+    step_generator_task_run_instance(&step_generator_task_instance);
+    expect_u32(step_generator_task_instance.limit_member, STEP_GENERATOR_TASK_NO_MEMBER, "the reset clears the member");
+    expect_u32(step_generator_task_instance.limit_reason, 0U, "the reset clears the reason");
+
+    /* A switch is latched only while the group runs, and the fake channels of this fixture keep the group from resetting
+     * to idle, so the next switch is recorded in a fresh fixture, whose latch is as empty as one after the reset. */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    step_generator_task_limit_reached(
+        &step_generator_task_instance,
+        MOTION_AXIS_Y,
+        MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT
+    );
+    expect_u32(step_generator_task_instance.limit_member, 1U, "the next switch, Y, is latched after the reset");
+    expect_u32(step_generator_task_instance.limit_reason, 2U, "the next switch keeps its START_LIMIT reason");
+}
+
+static void prepare_print_fixture(void) {
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+}
+
+static void report_limit(MotionAxis_t axis, MotionAxisHardwareStopReason_t reason) {
+    step_generator_task_limit_reached(&step_generator_task_instance, axis, reason);
+}
+
+static void expect_latch(uint32_t member, uint32_t reason, const char *message) {
+    expect_u32(step_generator_task_instance.limit_member, member, message);
+    expect_u32(step_generator_task_instance.limit_reason, reason, message);
+}
+
+/* A switch that finds the group IDLE brakes nothing, so it must not be blamed for a later brake. */
+static void test_limit_in_idle_group_is_counted_but_not_latched(void) {
+    StepGeneratorTaskStreamDiagnostics_t stream = {0};
+
+    prepare_print_fixture();
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_IDLE, "the group is IDLE");
+    report_limit(MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.members[2].limit_trips, 1U, "the switch of Z in an IDLE group is counted");
+    expect_latch(STEP_GENERATOR_TASK_NO_MEMBER, 0U, "the switch in an IDLE group is not latched");
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_IDLE, "an IDLE group stays IDLE");
+
+    run_group_prepared_and_started();
+    test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.halt_member, 1U, "the later brake is blamed on Y that braked, not on Z of the IDLE switch");
+}
+
+/* PRIMING: switches are queued by the group and the latch is written; the order of reasons is checked here, because a
+ * RUNNING group goes to STOPPING at the first switch. */
+static void test_limit_in_priming_group_latches_and_real_limit_outranks_release(void) {
+    StepGeneratorTaskStreamDiagnostics_t stream = {0};
+
+    prepare_print_fixture();
+    expect_u32(step_stream_group_prepare(test_group()), STEP_STREAM_GROUP_STATUS_OK, "the group prepares");
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_PRIMING, "the group is PRIMING");
+    report_limit(MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE);
+    expect_latch(1U, 4U, "a release of Y is latched in PRIMING");
+    report_limit(MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE);
+    expect_latch(1U, 4U, "a second release does not replace the latched one");
+    report_limit(MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
+    expect_latch(2U, 3U, "a real END_LIMIT of Z replaces the latched release");
+    report_limit(MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT);
+    expect_latch(2U, 3U, "a real START_LIMIT of Y does not replace a real limit");
+    report_limit(MOTION_AXIS_X, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE);
+    expect_latch(2U, 3U, "a release does not replace a real limit");
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.members[0].limit_trips, 1U, "the release of X is counted");
+    expect_u32(stream.members[1].limit_trips, 2U, "two switches of Y are counted");
+    expect_u32(stream.members[2].limit_trips, 2U, "two switches of Z are counted");
+}
+
+/* A real switch replaces a latched release in PRIMING, and the replaced one is the cause of the later halt. */
+static void test_limit_in_priming_group_blames_the_real_limit_on_halt(void) {
+    StepGeneratorTaskStreamDiagnostics_t stream = {0};
+
+    prepare_print_fixture();
+    expect_u32(step_stream_group_prepare(test_group()), STEP_STREAM_GROUP_STATUS_OK, "the group prepares");
+    report_limit(MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE);
+    report_limit(MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
+    expect_u32(step_stream_group_start(test_group(), 2500U), STEP_STREAM_GROUP_STATUS_OK, "the group starts");
+    expect_u32(
+        step_stream_group_get_state(test_group()),
+        STEP_STREAM_GROUP_STATE_STOPPING,
+        "the queued switches stop the group at start"
+    );
+    test_stream_listener[TEST_CH_X].on_brake(test_stream_listener[TEST_CH_X].context);
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.halt_member, 2U, "the halt is blamed on Z whose real limit replaced the release of Y");
+}
+
+/* RUNNING: the first switch is latched, however weak, and then the group is STOPPING. */
+static void test_limit_in_running_group_latches_a_release(void) {
+    prepare_print_fixture();
+    run_group_prepared_and_started();
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_RUNNING, "the group is RUNNING");
+    report_limit(MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT_RELEASE);
+    expect_latch(1U, 4U, "a release of Y is latched in a RUNNING group");
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_STOPPING, "the release stops it");
+    /* The group is STOPPING now: a later switch, even a real one, is not latched. */
+    report_limit(MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
+    expect_latch(1U, 4U, "a real limit in a STOPPING group does not replace the latch");
+}
+
+/* STOPPING and FAULT without a latch: the switch is counted, nothing is blamed. */
+static void test_limit_in_stopping_or_faulted_group_is_not_latched(void) {
+    StepGeneratorTaskStreamDiagnostics_t stream = {0};
+
+    prepare_print_fixture();
+    run_group_prepared_and_started();
+    step_stream_group_on_limit(test_group(), 0U);
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_STOPPING, "the group is STOPPING");
+    report_limit(MOTION_AXIS_Z, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
+    expect_latch(STEP_GENERATOR_TASK_NO_MEMBER, 0U, "a switch in a STOPPING group is not latched");
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.members[2].limit_trips, 1U, "the switch in a STOPPING group is counted");
+
+    prepare_print_fixture();
+    run_group_prepared_and_started();
+    step_stream_group_on_member_fault(test_group(), 0U, 1U);
+    expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_FAULT, "the group is FAULT");
+    report_limit(MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT);
+    expect_latch(STEP_GENERATOR_TASK_NO_MEMBER, 0U, "a switch in a faulted group is not latched");
 }
 
 static void test_group_ends_with_its_stream(void) {
@@ -1906,7 +2141,7 @@ static void test_callbacks_act_on_their_own_instance(void) {
 
     /* A limit report with the context of the other instance counts there and brakes the group of that instance only. */
     other.group.state = STEP_STREAM_GROUP_STATE_RUNNING;
-    step_generator_task_limit_reached(&other, MOTION_AXIS_Y);
+    step_generator_task_limit_reached(&other, MOTION_AXIS_Y, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
     expect_u32(other.limit_trips[1], 1U, "the limit is counted in the instance of the context");
     expect_u32(other.limit_trips[0] + other.limit_trips[2], 0U, "only the member of the axis is counted");
     expect_u32(
@@ -2058,16 +2293,21 @@ static void test_two_instances_own_different_axes(void) {
         "the channel of Z reports to the second instance as its member 1"
     );
 
-    test_limit_listeners[MOTION_AXIS_Z](test_limit_contexts[MOTION_AXIS_Z], MOTION_AXIS_Z);
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(second.limit_trips[1], 1U, "the limit of Z is counted as member 1 of the second instance");
     expect_u32(second.limit_trips[0], 0U, "Y of the second instance saw no limit");
     expect_u32(first.limit_trips[0], 0U, "the first instance does not see the limit of Z");
 }
 
 static int test_foreign_context;
-static void test_foreign_limit(void *context, MotionAxis_t axis) {
+static void test_foreign_limit(void *context, MotionAxis_t axis, MotionAxisHardwareStopReason_t reason) {
     (void)context;
     (void)axis;
+    (void)reason;
 }
 
 /* Gives the one-lane instance of the axis a queue of its own in the config. */
@@ -2232,7 +2472,11 @@ static void test_limit_switch_reaches_only_its_instance(void) {
     StepGeneratorInstance_t *const axis_x = &step_generator_task_axis_instances[MOTION_AXIS_X];
     StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
 
-    test_limit_listeners[MOTION_AXIS_Y](test_limit_contexts[MOTION_AXIS_Y], MOTION_AXIS_Y);
+    test_limit_listeners[MOTION_AXIS_Y](
+        test_limit_contexts[MOTION_AXIS_Y],
+        MOTION_AXIS_Y,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(axis_y->limit_trips[0], 1U, "the switch of Y is counted by the instance of Y");
     expect_u32(axis_x->limit_trips[0], 0U, "the instance of X does not see the switch of Y");
     expect_u32(
@@ -2248,10 +2492,18 @@ static void test_limit_switch_reaches_only_its_instance(void) {
     expect_u32(step_stream_group_get_state(&axis_x->group), STEP_STREAM_GROUP_STATE_RUNNING, "the group of X runs on");
 
     /* The listener of X knows only the axis of X: a report of another axis is not its member. */
-    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_Y);
+    test_limit_listeners[MOTION_AXIS_X](
+        test_limit_contexts[MOTION_AXIS_X],
+        MOTION_AXIS_Y,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(axis_x->limit_trips[0], 0U, "a switch of another axis is not counted by the instance of X");
     expect_u32(test_brake_requests[TEST_CH_X], 0U, "a switch of another axis does not brake X");
-    test_limit_listeners[MOTION_AXIS_X](test_limit_contexts[MOTION_AXIS_X], MOTION_AXIS_X);
+    test_limit_listeners[MOTION_AXIS_X](
+        test_limit_contexts[MOTION_AXIS_X],
+        MOTION_AXIS_X,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
     expect_u32(axis_x->limit_trips[0], 1U, "the switch of X is counted by the instance of X");
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of X brakes the channel of X");
     expect_u32(axis_y->limit_trips[0], 1U, "the instance of Y did not count the switch of X");
@@ -2865,6 +3117,389 @@ static void test_reset_count_rises_when_the_reset_fails(void) {
     expect_u32(step_generator_task_instance.halts_total, 2U, "STOP halted once and the failed reset halted again");
 }
 
+/* ---- Progress snapshot ---- */
+
+static StepGeneratorProgress_t read_progress(const StepGeneratorInstance_t *instance) {
+    StepGeneratorProgress_t progress;
+    (void)memset(&progress, 0xFF, sizeof(progress));
+    step_generator_instance_get_progress(instance, &progress);
+    return progress;
+}
+
+static void run_print_pass(void) { step_generator_task_run_instance(&step_generator_task_instance); }
+
+static void set_records_played(uint32_t x, uint32_t y, uint32_t z) {
+    test_records_played[TEST_CH_X] = x;
+    test_records_played[TEST_CH_Y] = y;
+    test_records_played[TEST_CH_Z] = z;
+}
+
+/* A block of x_steps on X whose MotionPlanBlock_t.order is `order`. */
+static void push_ordered_block(uint32_t order, int64_t x_steps) {
+    MotionPlanBlock_t block = make_block(500U + order, x_steps, 0);
+    block.order = order;
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "ordered block is queued");
+}
+
+/* The task has run one pass: the print stream plays three blocks of 3 steps on X (orders 21, 22, 23) and its channels
+ * stream. On Y and Z each block is one idle record, so the block ends there are records 1, 2 and 3. */
+static void start_print_stream_with_three_blocks(void) {
+    reset_fixture();
+    push_ordered_block(21U, 3);
+    push_ordered_block(22U, 3);
+    push_ordered_block(23U, 3);
+    test_wait_script_count = 0U;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_task_instance.channels_held, 1U, "the print stream holds its channels");
+    expect_u32(step_generator_task_instance.halted, 0U, "the print stream is not halted");
+}
+
+/* The task has run one pass on an empty queue and is ready; nothing streams. */
+static void start_idle_print_task(void) {
+    reset_fixture();
+    test_wait_script_count = 0U;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 1U, "the print instance is ready");
+}
+
+static void test_progress_of_a_fresh_instance_and_null_arguments(void) {
+    reset_fixture();
+    StepGeneratorProgress_t marker;
+    (void)memset(&marker, 0xAB, sizeof(marker));
+    StepGeneratorProgress_t progress = marker;
+    step_generator_instance_get_progress(NULL, &progress);
+    expect_true(memcmp(&progress, &marker, sizeof(progress)) == 0, "a NULL instance writes nothing");
+
+    /* A NULL progress is ignored; the instance keeps what it had. */
+    step_generator_instance_get_progress(&step_generator_task_instance, NULL);
+    expect_u32(step_generator_task_instance.generation, 0U, "a NULL progress changes nothing");
+
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.generation, 0U, "fresh generation is 0");
+    expect_u32(progress.played_blocks, 0U, "fresh played_blocks is 0");
+    expect_u32(progress.played_order, 0U, "fresh played_order is 0");
+    expect_u32(progress.stop_resolved, 0U, "fresh stop is not resolved");
+    expect_u32(progress.has_unplayed, 0U, "fresh has_unplayed is 0");
+    expect_u32(progress.unplayed_order, 0U, "fresh unplayed_order is 0");
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_NONE, "fresh halt_cause is 0");
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "fresh halt_axis names no axis");
+    expect_u32(progress.halt_detail, 0U, "fresh halt_detail is 0");
+}
+
+static void test_generation_rises_with_every_halt(void) {
+    reset_fixture();
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(read_progress(&step_generator_task_instance).generation, 1U, "the first halt makes generation 1");
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(read_progress(&step_generator_task_instance).generation, 2U, "a repeated halt makes generation 2");
+    step_generator_instance_halt(NULL);
+    expect_u32(read_progress(&step_generator_task_instance).generation, 2U, "a NULL halt changes no generation");
+    for (uint32_t axis = 0U; axis < STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT; ++axis) {
+        expect_u32(
+            read_progress(step_generator_task_get_axis_instance((MotionAxis_t)axis)).generation,
+            0U,
+            "a halt of the print instance leaves the generation of an axis instance"
+        );
+    }
+
+    /* STOP of all: every instance counts it once. */
+    step_generator_task_halt_all();
+    expect_u32(read_progress(&step_generator_task_instance).generation, 3U, "STOP of all counts in the print instance");
+    for (uint32_t axis = 0U; axis < STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT; ++axis) {
+        expect_u32(
+            read_progress(step_generator_task_get_axis_instance((MotionAxis_t)axis)).generation,
+            1U,
+            "STOP of all counts once in each axis instance"
+        );
+    }
+    step_generator_task_halt_all();
+    expect_u32(read_progress(&step_generator_task_instance).generation, 4U, "a second STOP of all counts again");
+    expect_u32(
+        read_progress(step_generator_task_get_axis_instance(MOTION_AXIS_Z)).generation,
+        2U,
+        "a second STOP of all counts again in an axis instance"
+    );
+}
+
+static void test_halt_wakes_the_task_when_it_runs(void) {
+    reset_fixture();
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(test_flags_set_calls, 0U, "a halt before the task starts wakes nobody");
+    expect_u32(step_generator_task_instance.halted, 1U, "the halt itself still happens");
+
+    reset_fixture();
+    step_generator_task_thread_id = TEST_THREAD_ID;
+    step_generator_instance_halt(&step_generator_task_instance);
+    expect_u32(test_flags_set_calls, 1U, "a halt wakes the task once");
+    expect_u32(test_flags_set_value, STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED, "the halt sets the wake flag");
+    expect_true(test_flags_set_target == TEST_THREAD_ID, "the wake goes to the generator task");
+
+    /* A fault reported by a channel interrupt wakes it as well. */
+    start_idle_print_task();
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    test_flags_set_value = 0U;
+    test_stream_listener[TEST_CH_Y].on_fault(test_stream_listener[TEST_CH_Y].context, STEP_STREAM_AXIS_FAULT_DMA);
+    expect_u32(test_flags_set_value, STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED, "a channel fault wakes the task");
+}
+
+static void test_running_stream_advances_played_blocks_by_block_ends(void) {
+    start_print_stream_with_three_blocks();
+    expect_u32(test_records_played_calls[TEST_CH_X], 1U, "the pass asked X for its played records once");
+    expect_u32(test_records_played_calls[TEST_CH_Y], 1U, "the pass asked Y for its played records once");
+    expect_u32(test_records_played_calls[TEST_CH_Z], 1U, "the pass asked Z for its played records once");
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 0U, "nothing is played at the start");
+    expect_u32(progress.played_order, 0U, "no block order is reported at the start");
+
+    /* X is done, Y and Z are not (their first block ends at record 1) ... */
+    set_records_played(1000U, 1000U, 0U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 0U, "a block is not played while Z has not reached its end");
+    /* ... and the other way round. */
+    set_records_played(0U, 1000U, 1000U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 0U, "a block is not played while X has not reached its end");
+
+    set_records_played(1000U, 1U, 1U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 1U, "the first block is played once every lane has reached its end");
+    expect_u32(progress.played_order, 21U, "the order of the first block is reported");
+
+    set_records_played(1000U, 2U, 2U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 2U, "the second block is played");
+    expect_u32(progress.played_order, 22U, "the order of the second block is reported");
+
+    set_records_played(1000U, 3U, 3U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 3U, "the third block is played");
+    expect_u32(progress.played_order, 23U, "the order of the third block is reported");
+    expect_u32(progress.stop_resolved, 0U, "a stream that is not halted resolves no stop");
+    expect_u32(progress.has_unplayed, 0U, "a stream that is not halted names no unplayed block");
+    expect_u32(progress.generation, 0U, "playing blocks does not change the generation");
+}
+
+/* Z trips its end switch and Y is the first channel to brake: the stop is resolved only when every channel rests. */
+static void test_limit_stop_is_resolved_when_every_channel_rests(void) {
+    start_print_stream_with_three_blocks();
+    set_records_played(1000U, 1U, 1U);
+    run_print_pass();
+    expect_u32(read_progress(&step_generator_task_instance).played_blocks, 1U, "block 21 is played before the stop");
+
+    test_limit_listeners[MOTION_AXIS_Z](
+        test_limit_contexts[MOTION_AXIS_Z],
+        MOTION_AXIS_Z,
+        MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
+    );
+    test_stream_listener[TEST_CH_Y].on_brake(test_stream_listener[TEST_CH_Y].context);
+    expect_u32(step_generator_task_instance.halted, 1U, "the brake halts the print instance");
+
+    /* Only Y still runs: the records it has played are not final, so nothing is counted and nothing is resolved. */
+    test_axis_streaming[TEST_CH_X] = 0U;
+    test_axis_streaming[TEST_CH_Y] = 1U;
+    test_axis_streaming[TEST_CH_Z] = 0U;
+    set_records_played(1000U, 1000U, 1000U);
+    run_print_pass();
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.stop_resolved, 0U, "the stop is not resolved while Y streams");
+    expect_u32(progress.played_blocks, 1U, "no block is counted while Y streams");
+    expect_u32(progress.played_order, 21U, "the last played order is kept while Y streams");
+    expect_u32(progress.has_unplayed, 0U, "no unplayed block is named while Y streams");
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "the cause is known at once");
+    expect_u32(progress.halt_axis, (uint32_t)MOTION_AXIS_Z, "the stop is blamed on Z, whose switch fired");
+    expect_u32(progress.halt_detail, 3U, "the detail is END_LIMIT");
+
+    /* Every channel rests; Y and Z have played 2 records: block 22 is played, block 23 is cut off. */
+    test_axis_streaming[TEST_CH_Y] = 0U;
+    set_records_played(1000U, 2U, 2U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.stop_resolved, 1U, "the stop is resolved once every channel rests");
+    expect_u32(progress.played_blocks, 2U, "blocks 21 and 22 are played completely");
+    expect_u32(progress.played_order, 22U, "block 22 is the last played one");
+    expect_u32(progress.has_unplayed, 1U, "a block was cut off");
+    expect_u32(progress.unplayed_order, 23U, "the first cut off block is 23");
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT, "the cause stays LIMIT");
+    expect_u32(progress.halt_axis, (uint32_t)MOTION_AXIS_Z, "the axis stays Z");
+    expect_u32(progress.halt_detail, 3U, "the detail stays END_LIMIT");
+    expect_u32(progress.generation, 0U, "a limit stop is not a STOP call");
+
+    /* The stop is resolved once: later passes with other numbers change nothing. */
+    set_records_played(1000U, 3U, 3U);
+    run_print_pass();
+    run_print_pass();
+    const StepGeneratorProgress_t again = read_progress(&step_generator_task_instance);
+    expect_u32(again.stop_resolved, 1U, "the stop stays resolved");
+    expect_u32(again.played_blocks, 2U, "the played blocks are final after the resolve");
+    expect_u32(again.played_order, 22U, "the played order is final after the resolve");
+    expect_u32(again.has_unplayed, 1U, "the unplayed block stays named");
+    expect_u32(again.unplayed_order, 23U, "the unplayed order is not resolved again");
+}
+
+static void test_stop_with_blocks_only_in_the_plan_names_the_head_of_the_plan(void) {
+    start_idle_print_task();
+    push_ordered_block(31U, 3);
+    push_ordered_block(32U, 3);
+    step_generator_instance_halt(&step_generator_task_instance);
+    run_print_pass();
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.stop_resolved, 1U, "the stop of a resting instance is resolved at once");
+    expect_u32(progress.has_unplayed, 1U, "the queued blocks are cut off");
+    expect_u32(progress.unplayed_order, 31U, "the first queued block is named, not the last");
+    expect_u32(progress.played_blocks, 0U, "nothing was played");
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, "a STOP call is the cause");
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "a STOP call blames no axis");
+    expect_u32(progress.halt_detail, 0U, "a STOP call has no detail");
+    expect_u32(progress.generation, 1U, "the STOP call raised the generation");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_records_played_calls[channel], 0U, "an instance that holds no channel reads no records");
+    }
+
+    /* Lifting the halt clears the stop part of the snapshot and keeps the cause and the generation. */
+    step_generator_instance_resume_after_stop(&step_generator_task_instance);
+    run_print_pass();
+    expect_u32(step_generator_task_instance.halted, 0U, "the reset lifted the halt");
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.stop_resolved, 0U, "the reset clears stop_resolved");
+    expect_u32(progress.has_unplayed, 0U, "the reset clears has_unplayed");
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, "the cause survives the reset");
+    expect_u32(progress.generation, 1U, "the reset does not change the generation");
+}
+
+static void test_stop_without_any_block_has_nothing_unplayed(void) {
+    start_idle_print_task();
+    /* A leftover of an earlier stop must be overwritten, not kept. */
+    step_generator_task_instance.stop_unplayed_order = 99U;
+    step_generator_instance_halt(&step_generator_task_instance);
+    run_print_pass();
+    const StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.stop_resolved, 1U, "the stop is resolved");
+    expect_u32(progress.has_unplayed, 0U, "no block anywhere, so none is cut off");
+    expect_u32(progress.unplayed_order, 0U, "no unplayed order is reported");
+}
+
+static void test_halt_detail_follows_the_cause(void) {
+    /* A fault of the channel of Y. */
+    start_idle_print_task();
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    test_stream_listener[TEST_CH_Y].on_fault(test_stream_listener[TEST_CH_Y].context, STEP_STREAM_AXIS_FAULT_DMA);
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, "a ring fault is the cause");
+    expect_u32(progress.halt_axis, (uint32_t)MOTION_AXIS_Y, "the faulted channel is Y");
+    expect_u32(progress.halt_detail, (uint32_t)STEP_STREAM_AXIS_FAULT_DMA, "the detail is the fault code");
+
+    /* A feeder error. */
+    reset_fixture();
+    push_block(70U, 3);
+    test_fail_prepare = 1U;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR, "a feeder error is the cause");
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "a feeder error blames no channel");
+    expect_u32(progress.halt_detail, (uint32_t)STEP_STREAM_FEEDER_STATUS_AXIS_ERROR, "the detail is the feeder status");
+
+    /* The causes without a detail read 0 even when the fields of an earlier cause hold values. */
+    start_idle_print_task();
+    step_generator_instance_halt(&step_generator_task_instance);
+    step_generator_task_instance.halt_fault = 7U;
+    step_generator_task_instance.feeder_status = 9U;
+    step_generator_task_instance.limit_reason = 3U;
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_HALT_CALL, "a STOP call is the cause");
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "a STOP call blames no axis");
+    expect_u32(progress.halt_detail, 0U, "a STOP call has no detail");
+
+    reset_fixture();
+    (void)run_task_until_jump(NULL);
+    step_generator_task_instance.halt_fault = 7U;
+    step_generator_task_instance.feeder_status = 9U;
+    step_generator_task_instance.limit_reason = 3U;
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_SETUP_FAILED, "a failed setup is the cause");
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "a failed setup blames no axis");
+    expect_u32(progress.halt_detail, 0U, "a failed setup has no detail");
+}
+
+/* What the listener saw of the print snapshot when it was called: the snapshot is published before the call. */
+static uint32_t test_progress_listener_calls;
+static uint32_t test_progress_listener_played_blocks;
+static uint32_t test_progress_listener_stop_resolved;
+
+static void count_progress_listener(void) {
+    ++test_progress_listener_calls;
+    const StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    test_progress_listener_played_blocks = progress.played_blocks;
+    test_progress_listener_stop_resolved = progress.stop_resolved;
+}
+
+/* MotionTask is woken when the print snapshot changes: blocks played, or the stop resolved. */
+static void test_progress_listener_is_called_when_the_print_snapshot_changes(void) {
+    test_progress_listener_calls = 0U;
+    step_generator_task_set_progress_listener(count_progress_listener);
+    start_print_stream_with_three_blocks();
+    expect_u32(test_progress_listener_calls, 0U, "a stream that has played nothing reports no progress");
+
+    set_records_played(1000U, 1U, 1U);
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 1U, "the first played block calls the listener");
+    expect_u32(test_progress_listener_played_blocks, 1U, "the snapshot is published before the listener is called");
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 1U, "a pass that changes nothing does not call the listener");
+
+    set_records_played(1000U, 2U, 2U);
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 2U, "the second played block calls the listener");
+    expect_u32(test_progress_listener_played_blocks, 2U, "the listener sees two played blocks");
+
+    step_generator_instance_halt(&step_generator_task_instance);
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 3U, "the resolved stop calls the listener");
+    expect_u32(test_progress_listener_stop_resolved, 1U, "the stop is resolved when the listener is called");
+    expect_u32(test_progress_listener_played_blocks, 2U, "the stop does not change the played blocks");
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 3U, "a stop is reported once");
+
+    /* A new order with the same count of played blocks is a change too (a stream that restarted between two passes). */
+    start_print_stream_with_three_blocks();
+    set_records_played(1000U, 1U, 1U);
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 4U, "the first block of the new stream calls the listener");
+    step_generator_task_instance.played_order = 99U;
+    run_print_pass();
+    expect_u32(test_progress_listener_calls, 5U, "another order with the same played blocks calls the listener");
+    expect_u32(read_progress(&step_generator_task_instance).played_order, 21U, "the snapshot carries the order that was played");
+
+    /* Without a listener the snapshot is still published. */
+    step_generator_task_set_progress_listener(NULL);
+    start_print_stream_with_three_blocks();
+    set_records_played(1000U, 1U, 1U);
+    run_print_pass();
+    expect_u32(read_progress(&step_generator_task_instance).played_blocks, 1U, "the snapshot is published without a listener");
+    expect_u32(test_progress_listener_calls, 5U, "a removed listener is not called");
+
+    /* The instances of the axes have no moves to answer: their changes do not call the listener. */
+    step_generator_task_set_progress_listener(count_progress_listener);
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    run_one_service_pass();
+    StepGeneratorInstance_t *const axis_y = &step_generator_task_axis_instances[MOTION_AXIS_Y];
+    expect_u32(step_generator_instance_is_ready(axis_y), 1U, "the instance of Y is ready");
+    const uint32_t calls_before = test_progress_listener_calls;
+    step_generator_instance_halt(axis_y);
+    step_generator_task_run_instance(axis_y);
+    expect_u32(read_progress(axis_y).stop_resolved, 1U, "the instance of Y resolved its stop");
+    expect_u32(test_progress_listener_calls, calls_before, "the snapshot of an axis instance does not call the listener");
+    step_generator_task_set_progress_listener(NULL);
+}
+
 int main(void) {
     for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         test_axis_markers[channel] = (int)channel;
@@ -2885,6 +3520,12 @@ int main(void) {
     test_faults_halt_the_task();
     test_listener_and_notifications();
     test_limit_switch_brakes_through_the_group();
+    test_halt_member_is_the_axis_whose_switch_fired();
+    test_limit_in_idle_group_is_counted_but_not_latched();
+    test_limit_in_priming_group_latches_and_real_limit_outranks_release();
+    test_limit_in_priming_group_blames_the_real_limit_on_halt();
+    test_limit_in_running_group_latches_a_release();
+    test_limit_in_stopping_or_faulted_group_is_not_latched();
     test_group_ends_with_its_stream();
     test_stop_reset_clears_a_group_fault();
     test_reset_is_refused_while_a_channel_runs();
@@ -2908,6 +3549,15 @@ int main(void) {
     test_instance_is_ready_once_its_feeder_is_built();
     test_reset_count_rises_by_one_per_finished_reset();
     test_reset_count_rises_when_the_reset_fails();
+    test_progress_of_a_fresh_instance_and_null_arguments();
+    test_generation_rises_with_every_halt();
+    test_halt_wakes_the_task_when_it_runs();
+    test_running_stream_advances_played_blocks_by_block_ends();
+    test_limit_stop_is_resolved_when_every_channel_rests();
+    test_stop_with_blocks_only_in_the_plan_names_the_head_of_the_plan();
+    test_stop_without_any_block_has_nothing_unplayed();
+    test_halt_detail_follows_the_cause();
+    test_progress_listener_is_called_when_the_print_snapshot_changes();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Step generator task unit tests failed: %u\n", (unsigned int)test_failures);

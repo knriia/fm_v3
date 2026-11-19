@@ -9,6 +9,8 @@ static volatile uint32_t command_queue_enqueue_errors;
 static volatile uint32_t command_queue_max_queued;
 /* Written once by the producer at startup and read by the consumer; a pointer store is atomic on Cortex-M7. */
 static volatile CommandQueueSpaceListener_t command_queue_space_listener;
+/* Written once by the consumer at startup and read by the producer. */
+static volatile CommandQueuePutListener_t command_queue_put_listener;
 
 static void command_queue_counter_increment(volatile uint32_t *counter) {
     if (*counter != UINT32_MAX) {
@@ -45,6 +47,10 @@ CommandQueuePutResult_t command_queue_try_send(const CommandDTO_t *command) {
     if (status == osOK) {
         command_queue_counter_increment(&command_queue_enqueued_total);
         command_queue_update_max_queued(osMessageQueueGetCount(command_queue_handle));
+        const CommandQueuePutListener_t listener = command_queue_put_listener;
+        if (listener != NULL) {
+            listener();
+        }
         return COMMAND_QUEUE_PUT_OK;
     }
     if (status == osErrorResource) {
@@ -78,6 +84,8 @@ uint32_t command_queue_free_slots(void) {
 }
 
 void command_queue_set_space_listener(CommandQueueSpaceListener_t listener) { command_queue_space_listener = listener; }
+
+void command_queue_set_put_listener(CommandQueuePutListener_t listener) { command_queue_put_listener = listener; }
 
 void command_queue_get_diagnostics(CommandQueueDiagnostics_t *diagnostics) {
     if (diagnostics == NULL) {
