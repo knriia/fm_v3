@@ -62,7 +62,7 @@ typedef struct {
     {                                                                                                                  \
         .fast_seek = {1000U, 50000U, 100000U},                                                                         \
         .backoff = {100U, 2000U, 2000U},                                                                               \
-        .approach = {10U, 100U, 500U},                                                                                 \
+        .approach = {7U, 67U, 333U},                                                                                   \
     }
 
 #define MOTION_TASK_BELT_CALIBRATION_SETTINGS                                                                          \
@@ -82,7 +82,7 @@ typedef struct {
     {                                                                                                                  \
         .fast_seek = MOTION_TASK_Z_FAST_PROFILE,                                                                       \
         .backoff = {3200U, 16000U, 80000U},                                                                            \
-        .approach = {800U, 4800U, 32000U},                                                                             \
+        .approach = {107U, 640U, 4267U},                                                                               \
     }
 
 /* The take-up is about 0.08 mm and the measurement about 12.2 mm. */

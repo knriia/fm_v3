@@ -2004,7 +2004,7 @@ static void test_x_homing_through_the_stream(void) {
     );
     expect_u32(queued_blocks(&gen_x.queue), 0U, "each stop of the homing flushes the queue of X");
     expect_u32(test_block_ready_notifications, 3U, "each homing move is one block for the generator");
-    expect_u32(fake_axes[MOTION_AXIS_X].bench_last_target_rate_hz, 100U, "the approach plays at the approach rate");
+    expect_u32(fake_axes[MOTION_AXIS_X].bench_last_target_rate_hz, 67U, "the approach plays at the approach rate");
     expect_u32(context.machine_state.homed_axes_mask, MOTION_PLANNER_ALL_AXES_MASK, "X is homed");
 
     /* The generator resets only after a few waits: homing goes on with the backoff. */
@@ -2459,7 +2459,7 @@ static void test_z_homing_through_the_stream(void) {
     expect_u32(fake_z.release_stop_arms, 1U, "the Z backoff arms the Z release stop");
     expect_u32(fake_z.release_stop_disarms, 1U, "the Z release stop is disarmed before the approach");
     expect_i64(fake_z.bench_last_signed_steps, -1000000, "the Z approach heads toward the Z start switch");
-    expect_u32(fake_z.bench_last_target_rate_hz, 4800U, "the Z approach plays at the screw approach rate");
+    expect_u32(fake_z.bench_last_target_rate_hz, 640U, "the Z approach plays at the screw approach rate");
     expect_u32(
         fake_z.start_limit_hook == encoder_oz_reset_coordinate ? 1U : 0U,
         1U,
@@ -2549,7 +2549,7 @@ static void test_y_homing_through_the_stream(void) {
     expect_u32(fake_y.release_stop_arms, 1U, "the Y backoff arms the Y release stop");
     expect_u32(fake_y.release_stop_disarms, 1U, "the Y release stop is disarmed before the approach");
     expect_i64(fake_y.bench_last_signed_steps, -1000000, "the Y approach heads toward the Y start switch");
-    expect_u32(fake_y.bench_last_target_rate_hz, 100U, "the Y approach plays at the belt approach rate");
+    expect_u32(fake_y.bench_last_target_rate_hz, 67U, "the Y approach plays at the belt approach rate");
     expect_u32(
         fake_y.start_limit_hook == encoder_oy_reset_coordinate ? 1U : 0U,
         1U,
@@ -2625,7 +2625,7 @@ static uint8_t test_axis_bit(uint32_t axis) { return (uint8_t)(1U << axis); }
 /* Target rates of the first homing move (the fast seek) and of the last one (the approach), from the axis settings:
  * belts X and Y 50 kHz and 100 Hz, the screw Z 80 kHz and 4.8 kHz. */
 static const uint32_t test_seek_rate_hz[MOTION_AXIS_HARDWARE_COUNT] = {50000U, 50000U, 80000U};
-static const uint32_t test_approach_rate_hz[MOTION_AXIS_HARDWARE_COUNT] = {100U, 100U, 4800U};
+static const uint32_t test_approach_rate_hz[MOTION_AXIS_HARDWARE_COUNT] = {67U, 67U, 640U};
 
 static MotionAxisHardwareStartLimitHook_t test_scale_zero_hook(uint32_t axis) {
     return axis == (uint32_t)MOTION_AXIS_X   ? encoder_ox_reset_coordinate
@@ -3195,7 +3195,7 @@ static void test_z_home_and_calibration(void) {
         1U,
         "the procedure moves Z through the planned stream"
     );
-    expect_u32(fake_z.bench_last_target_rate_hz, 4800U, "Z approaches its home switch slowly");
+    expect_u32(fake_z.bench_last_target_rate_hz, 640U, "Z approaches its home switch slowly");
     expect_u32(fake_z.bench_starts, 6U, "Z is homed before and after the measurement");
     expect_u32(fake_x_bench_starts + fake_y.bench_starts, 0U, "CALIBRATE Z does not move X or Y");
     expect_u32(context.calibration.calibrated_axes_mask, MOTION_PLANNER_AXIS_Z_MASK, "Z is marked calibrated");
