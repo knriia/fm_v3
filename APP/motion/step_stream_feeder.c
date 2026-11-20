@@ -160,6 +160,7 @@ void step_stream_feeder_reset(StepStreamFeeder_t *feeder) {
     }
     feeder->phase = STEP_STREAM_FEEDER_PHASE_IDLE;
     feeder->fault_status = STEP_STREAM_FEEDER_STATUS_OK;
+    feeder->generator_fault_status = STEP_STREAM_GENERATOR_STATUS_OK;
     memset(feeder->lane, 0, sizeof(feeder->lane));
     feeder->plan_epoch = 0U;
     feeder->front_block = 0U;
@@ -322,13 +323,18 @@ static int8_t step_stream_feeder_begin_block(StepStreamFeeder_t *feeder, uint32_
         step_stream_feeder_open_block_end(feeder, state->next_block, &block) == 0U) {
         return 0;
     }
-    if (next == STEP_STREAM_FEEDER_NEXT_ERROR || step_stream_generator_init_from_block(
-                                                     &state->generator,
-                                                     &feeder->config.generator,
-                                                     &block,
-                                                     feeder->config.axis_index[lane],
-                                                     &state->carry
-                                                 ) != STEP_STREAM_GENERATOR_STATUS_OK) {
+    if (next == STEP_STREAM_FEEDER_NEXT_ERROR) {
+        return -1;
+    }
+    const StepStreamGeneratorStatus_t init_status = step_stream_generator_init_from_block(
+        &state->generator,
+        &feeder->config.generator,
+        &block,
+        feeder->config.axis_index[lane],
+        &state->carry
+    );
+    if (init_status != STEP_STREAM_GENERATOR_STATUS_OK) {
+        feeder->generator_fault_status = init_status;
         return -1;
     }
     state->generator_active = 1U;
@@ -375,6 +381,7 @@ step_stream_feeder_fill_half(StepStreamFeeder_t *feeder, uint32_t lane, uint16_t
             &written
         );
         if (status != STEP_STREAM_GENERATOR_STATUS_OK && status != STEP_STREAM_GENERATOR_STATUS_DONE) {
+            feeder->generator_fault_status = status;
             return step_stream_feeder_generator_fault(feeder);
         }
         used += (uint32_t)written;
@@ -642,6 +649,10 @@ uint8_t step_stream_feeder_get_first_unplayed(const StepStreamFeeder_t *feeder, 
 
 StepStreamFeederPhase_t step_stream_feeder_get_phase(const StepStreamFeeder_t *feeder) {
     return feeder == NULL ? STEP_STREAM_FEEDER_PHASE_IDLE : feeder->phase;
+}
+
+StepStreamGeneratorStatus_t step_stream_feeder_get_generator_fault(const StepStreamFeeder_t *feeder) {
+    return feeder == NULL ? STEP_STREAM_GENERATOR_STATUS_OK : feeder->generator_fault_status;
 }
 
 uint8_t step_stream_feeder_get_moving_axes(const StepStreamFeeder_t *feeder) {

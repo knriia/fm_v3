@@ -229,6 +229,73 @@ static int test_block_wrapper_and_duration(void) {
     return 1;
 }
 
+/* Plays an idle lane (no steps) of the block at 1 kHz: one tick is 1 ms, so the sum of the record periods is the
+ * floor of the duration in ms and the carry is the rest in ns-ticks units (duration_ns * 1000 mod 1e9). */
+static int play_block_duration(
+    const MotionPlanBlock_t *block,
+    uint64_t *total_ticks,
+    uint32_t *carry_remainder
+) {
+    StepStreamGeneratorConfig_t config = default_config();
+    config.timer_clock_hz = 1000U;
+    StepStreamGenerator_t generator;
+    uint16_t records[300] = {0};
+    StepStreamGeneratorCarry_t carry = {0};
+    StepStreamGeneratorStatus_t last_status = STEP_STREAM_GENERATOR_STATUS_OK;
+
+    CHECK(step_stream_generator_init_from_block(&generator, &config, block, 0U, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    const size_t count = collect_records(&generator, records, 100U, 100U, &last_status);
+    CHECK(last_status == STEP_STREAM_GENERATOR_STATUS_DONE);
+    *total_ticks = 0U;
+    for (size_t index = 0U; index < count; ++index) {
+        *total_ticks += record_period(records, index);
+    }
+    CHECK(step_stream_generator_get_carry(&generator, &carry) == STEP_STREAM_GENERATOR_STATUS_OK);
+    *carry_remainder = carry.ns_to_ticks_remainder;
+    return 1;
+}
+
+static int test_long_block_duration_reduces_fraction(void) {
+    StepStreamGeneratorConfig_t config = default_config();
+    StepStreamGenerator_t generator;
+    MotionPlanBlock_t block = {0};
+    uint64_t ticks = 0U;
+    uint32_t remainder = 0U;
+
+    /* master * feed * den would overflow before the division; the duration is 343000 / (10000 * 343000) * 197000 s. */
+    block.master_step_count = 343000U;
+    block.step_event_rate_numerator = 3430000000U;
+    block.step_event_rate_denominator = 197000U;
+    CHECK(play_block_duration(&block, &ticks, &remainder));
+    CHECK(ticks == 19700U);
+    CHECK(remainder == 0U);
+
+    /* 28143142857.14... ns rounded up to 28143142858 ns: 28143 ms and 142858000 of carry (142857000 if it was floored). */
+    block.step_event_rate_numerator = 7000U * 343000U;
+    block.step_event_rate_denominator = 197002U;
+    CHECK(play_block_duration(&block, &ticks, &remainder));
+    CHECK(ticks == 28143U);
+    CHECK(remainder == 142858000U);
+
+    /* Short move, no change: 87000 steps at 10000 um/s over 50000 um = 5 s. */
+    block.master_step_count = 87000U;
+    block.step_event_rate_numerator = 10000U * 87000U;
+    block.step_event_rate_denominator = 50000U;
+    CHECK(play_block_duration(&block, &ticks, &remainder));
+    CHECK(ticks == 5000U);
+    CHECK(remainder == 0U);
+
+    /* The numerator 3 shares no factor with 343000 or 197000e9, so nothing reduces: 343000 * 1.97e14 ≈ 6.76e19 is
+     * still above UINT64_MAX. */
+    block.master_step_count = 343000U;
+    block.step_event_rate_numerator = 3U;
+    block.step_event_rate_denominator = 197000U;
+    CHECK(step_stream_generator_init_from_block(&generator, &config, &block, 0U, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_ARITHMETIC_OVERFLOW);
+    return 1;
+}
+
 static int test_idle_and_split_boundaries(void) {
     StepStreamGeneratorConfig_t config = default_config();
     config.min_record_ticks = 100U;
@@ -640,7 +707,7 @@ static int test_max_record_ticks(void) {
 int main(void) {
     if (!test_invalid_arguments() || !test_block_wrapper_and_duration() || !test_idle_and_split_boundaries() ||
         !test_resume_and_exact_sums() || !test_carry_and_overflow() || !test_speed_profiles() ||
-        !test_max_record_ticks() || !test_long_idle_is_chunked()) {
+        !test_max_record_ticks() || !test_long_idle_is_chunked() || !test_long_block_duration_reduces_fraction()) {
         return 1;
     }
     puts("step_stream_generator_unit_tests: PASS");

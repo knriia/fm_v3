@@ -132,12 +132,16 @@ typedef struct {
      * STEP_GENERATOR_TASK_NO_AXIS. */
     uint32_t halt_axis;
     /* For LIMIT MotionAxisHardwareStopReason_t (START_LIMIT 2, END_LIMIT 3), for GROUP_FAULT StepStreamAxisFault_t, for
-     * FEEDER_ERROR StepStreamFeederStatus_t; 0 for the others. */
+     * FEEDER_ERROR StepStreamFeederStatus_t in the low nibble and the StepStreamGeneratorStatus_t that caused it in the
+     * high one (shift STEP_GENERATOR_TASK_DETAIL_GENERATOR_SHIFT, 0 when the generator was not the cause); 0 for the
+     * others. The whole value goes to a byte of the ERROR frame. */
     uint32_t halt_detail;
 } StepGeneratorProgress_t;
 
 /* halt_axis while no axis is to blame. */
 #define STEP_GENERATOR_TASK_NO_AXIS 0xFFFFFFFFU
+/* Where the generator status sits in the halt detail of a feeder error. */
+#define STEP_GENERATOR_TASK_DETAIL_GENERATOR_SHIFT 4U
 
 /* Called from StepGeneratorTask after the snapshot of the printing stream changed; must only signal and return. */
 typedef void (*StepGeneratorProgressListener_t)(void);

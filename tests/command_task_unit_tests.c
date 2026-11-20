@@ -1793,8 +1793,9 @@ static void test_result_stream_interrupted_and_completed_frames(void) {
     script_detailed_result(0U, 520U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 2U, 2U, 3U);
     /* A group fault (cause 3) of X: axis 0 is X and must not be sent as "no axis". */
     script_detailed_result(1U, 521U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 3U, 0U, 0x7EU);
-    /* A stop that no axis is to blame for. */
-    script_detailed_result(2U, 522U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 4U, 0xFFU, 9U);
+    /* A stop that no axis is to blame for: a feeder error (cause 4), the detail 0x32 is the generator status 3 in the
+     * high nibble and the feeder status 2 in the low one, sent whole as the fifth byte. */
+    script_detailed_result(2U, 522U, COMMAND_MESSAGE_TYPE_ERROR, 0x0128U, 4U, 0xFFU, 0x32U);
     script_result(3U, 523U, COMMAND_MESSAGE_TYPE_DONE, 0x0002U);
     /* The stop fields of a DONE result are not part of its frame. */
     script_detailed_result(4U, 524U, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_ACCEPTED, 2U, 2U, 3U);
@@ -1807,7 +1808,7 @@ static void test_result_stream_interrupted_and_completed_frames(void) {
     expect_u32((uint32_t)test_captured_response_length, 3U * 19U + 2U * 16U, "three 19-byte ERROR and two 16-byte DONE frames");
     expect_error_details_at(0U, 520U, 0x0128U, 2U, 2U, 3U, "the limit stop carries cause, axis and detail");
     expect_error_details_at(19U, 521U, 0x0128U, 3U, 0U, 0x7EU, "axis X is sent as 0");
-    expect_error_details_at(38U, 522U, 0x0128U, 4U, 0xFFU, 9U, "no blamed axis is sent as 0xFF");
+    expect_error_details_at(38U, 522U, 0x0128U, 4U, 0xFFU, 0x32U, "no blamed axis is sent as 0xFF, the detail byte is whole");
     expect_frame_at(57U, COMMAND_MESSAGE_TYPE_DONE, 523U, 2U, "the completed move gets DONE with code 2");
     expect_u32(test_captured_response[57U + COMMAND_FRAME_HEADER_SIZE], 0x02U, "COMPLETED payload is 02 00 (low)");
     expect_u32(test_captured_response[57U + COMMAND_FRAME_HEADER_SIZE + 1U], 0x00U, "COMPLETED payload is 02 00 (high)");

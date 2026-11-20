@@ -99,6 +99,8 @@ typedef struct StepGeneratorInstance {
     volatile uint32_t limit_reason;
     /* Written by the generator task only. */
     volatile uint32_t feeder_status;
+    /* StepStreamGeneratorStatus_t behind a GENERATOR_ERROR of the feeder, taken with feeder_status. */
+    volatile uint32_t feeder_generator_status;
     /* Resets after STOP that left a channel running; counted into axis_errors with the feeder's errors. */
     volatile uint32_t reset_failures;
     /* Counted inside a critical section: the switch interrupt and the poll at the stream start both report. */
@@ -863,7 +865,9 @@ void step_generator_instance_get_progress(const StepGeneratorInstance_t *instanc
     } else if (instance->halt_cause == STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT) {
         progress->halt_detail = instance->halt_fault;
     } else if (instance->halt_cause == STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR) {
-        progress->halt_detail = instance->feeder_status;
+        /* Low nibble: the feeder status; high nibble: the generator status behind it (0 when none). */
+        progress->halt_detail =
+            (instance->feeder_generator_status << STEP_GENERATOR_TASK_DETAIL_GENERATOR_SHIFT) | instance->feeder_status;
     }
     step_stream_axis_exit_critical(primask);
     progress->halt_axis =
@@ -913,6 +917,7 @@ static void step_generator_task_run_instance(StepGeneratorInstance_t *self) {
         if (feeder_status != STEP_STREAM_FEEDER_STATUS_OK) {
             /* The feeder has stopped the axis; the plan is untrustworthy until STOP. */
             self->feeder_status = (uint32_t)feeder_status;
+            self->feeder_generator_status = (uint32_t)step_stream_feeder_get_generator_fault(&self->feeder);
             step_generator_task_set_halted(
                 self,
                 STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
