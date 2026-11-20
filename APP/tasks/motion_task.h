@@ -56,7 +56,8 @@ typedef struct {
 
 void MotionTask(void *argument);
 /* Wake MotionTask: a command was put into the command queue, or the step stream reported progress. They only set a
- * thread flag, so they can be called from any task; before the task has started they do nothing. */
+ * thread flag, so they can be called from any task; before the task has started they do nothing. Room in the plan
+ * buffer wakes the task through the space listener that it sets on the buffer itself. */
 void motion_task_notify_command(void);
 void motion_task_notify_progress(void);
 void motion_task_get_diagnostics(MotionTaskDiagnostics *diagnostics);
@@ -76,6 +77,8 @@ void motion_task_test_seed_diagnostics(const MotionTaskDiagnostics *diagnostics)
 void motion_task_test_reset_planner(void);
 uint32_t motion_task_test_get_planner_call_count(void);
 MotionPlannerResult_t motion_task_test_get_last_planner_result(void);
+/* Fills the tracker of the moves that wait for a result, so that a test can see a move wait for room in it. */
+void motion_task_test_fill_tracker(void);
 #endif
 
 #endif /* FM_V3_MOTION_TASK_H */

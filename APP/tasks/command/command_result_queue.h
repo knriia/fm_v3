@@ -10,7 +10,8 @@
  * equal). */
 #define COMMAND_RESULT_QUEUE_PENDING_MOVES 128U
 /* A command that waits in the command queue still owes its first result, and a move that has been accepted owes its
- * final one, so the queue holds both and one more: a result is not lost while the client reads slowly. */
+ * final one, so the queue holds both and one more. That covers a client that reads at the pace it sends; a client that
+ * stops reading can make MotionTask produce more results than fit (a move owes two), and those are dropped. */
 #define COMMAND_RESULT_QUEUE_CAPACITY (COMMAND_QUEUE_CAPACITY + COMMAND_RESULT_QUEUE_PENDING_MOVES + 1U)
 
 /* What MotionTask decided about one command: a DONE frame with a COMMAND_DONE_* result code, or an ERROR frame with a
@@ -23,6 +24,8 @@ typedef struct {
     uint8_t cause;
     uint8_t axis;
     uint8_t detail;
+    /* The epoch of the command stream (command_queue_epoch) the result belongs to. */
+    uint32_t epoch;
 } CommandResult_t;
 
 /* Called from the producer task after a result is queued; must only signal and return. */
@@ -30,11 +33,14 @@ typedef void (*CommandResultListener_t)(void);
 
 osStatus_t command_result_queue_init(void);
 /* Only MotionTask posts. Never waits; a result that does not fit is dropped, which takes a client that has left
- * COMMAND_RESULT_QUEUE_CAPACITY results unread. */
-void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_t code);
-/* The same with the stop details of an ERROR frame; command_result_queue_post gives cause 0, COMMAND_ERROR_AXIS_NONE
- * and detail 0. */
-void command_result_queue_post_detailed(
+ * COMMAND_RESULT_QUEUE_CAPACITY results unread. The result belongs to `epoch` of the command stream: the epoch that
+ * MotionTask read before it took the command or the snapshot the result comes from. If a STOP has flushed the command
+ * queue since, the result is void and the task that sends results drops it. */
+void command_result_queue_post_in_epoch(uint32_t epoch, uint32_t sequence, uint8_t response_type, uint16_t code);
+/* The same with the stop details of an ERROR frame; command_result_queue_post_in_epoch gives cause 0,
+ * COMMAND_ERROR_AXIS_NONE and detail 0. */
+void command_result_queue_post_detailed_in_epoch(
+    uint32_t epoch,
     uint32_t sequence,
     uint8_t response_type,
     uint16_t code,
@@ -42,7 +48,8 @@ void command_result_queue_post_detailed(
     uint8_t axis,
     uint8_t detail
 );
-/* Never waits; osOK when a result was taken, osErrorResource when none is queued. */
+/* Never waits; osOK when a result was taken, osErrorResource when none is queued. Results of an older epoch than the
+ * current one are skipped. */
 osStatus_t command_result_queue_try_receive(CommandResult_t *result);
 /* Drops every queued result; a new connection must not receive the results of the previous one. */
 void command_result_queue_discard_all(void);

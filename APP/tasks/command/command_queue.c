@@ -7,6 +7,8 @@ static volatile uint32_t command_queue_enqueued_total;
 static volatile uint32_t command_queue_full_rejections;
 static volatile uint32_t command_queue_enqueue_errors;
 static volatile uint32_t command_queue_max_queued;
+/* Written only by command_queue_flush, read by the consumer and by the task that sends the results. */
+static volatile uint32_t command_queue_epoch_value;
 /* Written once by the producer at startup and read by the consumer; a pointer store is atomic on Cortex-M7. */
 static volatile CommandQueueSpaceListener_t command_queue_space_listener;
 /* Written once by the consumer at startup and read by the producer. */
@@ -82,6 +84,20 @@ osStatus_t command_queue_receive(CommandDTO_t *command, uint32_t timeout_ms) {
 uint32_t command_queue_free_slots(void) {
     return command_queue_handle == NULL ? 0U : osMessageQueueGetSpace(command_queue_handle);
 }
+
+void command_queue_discard_pending(void) {
+    CommandDTO_t discarded = {0};
+    while (command_queue_receive(&discarded, 0U) == osOK) {
+    }
+}
+
+void command_queue_flush(void) {
+    command_queue_discard_pending();
+    /* After the drain, so that a command taken before it is older than the epoch that the consumer reads. */
+    (void)__atomic_fetch_add(&command_queue_epoch_value, 1U, __ATOMIC_SEQ_CST);
+}
+
+uint32_t command_queue_epoch(void) { return __atomic_load_n(&command_queue_epoch_value, __ATOMIC_SEQ_CST); }
 
 void command_queue_set_space_listener(CommandQueueSpaceListener_t listener) { command_queue_space_listener = listener; }
 

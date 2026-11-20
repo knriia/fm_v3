@@ -302,11 +302,135 @@ static void test_command_queue_put_listener(void) {
     expect_u32(test_put_listener_calls, calls_when_full, "a removed listener is not called");
 }
 
+static uint32_t test_epoch_probe_calls;
+static uint32_t test_epoch_probe_epoch;
+static uint32_t test_epoch_probe_free_slots;
+static uint32_t test_epoch_probe_wrong_epoch_calls;
+static uint32_t test_epoch_probe_expected_epoch;
+
+/* A space listener that looks at the epoch while the queue is being drained. */
+static void test_epoch_probe_listener(void) {
+    ++test_epoch_probe_calls;
+    test_epoch_probe_epoch = command_queue_epoch();
+    test_epoch_probe_free_slots = command_queue_free_slots();
+    if (test_epoch_probe_epoch != test_epoch_probe_expected_epoch) {
+        ++test_epoch_probe_wrong_epoch_calls;
+    }
+}
+
+static void drain_command_queue(void) {
+    CommandDTO_t drained = {0};
+    while (command_queue_receive(&drained, 0U) == osOK) {
+    }
+}
+
+static void send_commands(uint32_t count) {
+    for (uint32_t sequence = 1U; sequence <= count; ++sequence) {
+        const CommandDTO_t command = make_command(sequence);
+        expect_u32(command_queue_try_send(&command), COMMAND_QUEUE_PUT_OK, "a command is queued for the flush tests");
+    }
+}
+
+/* The module starts with the epoch 0. Before the queue exists there is nothing to drain: discarding changes no epoch,
+ * and a flush only starts the next one. */
+static void test_epoch_starts_at_zero_and_works_before_initialization(void) {
+    expect_u32(command_queue_epoch(), 0U, "the epoch of a new module is 0");
+    command_queue_discard_pending();
+    expect_u32(command_queue_epoch(), 0U, "dropping the commands of a queue that does not exist changes no epoch");
+    command_queue_flush();
+    expect_u32(command_queue_epoch(), 1U, "a flush before the queue exists starts the next epoch");
+    expect_u32(command_queue_free_slots(), 0U, "the flush created no queue");
+}
+
+static void test_discard_pending_drops_the_commands_and_keeps_the_epoch(void) {
+    drain_command_queue();
+    command_queue_set_space_listener(NULL);
+    const uint32_t epoch = command_queue_epoch();
+    send_commands(5U);
+    expect_u32(command_queue_free_slots(), COMMAND_QUEUE_CAPACITY - 5U, "five commands wait in the queue");
+
+    test_space_listener_calls = 0U;
+    command_queue_set_space_listener(test_space_listener);
+    command_queue_discard_pending();
+    expect_u32(command_queue_free_slots(), COMMAND_QUEUE_CAPACITY, "every waiting command is dropped");
+    expect_u32(test_space_listener_calls, 5U, "each dropped command frees its place for the producer");
+    expect_u32(command_queue_epoch(), epoch, "dropping the commands does not change the epoch");
+    CommandDTO_t output = {0};
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osErrorResource, "no command survives");
+
+    command_queue_discard_pending();
+    expect_u32(test_space_listener_calls, 5U, "dropping from an empty queue frees nothing");
+    expect_u32(command_queue_epoch(), epoch, "dropping from an empty queue does not change the epoch either");
+
+    send_commands(COMMAND_QUEUE_CAPACITY);
+    expect_u32(command_queue_free_slots(), 0U, "the queue is full");
+    command_queue_discard_pending();
+    expect_u32(command_queue_free_slots(), COMMAND_QUEUE_CAPACITY, "a full queue is dropped completely");
+    expect_u32(test_space_listener_calls, 5U + COMMAND_QUEUE_CAPACITY, "every command of the full queue was taken out");
+    command_queue_set_space_listener(NULL);
+}
+
+static void test_flush_drops_the_commands_and_starts_the_next_epoch(void) {
+    drain_command_queue();
+    command_queue_set_space_listener(NULL);
+    const uint32_t epoch = command_queue_epoch();
+    send_commands(5U);
+
+    command_queue_flush();
+    expect_u32(command_queue_free_slots(), COMMAND_QUEUE_CAPACITY, "the flush drops every waiting command");
+    expect_u32(command_queue_epoch(), epoch + 1U, "the flush raises the epoch by one");
+    CommandDTO_t output = {0};
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osErrorResource, "no command survives the flush");
+
+    command_queue_flush();
+    expect_u32(command_queue_epoch(), epoch + 2U, "a flush of an empty queue starts an epoch as well");
+    CommandDTO_t command = make_command(77U);
+    expect_u32(command_queue_try_send(&command), COMMAND_QUEUE_PUT_OK, "the queue takes commands after a flush");
+    expect_u32(command_queue_receive(&output, 0U), (uint32_t)osOK, "the command after the flush is received");
+    expect_u32(output.sequence, 77U, "the command after the flush is the one sent");
+    expect_u32(command_queue_epoch(), epoch + 2U, "sending and receiving do not change the epoch");
+}
+
+/* A consumer reads the epoch before it takes a command. The epoch must rise only after the drain: a command that the
+ * flush takes out, or that the consumer took just before, is then older than the epoch. */
+static void test_flush_raises_the_epoch_after_the_queue_is_drained(void) {
+    drain_command_queue();
+    const uint32_t epoch = command_queue_epoch();
+    send_commands(3U);
+    test_epoch_probe_calls = 0U;
+    test_epoch_probe_wrong_epoch_calls = 0U;
+    test_epoch_probe_epoch = UINT32_MAX;
+    test_epoch_probe_free_slots = UINT32_MAX;
+    test_epoch_probe_expected_epoch = epoch;
+    command_queue_set_space_listener(test_epoch_probe_listener);
+
+    command_queue_flush();
+    expect_u32(test_epoch_probe_calls, 3U, "the flush took the three commands out one by one");
+    expect_u32(test_epoch_probe_wrong_epoch_calls, 0U, "every command left the queue while the epoch was still the old one");
+    expect_u32(test_epoch_probe_epoch, epoch, "the last drained command saw the old epoch");
+    expect_u32(test_epoch_probe_free_slots, COMMAND_QUEUE_CAPACITY, "the queue was empty at the last call");
+    expect_u32(command_queue_epoch(), epoch + 1U, "the epoch rose once the queue was empty");
+
+    /* Dropping without a flush: the probe sees the same epoch before and after. */
+    send_commands(2U);
+    test_epoch_probe_calls = 0U;
+    test_epoch_probe_expected_epoch = epoch + 1U;
+    command_queue_discard_pending();
+    expect_u32(test_epoch_probe_calls, 2U, "the drop took the two commands out");
+    expect_u32(test_epoch_probe_wrong_epoch_calls, 0U, "the epoch stayed during the drop");
+    expect_u32(command_queue_epoch(), epoch + 1U, "and after it");
+    command_queue_set_space_listener(NULL);
+}
+
 int main(void) {
+    test_epoch_starts_at_zero_and_works_before_initialization();
     test_command_queue_initialization_and_arguments();
     test_command_queue_fifo_full_and_copy_semantics();
     test_command_queue_space_listener();
     test_command_queue_put_listener();
+    test_discard_pending_drops_the_commands_and_keeps_the_epoch();
+    test_flush_drops_the_commands_and_starts_the_next_epoch();
+    test_flush_raises_the_epoch_after_the_queue_is_drained();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Command queue unit tests failed: %u\n", test_failures);

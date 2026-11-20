@@ -32,6 +32,20 @@ static void plan_buffer_unlock(PlanBuffer_t *self) {
     configASSERT(status == osOK);
 }
 
+/* Outside the lock, so the listener may wake a task that takes the lock at once. */
+static void plan_buffer_notify_space(const PlanBuffer_t *self, uint32_t freed) {
+    const PlanBufferSpaceListener_t listener = self->space_listener;
+    if (freed != 0U && listener != NULL) {
+        listener();
+    }
+}
+
+void plan_buffer_set_space_listener(PlanBuffer_t *self, PlanBufferSpaceListener_t listener) {
+    if (self != NULL) {
+        self->space_listener = listener;
+    }
+}
+
 PlanBufferStatus_t plan_buffer_init(PlanBuffer_t *self, MotionPlanBlock_t *entries, uint32_t capacity) {
     if (self == NULL || entries == NULL || capacity == 0U) {
         return PLAN_BUFFER_STATUS_INVALID_ARGUMENT;
@@ -116,6 +130,7 @@ PlanBufferStatus_t plan_buffer_try_pop(PlanBuffer_t *self, MotionPlanBlock_t *bl
         plan_buffer_counter_increment(&self->dequeued_total);
     }
     plan_buffer_unlock(self);
+    plan_buffer_notify_space(self, status == PLAN_BUFFER_STATUS_OK ? 1U : 0U);
     return status;
 }
 
@@ -168,7 +183,18 @@ PlanBufferStatus_t plan_buffer_discard(PlanBuffer_t *self, uint32_t epoch, uint3
         plan_buffer_counter_add(&self->dequeued_total, count);
     }
     plan_buffer_unlock(self);
+    plan_buffer_notify_space(self, status == PLAN_BUFFER_STATUS_OK ? count : 0U);
     return status;
+}
+
+uint8_t plan_buffer_is_full(PlanBuffer_t *self) {
+    if (self == NULL || self->initialized == 0U) {
+        return 0U;
+    }
+    plan_buffer_lock(self);
+    const uint8_t full = self->count == self->capacity ? 1U : 0U;
+    plan_buffer_unlock(self);
+    return full;
 }
 
 uint32_t plan_buffer_get_epoch(const PlanBuffer_t *self) { return self == NULL ? 0U : self->epoch; }

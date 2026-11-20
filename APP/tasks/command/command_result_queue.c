@@ -15,11 +15,21 @@ osStatus_t command_result_queue_init(void) {
     return command_result_queue_handle == NULL ? osErrorNoMemory : osOK;
 }
 
-void command_result_queue_post(uint32_t sequence, uint8_t response_type, uint16_t code) {
-    command_result_queue_post_detailed(sequence, response_type, code, 0U, COMMAND_ERROR_AXIS_NONE, 0U);
+static void command_result_queue_put(const CommandResult_t *result);
+
+void command_result_queue_post_in_epoch(uint32_t epoch, uint32_t sequence, uint8_t response_type, uint16_t code) {
+    const CommandResult_t result = {
+        .sequence = sequence,
+        .response_type = response_type,
+        .code = code,
+        .axis = COMMAND_ERROR_AXIS_NONE,
+        .epoch = epoch,
+    };
+    command_result_queue_put(&result);
 }
 
-void command_result_queue_post_detailed(
+void command_result_queue_post_detailed_in_epoch(
+    uint32_t epoch,
     uint32_t sequence,
     uint8_t response_type,
     uint16_t code,
@@ -34,9 +44,13 @@ void command_result_queue_post_detailed(
         .cause = cause,
         .axis = axis,
         .detail = detail,
+        .epoch = epoch,
     };
-    if (command_result_queue_handle == NULL ||
-        osMessageQueuePut(command_result_queue_handle, &result, 0U, 0U) != osOK) {
+    command_result_queue_put(&result);
+}
+
+static void command_result_queue_put(const CommandResult_t *result) {
+    if (command_result_queue_handle == NULL || osMessageQueuePut(command_result_queue_handle, result, 0U, 0U) != osOK) {
         return;
     }
 
@@ -53,7 +67,13 @@ osStatus_t command_result_queue_try_receive(CommandResult_t *result) {
     if (command_result_queue_handle == NULL) {
         return osErrorResource;
     }
-    return osMessageQueueGet(command_result_queue_handle, result, NULL, 0U);
+    /* A result of an older epoch answers a command that a STOP has cancelled since: the client must not see it. */
+    for (;;) {
+        const osStatus_t status = osMessageQueueGet(command_result_queue_handle, result, NULL, 0U);
+        if (status != osOK || result->epoch == command_queue_epoch()) {
+            return status;
+        }
+    }
 }
 
 void command_result_queue_discard_all(void) {

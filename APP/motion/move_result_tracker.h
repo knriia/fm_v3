@@ -12,7 +12,7 @@
  * the queue and STOP drops them. Not reentrant; one owner task calls it. */
 
 /* Moves that can wait for their result at the same time. The step feeder remembers the end of this many blocks; a move
- * beyond the capacity is refused when it arrives, so that neither queue can overflow. */
+ * beyond the capacity waits for room before MotionTask accepts it, so that neither queue can overflow. */
 #define MOVE_RESULT_TRACKER_CAPACITY 128U
 
 typedef struct {
