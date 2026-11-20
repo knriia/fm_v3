@@ -22,10 +22,11 @@
 #define MOTION_TASK_STREAM_AXES_MASK                                                                                   \
     (MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Y_MASK | MOTION_PLANNER_AXIS_Z_MASK)
 #define MOTION_TASK_HOME_POLL_INTERVAL_MS 1U
-/* Thread flags of MotionTask: a command is queued, the step stream has progress to report. */
+/* Thread flags of MotionTask: a command is queued, the step stream has progress to report, the plan buffer has room. */
 #define MOTION_TASK_FLAG_COMMAND (1UL << 0)
 #define MOTION_TASK_FLAG_PROGRESS (1UL << 1)
-#define MOTION_TASK_FLAGS_ALL (MOTION_TASK_FLAG_COMMAND | MOTION_TASK_FLAG_PROGRESS)
+#define MOTION_TASK_FLAG_SPACE (1UL << 2)
+#define MOTION_TASK_FLAGS_ALL (MOTION_TASK_FLAG_COMMAND | MOTION_TASK_FLAG_PROGRESS | MOTION_TASK_FLAG_SPACE)
 _Static_assert(
     MOVE_RESULT_TRACKER_CAPACITY == COMMAND_RESULT_QUEUE_PENDING_MOVES,
     "the result queue has room for every move that waits for its result"
@@ -210,15 +211,20 @@ static int motion_task_is_xyz_move(const CommandDTO_t *command) {
            (command->parameters.motion_operation.operation_flags & COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE) != 0U;
 }
 
-/* The answer MotionTask gives to one command: DONE with a COMMAND_DONE_* code, or ERROR with a COMMAND_ERROR_* code. */
+/* What MotionTask decides about one command: DONE with a COMMAND_DONE_* code, ERROR with a COMMAND_ERROR_* code, or
+ * to wait. A command that waits has changed nothing and gets no answer yet; it is decided again when MotionTask wakes
+ * (room in a queue it needs, a STOP). */
 typedef struct {
     uint8_t response_type;
     uint16_t code;
+    uint8_t wait;
 } MotionTaskDecision_t;
 
 static MotionTaskDecision_t motion_task_done(uint16_t result_code) {
     return (MotionTaskDecision_t){.response_type = COMMAND_MESSAGE_TYPE_DONE, .code = result_code};
 }
+
+static MotionTaskDecision_t motion_task_wait(void) { return (MotionTaskDecision_t){.wait = 1U}; }
 
 /* Error code 0 means the command was accepted. */
 static MotionTaskDecision_t motion_task_decision_from_error(uint16_t error_code) {
@@ -243,13 +249,11 @@ motion_task_queue_move(MotionTaskContext_t *context, const MotionPlannerRequest_
 #endif
     if (result.status == MOTION_PLANNER_STATUS_OK) {
         motion_task_counter_increment(&motion_task_diagnostics.planner_blocks_created);
-        /* The tracker's capacity is what the step feeder can remember of started blocks, so a move that does not fit
-         * is refused here and no queue further down can overflow. */
+        /* The tracker's capacity is what the step feeder can remember of started blocks. The move is decided only while
+         * the tracker has room (motion_task_move_waits_for_room), and only this task adds to it, so the add succeeds.
+         */
         MotionPlanBlock_t block = result.block;
         block.order = move_result_tracker_add(&motion_task_move_tracker, request->sequence);
-        if (block.order == 0U) {
-            return motion_task_decision_from_error(COMMAND_ERROR_PLAN_QUEUE_FULL);
-        }
         if (plan_buffer_try_push(motion_task_plan_buffer, &block) != PLAN_BUFFER_STATUS_OK) {
             /* The rejected block is dropped; PlanBuffer records why it was not accepted. */
             move_result_tracker_remove_last(&motion_task_move_tracker);
@@ -788,15 +792,20 @@ static uint16_t motion_task_axes_start_refusal(uint8_t axes_mask, uint8_t busy_m
     return (axes_mask & busy_mask) != 0U ? COMMAND_ERROR_AXIS_BUSY : 0U;
 }
 
-void motion_task_request_stop(void) {
+/* Stops the pulses at the next timer interrupt and starts nothing new. */
+static void motion_task_halt_motion(void) {
     step_generator_task_halt_all();
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
         motion_axis_hardware_request_stop((MotionAxis_t)axis);
     }
-    /* STOP drops every command that waits behind it in the queue, without an answer. */
-    CommandDTO_t cancelled = {0};
-    while (command_queue_receive(&cancelled, 0U) == osOK) {
-    }
+}
+
+/* The network task accepts a STOP: the motion stops and the commands accepted earlier are void. The flush starts a new
+ * epoch of the command stream after it has emptied the queue, so the move MotionTask holds back and the results it has
+ * given for commands taken before are cancelled with it, in the window between the halt and the flush as well. */
+void motion_task_request_stop(void) {
+    motion_task_halt_motion();
+    command_queue_flush();
 }
 
 static uint8_t motion_task_any_hardware_is_active(void) {
@@ -861,13 +870,16 @@ static void motion_task_stop_axis(MotionTaskAxisState_t *state, MotionTaskContex
     motion_axis_hardware_reset_timing_peaks(state->axis);
 }
 
+/* `context` is the epoch of the command stream that was read before the snapshot of the stream: a STOP that comes
+ * after that read voids the results of the snapshot too. */
 static void motion_task_emit_move_result(void *context, const MoveResult_t *result) {
-    (void)context;
+    const uint32_t epoch = *(const uint32_t *)context;
     if (result->kind == MOVE_RESULT_COMPLETED) {
-        command_result_queue_post(result->sequence, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_COMPLETED);
+        command_result_queue_post_in_epoch(epoch, result->sequence, COMMAND_MESSAGE_TYPE_DONE, COMMAND_DONE_COMPLETED);
         return;
     }
-    command_result_queue_post_detailed(
+    command_result_queue_post_detailed_in_epoch(
+        epoch,
         result->sequence,
         COMMAND_MESSAGE_TYPE_ERROR,
         COMMAND_ERROR_STREAM_INTERRUPTED,
@@ -879,6 +891,7 @@ static void motion_task_emit_move_result(void *context, const MoveResult_t *resu
 
 /* Takes the snapshot of the printing stream and answers the moves it has played or cut off. */
 static void motion_task_process_move_results(void) {
+    uint32_t epoch = command_queue_epoch();
     StepGeneratorProgress_t progress = {0};
     step_generator_instance_get_progress(step_generator_task_get_print_instance(), &progress);
     const MoveResultProgress_t input = {
@@ -895,7 +908,7 @@ static void motion_task_process_move_results(void) {
             progress.halt_axis == STEP_GENERATOR_TASK_NO_AXIS ? COMMAND_ERROR_AXIS_NONE : (uint8_t)progress.halt_axis,
         .detail = (uint8_t)progress.halt_detail,
     };
-    move_result_tracker_update(&motion_task_move_tracker, &input, motion_task_emit_move_result, NULL);
+    move_result_tracker_update(&motion_task_move_tracker, &input, motion_task_emit_move_result, &epoch);
 }
 
 static void motion_task_signal(uint32_t flags) {
@@ -908,6 +921,9 @@ static void motion_task_signal(uint32_t flags) {
 void motion_task_notify_command(void) { motion_task_signal(MOTION_TASK_FLAG_COMMAND); }
 
 void motion_task_notify_progress(void) { motion_task_signal(MOTION_TASK_FLAG_PROGRESS); }
+
+/* The step generator has freed room in the plan buffer of the printing stream. */
+static void motion_task_notify_space(void) { motion_task_signal(MOTION_TASK_FLAG_SPACE); }
 
 /* Returns 0 when the axes did not come to rest in time or the printing stream is still halted after its reset. */
 static uint8_t motion_task_stop(MotionTaskAxisState_t *states, MotionTaskContext_t *context) {
@@ -971,8 +987,15 @@ static uint16_t motion_task_start_axes(
     return error_code;
 }
 
-/* The decision about one command other than STOP: accepted, or refused with the reason. The move itself is not finished
- * by then. */
+/* 1 while the plan buffer of the printing stream or the tracker of the moves has no room for one more move. */
+static uint8_t motion_task_move_waits_for_room(void) {
+    const uint8_t plan_full = plan_buffer_is_full(motion_task_plan_buffer);
+    const uint8_t tracker_full = move_result_tracker_has_room(&motion_task_move_tracker) == 0U ? 1U : 0U;
+    return (plan_full | tracker_full) != 0U ? 1U : 0U;
+}
+
+/* The decision about one command other than STOP: accepted, refused with the reason, or to wait for room. The move
+ * itself is not finished by then. */
 static MotionTaskDecision_t motion_task_execute_command(
     MotionTaskAxisState_t *states,
     MotionTaskContext_t *context,
@@ -1006,14 +1029,67 @@ static MotionTaskDecision_t motion_task_execute_command(
         if (busy_mask != 0U || motion_task_axis_streams_busy_axes() != 0U) {
             return motion_task_decision_from_error(COMMAND_ERROR_AXIS_BUSY);
         }
+        /* Last, after the refusals that depend on the state of the machine, so a halted stream, which frees no room,
+         * never waits. The planner's own refusal comes only after the wait, when the move is decided for good. */
+        if (motion_task_move_waits_for_room() != 0U) {
+            return motion_task_wait();
+        }
         return motion_task_queue_xyz_move(context, command);
     }
     return motion_task_decision_from_error(COMMAND_ERROR_NOT_SUPPORTED);
 }
 
+/* Sleeps until a command arrives, the stream makes progress or the plan buffer has room; while an axis homes or
+ * calibrates it also wakes to poll it. A flag set between the caller's check and the wait is not lost. */
+static void motion_task_wait_for_work(MotionTaskAxisState_t *axes, MotionTaskContext_t *context, uint8_t busy_mask) {
+    const uint32_t wait_timeout_ms = busy_mask != 0U ? MOTION_TASK_HOME_POLL_INTERVAL_MS : osWaitForever;
+    const uint32_t flags = osThreadFlagsWait(MOTION_TASK_FLAGS_ALL, osFlagsWaitAny, wait_timeout_ms);
+    /* Timeouts only occur while an axis homes or calibrates; the poll is a no-op once that has ended. */
+    if (flags == (uint32_t)osFlagsErrorTimeout) {
+        motion_task_poll_axes(axes, context);
+        motion_task_publish_axes(axes, context);
+    } else if ((flags & (uint32_t)osFlagsError) != 0U) {
+        motion_task_counter_increment(&motion_task_diagnostics.queue_receive_errors);
+        (void)osDelay(MOTION_TASK_ERROR_RETRY_DELAY_MS);
+    }
+}
+
+/* The command MotionTask took from the queue and could not decide yet. While it waits the queue is not read, so the
+ * commands behind it keep their place. Only MotionTask touches it. */
+typedef struct {
+    CommandDTO_t command;
+    /* The epoch of the command stream when the command was taken. */
+    uint32_t epoch;
+    uint8_t valid;
+} MotionTaskDeferred_t;
+
+/* The next command to decide: the deferred one while no STOP has come since it was taken, otherwise the next of the
+ * queue, which is read without waiting (the task sleeps on its flags instead). A command taken before a STOP is older
+ * than it, so a deferred one is dropped without an answer when the epoch has moved on. The epoch is read before the
+ * queue: a flush after that read makes it differ, whichever side of the drain the command was taken on. */
+static osStatus_t motion_task_take_command(MotionTaskDeferred_t *deferred, CommandDTO_t *command, uint32_t *epoch) {
+    if (deferred->valid != 0U) {
+        deferred->valid = 0U;
+        if (deferred->epoch == command_queue_epoch()) {
+            *command = deferred->command;
+            *epoch = deferred->epoch;
+            return osOK;
+        }
+    }
+    *epoch = command_queue_epoch();
+    const osStatus_t status = command_queue_receive(command, 0U);
+    if (status == osOK) {
+        motion_task_counter_increment(&motion_task_diagnostics.commands_dequeued);
+        motion_task_diagnostics.last_sequence = command->sequence;
+        motion_task_diagnostics.last_command_code = (uint32_t)command->code;
+    }
+    return status;
+}
+
 void MotionTask(void *argument) {
     MotionTaskContext_t *context = argument;
     MotionTaskAxisState_t axes[MOTION_AXIS_HARDWARE_COUNT] = {0};
+    MotionTaskDeferred_t deferred = {0};
     motion_task_plan_buffer = context == NULL ? NULL : context->plan_buffer;
     motion_task_thread_id = osThreadGetId();
     {
@@ -1024,6 +1100,7 @@ void MotionTask(void *argument) {
     }
     command_queue_set_put_listener(motion_task_notify_command);
     step_generator_task_set_progress_listener(motion_task_notify_progress);
+    plan_buffer_set_space_listener(motion_task_plan_buffer, motion_task_notify_space);
 
     /* Drive STEP/DIR/ENABLE of every axis to defined levels before any command can arrive. */
     for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
@@ -1039,21 +1116,13 @@ void MotionTask(void *argument) {
     for (;;) {
         motion_task_process_move_results();
         CommandDTO_t command = {0};
+        uint32_t epoch = 0U;
         const uint8_t busy_mask = motion_task_busy_axes(axes);
-        /* The queue is read without waiting, and the task sleeps on its flags instead: a command and the progress of
-         * the stream both wake it, and a flag set between the read and the wait is not lost. */
-        const osStatus_t receive_status = command_queue_receive(&command, 0U);
+        /* A command, the progress of the stream and room in the plan buffer all wake the task, and a flag set between
+         * the read and the wait is not lost. */
+        const osStatus_t receive_status = motion_task_take_command(&deferred, &command, &epoch);
         if (receive_status == osErrorResource || receive_status == osErrorTimeout) {
-            const uint32_t wait_timeout_ms = busy_mask != 0U ? MOTION_TASK_HOME_POLL_INTERVAL_MS : osWaitForever;
-            const uint32_t flags = osThreadFlagsWait(MOTION_TASK_FLAGS_ALL, osFlagsWaitAny, wait_timeout_ms);
-            /* Timeouts only occur while an axis homes or calibrates; the poll is a no-op once that has ended. */
-            if (flags == (uint32_t)osFlagsErrorTimeout) {
-                motion_task_poll_axes(axes, context);
-                motion_task_publish_axes(axes, context);
-            } else if ((flags & (uint32_t)osFlagsError) != 0U) {
-                motion_task_counter_increment(&motion_task_diagnostics.queue_receive_errors);
-                (void)osDelay(MOTION_TASK_ERROR_RETRY_DELAY_MS);
-            }
+            motion_task_wait_for_work(axes, context, busy_mask);
             continue;
         }
         if (receive_status != osOK) {
@@ -1064,10 +1133,6 @@ void MotionTask(void *argument) {
             continue;
         }
 
-        motion_task_counter_increment(&motion_task_diagnostics.commands_dequeued);
-        motion_task_diagnostics.last_sequence = command.sequence;
-        motion_task_diagnostics.last_command_code = (uint32_t)command.code;
-
         if (command.code == COMMAND_CODE_STOP) {
             const uint8_t settled = motion_task_stop(axes, context);
             /* Whatever the client has not read of the earlier commands is gone with them. */
@@ -1075,22 +1140,36 @@ void MotionTask(void *argument) {
             if (command.sequence != COMMAND_SEQUENCE_INTERNAL) {
                 const MotionTaskDecision_t decision =
                     motion_task_decision_from_error(settled != 0U ? 0U : COMMAND_ERROR_STOP_NOT_SETTLED);
-                command_result_queue_post(command.sequence, decision.response_type, decision.code);
+                /* The epoch of now, not of the read before the queue: the flush that came with this STOP is older. */
+                command_result_queue_post_in_epoch(
+                    command_queue_epoch(),
+                    command.sequence,
+                    decision.response_type,
+                    decision.code
+                );
             }
             motion_task_publish_axes(axes, context);
             continue;
         }
 
         const MotionTaskDecision_t decision = motion_task_execute_command(axes, context, &command, busy_mask);
+        if (decision.wait != 0U) {
+            /* No room yet and nothing changed: the move stays here and is decided again when the task wakes. */
+            deferred = (MotionTaskDeferred_t){.command = command, .epoch = epoch, .valid = 1U};
+            motion_task_wait_for_work(axes, context, busy_mask);
+            continue;
+        }
         if (motion_task_is_planner_refusal(&decision) != 0U) {
             /* A move the planner refuses is a client bug, and what was queued behind it cannot be trusted: everything
              * is stopped and emptied as by STOP (streams, rings, plan queues, command queue, results the client has not
-             * read), and only this command is answered, with the planner's reason. */
-            motion_task_request_stop();
+             * read), and only this command is answered, with the planner's reason. No flush: no command is deferred
+             * here, and the answer below must not be void. */
+            motion_task_halt_motion();
+            command_queue_discard_pending();
             (void)motion_task_stop(axes, context);
             command_result_queue_discard_all();
         }
-        command_result_queue_post(command.sequence, decision.response_type, decision.code);
+        command_result_queue_post_in_epoch(epoch, command.sequence, decision.response_type, decision.code);
 
         motion_task_poll_axes(axes, context);
         motion_task_publish_axes(axes, context);
@@ -1180,6 +1259,11 @@ void motion_task_test_reset_planner(void) {
 }
 
 uint32_t motion_task_test_get_planner_call_count(void) { return motion_task_test_planner_call_count; }
+
+void motion_task_test_fill_tracker(void) {
+    while (move_result_tracker_add(&motion_task_move_tracker, 0U) != 0U) {
+    }
+}
 
 MotionPlannerResult_t motion_task_test_get_last_planner_result(void) { return motion_task_test_last_planner_result; }
 #endif

@@ -64,6 +64,7 @@ add_executable(command_result_queue_unit_tests
 add_executable(motion_task_unit_tests
     motion_task_unit_tests.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/motion_task.c
+    ${CMAKE_CURRENT_LIST_DIR}/../APP/tasks/command/command_result_queue.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/motion_planner.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/plan_buffer.c
     ${CMAKE_CURRENT_LIST_DIR}/../APP/motion/move_result_tracker.c

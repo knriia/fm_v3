@@ -33,6 +33,10 @@ typedef struct {
     uint32_t cancelled_blocks;
 } PlanBufferDiagnostics_t;
 
+/* Called from the reader's task after pop or discard has freed room, outside the buffer's lock; must only signal and
+ * return. A clear does not call it: whoever clears knows. */
+typedef void (*PlanBufferSpaceListener_t)(void);
+
 /* One queue of plan blocks. The caller owns the object and its storage and passes them to init; every function takes
  * the object. The fields are private: only plan_buffer.c touches them. */
 typedef struct {
@@ -50,6 +54,8 @@ typedef struct {
     volatile uint32_t full_rejections;
     volatile uint32_t rejected_operations;
     volatile uint32_t cancelled_blocks;
+    /* Set by the writer's task, read by the reader's; a pointer store is atomic on Cortex-M7. */
+    volatile PlanBufferSpaceListener_t space_listener;
 } PlanBuffer_t;
 
 /* Shared by one writer task (push, clear) and one reader task (pop, peek, discard); a mutex guards every operation.
@@ -70,6 +76,12 @@ PlanBufferStatus_t plan_buffer_try_pop(PlanBuffer_t *self, MotionPlanBlock_t *bl
 PlanBufferStatus_t plan_buffer_try_peek(PlanBuffer_t *self, uint32_t epoch, uint32_t offset, MotionPlanBlock_t *block);
 /* Drops the first `count` blocks; INVALID_ARGUMENT when fewer are queued. Counted as dequeued. */
 PlanBufferStatus_t plan_buffer_discard(PlanBuffer_t *self, uint32_t epoch, uint32_t count);
+/* The writer of the buffer asks to be told when the reader has freed room. A NULL `self` is ignored; NULL removes the
+ * listener. */
+void plan_buffer_set_space_listener(PlanBuffer_t *self, PlanBufferSpaceListener_t listener);
+/* 1 only when the buffer is ready and holds as many blocks as it can: the next push would be refused as FULL. A NULL or
+ * not initialized buffer is not full, its push is refused for another reason. */
+uint8_t plan_buffer_is_full(PlanBuffer_t *self);
 /* Changes with every clear. Read it when the reader starts working on the buffer. 0 for a NULL `self`. */
 uint32_t plan_buffer_get_epoch(const PlanBuffer_t *self);
 /* Cancels all pending blocks; call for STOP, motion errors, and future FAULT transitions. */

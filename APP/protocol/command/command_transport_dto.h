@@ -39,12 +39,15 @@ typedef enum {
 #define COMMAND_ERROR_INVALID_FRAME_CRC 0x0007U
 #define COMMAND_ERROR_TRUNCATED_FRAME 0x0008U
 #define COMMAND_ERROR_INVALID_STATE 0x0009U
+/* The command queue is full. Under load this is the normal sign of overload: a move that waits for room in the plan
+ * buffer holds the commands behind it in the queue, so the client slows down or gets this code. */
 #define COMMAND_ERROR_QUEUE_FULL 0x000AU
 #define COMMAND_ERROR_INVALID_SEQUENCE 0x000DU
 
 /* The codes from here on answer a command that MotionTask took from the queue: it either accepted the command (DONE)
  * or refused it (ERROR with one of these codes). Accepted means the planner made a block or the homing or calibration
- * started, not that the move has ended.
+ * started, not that the move has ended. A move that finds the plan buffer or the move tracker full is not refused: it
+ * waits for room, so its DONE can come late, and a STOP cancels it without an answer.
  * A move to the point where the axes already are is not a refusal: it is answered with DONE and the result code
  * COMMAND_DONE_ALREADY_AT_TARGET.
  * A planner refusal MotionPlannerStatus_t `status` is reported as COMMAND_ERROR_PLANNER_BASE + status, so NO_MOVEMENT
@@ -56,7 +59,8 @@ typedef enum {
 #define COMMAND_ERROR_LIMITS_CONFLICT 0x0121U
 /* The homing or calibration could not start its first move. */
 #define COMMAND_ERROR_HOME_NOT_STARTED 0x0122U
-/* The plan queue did not take the block of the move. */
+/* The plan queue did not take the block of the move. MotionTask holds a move back until there is room, so this is left
+ * for a queue that cannot take blocks at all (not ready, not there). */
 #define COMMAND_ERROR_PLAN_QUEUE_FULL 0x0123U
 /* The command, or the part of it that MotionTask would run, is not implemented. */
 #define COMMAND_ERROR_NOT_SUPPORTED 0x0124U
@@ -68,7 +72,8 @@ typedef enum {
 #define COMMAND_ERROR_NOT_CONFIGURED 0x0126U
 /* The step stream is halted (a limit switch, a generator fault): HOME, CALIBRATE and moves are refused until STOP. The
  * cause is the halt_cause of the step generator diagnostics (STEP_GENERATOR_TASK_HALT_CAUSE_*). STOP also cancels a
- * homing or calibration that is running; a move is refused with this code even while one runs. */
+ * homing or calibration that is running; a move is refused with this code even while one runs. A move that waits for
+ * room in the plan buffer gets it too when the stream halts meanwhile. */
 #define COMMAND_ERROR_STREAM_HALTED 0x0127U
 /* A move that MotionTask had accepted (DONE with COMMAND_DONE_ACCEPTED) did not run to its end: the step stream
  * stopped. The cause, axis and detail fields of the ERROR payload say why; STOP is needed to lift the stop. The answer

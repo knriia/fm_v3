@@ -28,6 +28,14 @@ static uint8_t test_mutex_wrong_handle;
 static osStatus_t test_mutex_acquire_result;
 static osStatus_t test_mutex_release_result;
 static uint32_t test_error_handler_calls;
+/* What the space listeners saw: how often they were called, how many locks were held at that moment, and how many
+ * blocks the buffer held (read from the object, which the listener sees as private state of the reader's buffer). */
+static uint32_t test_listener_calls;
+static uint32_t test_listener_mutex_depth;
+static uint32_t test_listener_queued;
+static uint32_t test_second_listener_calls;
+static uint32_t test_listener_refills;
+static uint32_t test_listener_refill_status;
 
 osMutexId_t osMutexNew(const osMutexAttr_t *attr) {
     ++test_mutex_new_calls;
@@ -146,6 +154,12 @@ static void reset_buffer(void) {
     test_mutex_acquire_result = osOK;
     test_mutex_release_result = osOK;
     test_error_handler_calls = 0U;
+    test_listener_calls = 0U;
+    test_listener_mutex_depth = UINT32_MAX;
+    test_listener_queued = UINT32_MAX;
+    test_second_listener_calls = 0U;
+    test_listener_refills = 0U;
+    test_listener_refill_status = UINT32_MAX;
 }
 
 static void test_mutex_guards_every_operation(void) {
@@ -694,7 +708,295 @@ static void test_init_clears_storage_and_counters(void) {
     expect_block_equal(&output, 7U);
 }
 
+static void test_is_full_follows_the_occupancy(void) {
+    reset_buffer();
+    expect_u32(
+        plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "buffer initializes for the fullness test"
+    );
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "an empty buffer is not full");
+
+    for (uint32_t sequence = 1U; sequence < PLAN_BUFFER_CAPACITY; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        (void)plan_buffer_try_push(&test_buffer, &block);
+    }
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "a buffer with one place left is not full");
+
+    const MotionPlanBlock_t last = make_block(PLAN_BUFFER_CAPACITY);
+    expect_u32(plan_buffer_try_push(&test_buffer, &last), PLAN_BUFFER_STATUS_OK, "the last place is taken");
+    expect_u32(plan_buffer_is_full(&test_buffer), 1U, "a buffer with every place taken is full");
+    expect_u32(
+        plan_buffer_try_push(&test_buffer, &last),
+        PLAN_BUFFER_STATUS_FULL,
+        "a push into the buffer that reports full is refused as FULL"
+    );
+    expect_u32(plan_buffer_is_full(&test_buffer), 1U, "a refused push does not change the fullness");
+
+    MotionPlanBlock_t output = {0};
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the front is popped");
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "a pop makes room");
+    expect_u32(plan_buffer_try_push(&test_buffer, &last), PLAN_BUFFER_STATUS_OK, "the freed place is taken again");
+    expect_u32(plan_buffer_is_full(&test_buffer), 1U, "the buffer is full again after the wrap around the ring end");
+
+    expect_u32(
+        plan_buffer_discard(&test_buffer, plan_buffer_get_epoch(&test_buffer), 1U),
+        PLAN_BUFFER_STATUS_OK,
+        "the front is discarded"
+    );
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "a discard of one block makes room");
+    expect_u32(plan_buffer_try_push(&test_buffer, &last), PLAN_BUFFER_STATUS_OK, "the place after the discard is taken");
+    expect_u32(plan_buffer_is_full(&test_buffer), 1U, "the buffer is full once more");
+
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "the full buffer is cleared");
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "a cleared buffer is not full");
+}
+
+static void test_is_full_uses_the_capacity_of_its_own_object(void) {
+    reset_buffer();
+    reset_second_buffer();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    expect_u32(
+        plan_buffer_init(&second_buffer, second_buffer_entries, SECOND_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "the small buffer initializes"
+    );
+    for (uint32_t sequence = 1U; sequence < SECOND_BUFFER_CAPACITY; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        (void)plan_buffer_try_push(&second_buffer, &block);
+    }
+    expect_u32(plan_buffer_is_full(&second_buffer), 0U, "the small buffer with a place left is not full");
+    const MotionPlanBlock_t last = make_block(SECOND_BUFFER_CAPACITY);
+    (void)plan_buffer_try_push(&second_buffer, &last);
+    expect_u32(plan_buffer_is_full(&second_buffer), 1U, "the small buffer is full at its own capacity");
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "the large buffer is not full for the three blocks of the small one");
+}
+
+static void test_is_full_is_zero_without_a_usable_buffer(void) {
+    reset_buffer();
+    expect_u32(plan_buffer_is_full(NULL), 0U, "no object is not full");
+    /* A zeroed object has count 0 and capacity 0: equal, but it is not a buffer that refuses a push as FULL. */
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "a buffer that was not initialized is not full");
+    test_mutex_new_fails = 1U;
+    expect_u32(
+        plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_NO_MEMORY,
+        "init without a mutex fails"
+    );
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "a buffer whose init failed is not full");
+    expect_u32(test_mutex_acquire_calls, 0U, "without a usable buffer nothing is locked");
+}
+
+static void test_is_full_locks_the_buffer_once(void) {
+    reset_buffer();
+    (void)plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY);
+    expect_u32(plan_buffer_is_full(&test_buffer), 0U, "an empty buffer is not full");
+    expect_u32(test_mutex_acquire_calls, 1U, "the fullness is read under the lock");
+    expect_u32(test_mutex_release_calls, 1U, "the lock is released");
+    expect_u32(test_mutex_max_depth, 1U, "the lock is not nested");
+    expect_u32(test_mutex_wrong_handle, 0U, "the buffer mutex is used");
+    expect_u32(test_error_handler_calls, 0U, "a successful lock raises no fault");
+
+    test_mutex_acquire_result = osErrorParameter;
+    (void)plan_buffer_is_full(&test_buffer);
+    expect_u32(test_error_handler_calls, 1U, "a failed lock is a fatal error");
+    test_mutex_acquire_result = osOK;
+    test_mutex_release_result = osErrorResource;
+    (void)plan_buffer_is_full(&test_buffer);
+    expect_u32(test_error_handler_calls, 2U, "a failed unlock is a fatal error");
+}
+
+static void space_listener(void) {
+    ++test_listener_calls;
+    test_listener_mutex_depth = test_mutex_depth;
+    test_listener_queued = test_buffer.count;
+}
+
+static void second_space_listener(void) { ++test_second_listener_calls; }
+
+/* A listener that does what the task it wakes does: it uses the buffer at once. */
+static void refilling_space_listener(void) {
+    space_listener();
+    ++test_listener_refills;
+    const MotionPlanBlock_t refill = make_block(99U);
+    test_listener_refill_status = plan_buffer_try_push(&test_buffer, &refill);
+}
+
+static void init_test_buffer_with_listener(void) {
+    reset_buffer();
+    expect_u32(
+        plan_buffer_init(&test_buffer, test_buffer_entries, PLAN_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "buffer initializes for the listener test"
+    );
+    plan_buffer_set_space_listener(&test_buffer, space_listener);
+}
+
+static void push_blocks(PlanBuffer_t *buffer, uint32_t count) {
+    for (uint32_t sequence = 1U; sequence <= count; ++sequence) {
+        const MotionPlanBlock_t block = make_block(sequence);
+        expect_u32(plan_buffer_try_push(buffer, &block), PLAN_BUFFER_STATUS_OK, "a block is queued for the listener test");
+    }
+}
+
+static void test_space_listener_is_called_once_per_pop_after_the_room_is_free(void) {
+    init_test_buffer_with_listener();
+    push_blocks(&test_buffer, 2U);
+    expect_u32(test_listener_calls, 0U, "queueing blocks takes room and calls no listener");
+
+    MotionPlanBlock_t output = {0};
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the first block is taken");
+    expect_block_equal(&output, 1U);
+    expect_u32(test_listener_calls, 1U, "a pop that frees room calls the listener once");
+    expect_u32(test_listener_queued, 1U, "the listener is called after the block has left the buffer");
+    expect_u32(test_listener_mutex_depth, 0U, "the listener is called outside the lock of the buffer");
+
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the second block is taken");
+    expect_u32(test_listener_calls, 2U, "each pop calls the listener once");
+    expect_u32(test_listener_queued, 0U, "the listener sees the buffer empty after the last pop");
+
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_EMPTY, "an empty buffer gives nothing");
+    expect_u32(test_listener_calls, 2U, "a pop that frees nothing calls no listener");
+}
+
+static void test_space_listener_is_called_once_per_discard_after_the_room_is_free(void) {
+    init_test_buffer_with_listener();
+    push_blocks(&test_buffer, 5U);
+    const uint32_t epoch = plan_buffer_get_epoch(&test_buffer);
+
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 2U), PLAN_BUFFER_STATUS_OK, "two blocks are dropped");
+    expect_u32(test_listener_calls, 1U, "a discard of several blocks calls the listener once");
+    expect_u32(test_listener_queued, 3U, "the listener is called after the blocks have left the buffer");
+    expect_u32(test_listener_mutex_depth, 0U, "the listener is called outside the lock of the buffer");
+
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 0U), PLAN_BUFFER_STATUS_OK, "dropping nothing succeeds");
+    expect_u32(test_listener_calls, 1U, "a discard that frees nothing calls no listener");
+
+    expect_u32(plan_buffer_discard(&test_buffer, epoch, 3U), PLAN_BUFFER_STATUS_OK, "the rest is dropped");
+    expect_u32(test_listener_calls, 2U, "the next discard calls the listener again");
+    expect_u32(test_listener_queued, 0U, "the listener sees the buffer empty");
+}
+
+static void test_space_listener_is_not_called_when_no_room_is_freed(void) {
+    init_test_buffer_with_listener();
+    push_blocks(&test_buffer, PLAN_BUFFER_CAPACITY);
+    const MotionPlanBlock_t extra = make_block(PLAN_BUFFER_CAPACITY + 1U);
+    expect_u32(plan_buffer_try_push(&test_buffer, &extra), PLAN_BUFFER_STATUS_FULL, "a full buffer refuses a block");
+    expect_u32(plan_buffer_try_push(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "a null block is refused");
+    expect_u32(test_listener_calls, 0U, "a push, accepted or refused, calls no listener");
+
+    MotionPlanBlock_t output = {0};
+    const uint32_t old_epoch = plan_buffer_get_epoch(&test_buffer);
+    expect_u32(plan_buffer_try_pop(&test_buffer, NULL), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "a pop without output is refused");
+    expect_u32(test_listener_calls, 0U, "a refused pop frees nothing and calls no listener");
+    expect_u32(
+        plan_buffer_discard(&test_buffer, old_epoch, PLAN_BUFFER_CAPACITY + 1U),
+        PLAN_BUFFER_STATUS_INVALID_ARGUMENT,
+        "more blocks than queued cannot be dropped"
+    );
+    expect_u32(test_listener_calls, 0U, "a refused discard frees nothing and calls no listener");
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(&test_buffer, &diagnostics);
+    expect_u32(diagnostics.queued, PLAN_BUFFER_CAPACITY, "the refused calls changed nothing");
+
+    expect_u32(plan_buffer_clear(&test_buffer), PLAN_BUFFER_STATUS_OK, "the full buffer is cleared");
+    expect_u32(test_listener_calls, 0U, "a clear calls no listener: whoever clears knows");
+    expect_u32(plan_buffer_discard(&test_buffer, old_epoch, 1U), PLAN_BUFFER_STATUS_STALE, "an old epoch cannot drop");
+    expect_u32(test_listener_calls, 0U, "a stale discard calls no listener");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_EMPTY, "the cleared buffer is empty");
+    expect_u32(test_listener_calls, 0U, "a pop of an empty buffer calls no listener");
+}
+
+static void test_space_listener_is_not_called_by_an_uninitialized_or_missing_buffer(void) {
+    reset_buffer();
+    plan_buffer_set_space_listener(&test_buffer, space_listener);
+    MotionPlanBlock_t output = {0};
+    expect_u32(
+        plan_buffer_try_pop(&test_buffer, &output),
+        PLAN_BUFFER_STATUS_NOT_INITIALIZED,
+        "a buffer that was not initialized gives nothing"
+    );
+    expect_u32(
+        plan_buffer_discard(&test_buffer, 0U, 1U),
+        PLAN_BUFFER_STATUS_NOT_INITIALIZED,
+        "a buffer that was not initialized drops nothing"
+    );
+    expect_u32(plan_buffer_try_pop(NULL, &output), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "no buffer gives nothing");
+    expect_u32(plan_buffer_discard(NULL, 0U, 1U), PLAN_BUFFER_STATUS_INVALID_ARGUMENT, "no buffer drops nothing");
+    expect_u32(test_listener_calls, 0U, "refused calls on an unusable buffer call no listener");
+}
+
+static void test_space_listener_can_be_replaced_removed_and_ignores_a_missing_buffer(void) {
+    init_test_buffer_with_listener();
+    push_blocks(&test_buffer, 4U);
+    MotionPlanBlock_t output = {0};
+
+    /* A missing buffer is ignored: the listener of the real one stays, and the one passed is not called. */
+    plan_buffer_set_space_listener(NULL, second_space_listener);
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "a block is taken");
+    expect_u32(test_listener_calls, 1U, "the listener of the buffer is unchanged by a call for no buffer");
+    expect_u32(test_second_listener_calls, 0U, "the listener passed for no buffer is never called");
+
+    plan_buffer_set_space_listener(&test_buffer, second_space_listener);
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "a block is taken after the replacement");
+    expect_u32(test_listener_calls, 1U, "the replaced listener is no longer called");
+    expect_u32(test_second_listener_calls, 1U, "the new listener is called");
+
+    plan_buffer_set_space_listener(&test_buffer, NULL);
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "a block is taken without a listener");
+    expect_u32(test_second_listener_calls, 1U, "a removed listener is not called");
+    expect_u32(plan_buffer_discard(&test_buffer, plan_buffer_get_epoch(&test_buffer), 1U), PLAN_BUFFER_STATUS_OK, "a block is dropped");
+    expect_u32(test_second_listener_calls, 1U, "a discard without a listener calls nothing");
+    expect_u32(test_listener_calls, 1U, "the first listener stays removed");
+}
+
+static void test_space_listener_belongs_to_its_own_buffer(void) {
+    init_test_buffer_with_listener();
+    reset_second_buffer();
+    expect_u32(
+        plan_buffer_init(&second_buffer, second_buffer_entries, SECOND_BUFFER_CAPACITY),
+        PLAN_BUFFER_STATUS_OK,
+        "the second buffer initializes"
+    );
+    plan_buffer_set_space_listener(&second_buffer, second_space_listener);
+    push_blocks(&test_buffer, 1U);
+    push_blocks(&second_buffer, 1U);
+
+    MotionPlanBlock_t output = {0};
+    expect_u32(plan_buffer_try_pop(&second_buffer, &output), PLAN_BUFFER_STATUS_OK, "the second buffer gives its block");
+    expect_u32(test_second_listener_calls, 1U, "the listener of the second buffer is called");
+    expect_u32(test_listener_calls, 0U, "the listener of the first buffer is not");
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the first buffer gives its block");
+    expect_u32(test_listener_calls, 1U, "the listener of the first buffer is called");
+    expect_u32(test_second_listener_calls, 1U, "the listener of the second buffer is not");
+}
+
+static void test_space_listener_may_use_the_buffer_at_once(void) {
+    init_test_buffer_with_listener();
+    plan_buffer_set_space_listener(&test_buffer, refilling_space_listener);
+    push_blocks(&test_buffer, PLAN_BUFFER_CAPACITY);
+    test_mutex_max_depth = 0U;
+
+    MotionPlanBlock_t output = {0};
+    expect_u32(plan_buffer_try_pop(&test_buffer, &output), PLAN_BUFFER_STATUS_OK, "the front is taken from the full buffer");
+    expect_u32(test_listener_refills, 1U, "the listener ran once");
+    expect_u32(test_listener_refill_status, PLAN_BUFFER_STATUS_OK, "the freed place is free for the listener's push");
+    expect_u32(test_mutex_max_depth, 1U, "the listener's push did not run inside the lock of the pop");
+    expect_u32(plan_buffer_is_full(&test_buffer), 1U, "the listener took the freed place");
+}
+
 int main(void) {
+    test_space_listener_is_called_once_per_pop_after_the_room_is_free();
+    test_space_listener_is_called_once_per_discard_after_the_room_is_free();
+    test_space_listener_is_not_called_when_no_room_is_freed();
+    test_space_listener_is_not_called_by_an_uninitialized_or_missing_buffer();
+    test_space_listener_can_be_replaced_removed_and_ignores_a_missing_buffer();
+    test_space_listener_belongs_to_its_own_buffer();
+    test_space_listener_may_use_the_buffer_at_once();
+    test_is_full_follows_the_occupancy();
+    test_is_full_uses_the_capacity_of_its_own_object();
+    test_is_full_is_zero_without_a_usable_buffer();
+    test_is_full_locks_the_buffer_once();
     test_init_rejects_bad_arguments();
     test_null_object_is_rejected_by_every_call();
     test_objects_are_independent();

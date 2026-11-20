@@ -1677,7 +1677,7 @@ static void expect_frame_at(size_t offset, uint8_t type, uint32_t sequence, uint
     expect_frame_in(test_captured_response, test_captured_response_length, offset, type, sequence, error_code, message);
 }
 
-/* A result as command_result_queue_post makes it: cause 0, no axis, detail 0. */
+/* A result as command_result_queue_post_in_epoch makes it: cause 0, no axis, detail 0. */
 static void script_result(uint32_t index, uint32_t sequence, uint8_t response_type, uint16_t code) {
     test_result_script[index] = (CommandResult_t){
         .sequence = sequence,
