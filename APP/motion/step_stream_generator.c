@@ -11,6 +11,15 @@ static uint64_t step_stream_generator_abs_i64(int64_t value) {
     return value < 0 ? (uint64_t)(-(value + 1)) + 1U : (uint64_t)value;
 }
 
+static uint64_t step_stream_generator_gcd(uint64_t a, uint64_t b) {
+    while (b != 0U) {
+        const uint64_t rest = a % b;
+        a = b;
+        b = rest;
+    }
+    return a;
+}
+
 static uint32_t step_stream_generator_max_record_ticks(const StepStreamGeneratorConfig_t *config) {
     return config->max_record_ticks != 0U ? config->max_record_ticks : STEP_STREAM_GENERATOR_MAX_RECORD_TICKS;
 }
@@ -51,15 +60,27 @@ step_stream_generator_calculate_duration(const MotionPlanBlock_t *block, uint64_
         return STEP_STREAM_GENERATOR_STATUS_ARITHMETIC_OVERFLOW;
     }
 
-    const uint64_t interval_numerator =
-        block->step_event_rate_denominator * STEP_STREAM_GENERATOR_NANOSECONDS_PER_SECOND;
-    if (block->master_step_count > UINT64_MAX / interval_numerator) {
+    /* The duration is master * denominator * 1e9 / numerator. The planner sets numerator = feed * master, so the
+     * product of the raw factors overflows long before the result does; reduce the fraction first (the rounded-up
+     * result is the same as without reduction). */
+    uint64_t master = block->master_step_count;
+    uint64_t numerator = block->step_event_rate_numerator;
+    uint64_t divisor = step_stream_generator_gcd(master, numerator);
+    master /= divisor;
+    numerator /= divisor;
+
+    uint64_t interval_numerator = block->step_event_rate_denominator * STEP_STREAM_GENERATOR_NANOSECONDS_PER_SECOND;
+    divisor = step_stream_generator_gcd(interval_numerator, numerator);
+    interval_numerator /= divisor;
+    numerator /= divisor;
+
+    if (master > UINT64_MAX / interval_numerator) {
         return STEP_STREAM_GENERATOR_STATUS_ARITHMETIC_OVERFLOW;
     }
 
-    const uint64_t duration_numerator = block->master_step_count * interval_numerator;
-    *duration_ns = duration_numerator / block->step_event_rate_numerator;
-    if (duration_numerator % block->step_event_rate_numerator != 0U) {
+    const uint64_t duration_numerator = master * interval_numerator;
+    *duration_ns = duration_numerator / numerator;
+    if (duration_numerator % numerator != 0U) {
         ++(*duration_ns);
     }
     return STEP_STREAM_GENERATOR_STATUS_OK;

@@ -3428,6 +3428,46 @@ static void test_halt_detail_follows_the_cause(void) {
     expect_u32(progress.halt_detail, 0U, "a failed setup has no detail");
 }
 
+static void test_halt_detail_carries_the_generator_status(void) {
+    /* The generator rejects the block (denominator * 1e9 does not fit 64 bits): the feeder reports GENERATOR_ERROR (2)
+     * and the generator status is ARITHMETIC_OVERFLOW (3), so the detail is (3 << 4) | 2. */
+    reset_fixture();
+    MotionPlanBlock_t block = make_block(80U, 3, 0);
+    block.step_event_rate_denominator = UINT64_MAX / STEP_STREAM_GENERATOR_NANOSECONDS_PER_SECOND + 1U;
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the bad block is queued");
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR, "a feeder error is the cause");
+    expect_u32(step_generator_task_instance.feeder_status, 2U, "the feeder status is GENERATOR_ERROR");
+    expect_u32(step_generator_task_instance.feeder_generator_status, 3U, "the generator status is ARITHMETIC_OVERFLOW");
+    expect_u32(progress.halt_detail, 0x32U, "generator status in the high nibble, feeder status in the low one");
+
+    /* A feeder error that is not the generator's keeps the high nibble at 0. */
+    reset_fixture();
+    push_block(81U, 3);
+    test_fail_prepare = 1U;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_detail, (uint32_t)STEP_STREAM_FEEDER_STATUS_AXIS_ERROR, "no generator status, no high nibble");
+
+    /* The other causes ignore the generator status. */
+    start_idle_print_task();
+    test_claim_print_channels();
+    run_group_prepared_and_started();
+    test_stream_listener[TEST_CH_Y].on_fault(test_stream_listener[TEST_CH_Y].context, STEP_STREAM_AXIS_FAULT_DMA);
+    step_generator_task_instance.feeder_generator_status = 3U;
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, "a ring fault is the cause");
+    expect_u32(progress.halt_detail, (uint32_t)STEP_STREAM_AXIS_FAULT_DMA, "a ring fault detail is unchanged");
+
+    step_generator_task_instance.halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT;
+    step_generator_task_instance.limit_reason = (uint32_t)MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_detail, 3U, "a limit detail is unchanged (END_LIMIT)");
+}
+
 /* What the listener saw of the print snapshot when it was called: the snapshot is published before the call. */
 static uint32_t test_progress_listener_calls;
 static uint32_t test_progress_listener_played_blocks;
@@ -3557,6 +3597,7 @@ int main(void) {
     test_stop_with_blocks_only_in_the_plan_names_the_head_of_the_plan();
     test_stop_without_any_block_has_nothing_unplayed();
     test_halt_detail_follows_the_cause();
+    test_halt_detail_carries_the_generator_status();
     test_progress_listener_is_called_when_the_print_snapshot_changes();
 
     if (test_failures != 0U) {

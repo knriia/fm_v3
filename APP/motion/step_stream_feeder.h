@@ -150,6 +150,9 @@ typedef struct {
     StepStreamFeederPhase_t phase;
     /* What a FAULT phase reports until reset. */
     StepStreamFeederStatus_t fault_status;
+    /* Why the generator failed when fault_status is GENERATOR_ERROR; OK when the fault was not the generator's own
+     * (a plan that could not be read or trusted). Cleared by reset. */
+    StepStreamGeneratorStatus_t generator_fault_status;
     StepStreamFeederLane_t lane[STEP_STREAM_FEEDER_MAX_LANES];
     /* Epoch of the plan buffer that the positions of this stream refer to. */
     uint32_t plan_epoch;
@@ -234,6 +237,8 @@ StepStreamFeederPhase_t step_stream_feeder_get_phase(const StepStreamFeeder_t *f
 /* Planner axes (bit = axis) that the blocks of the stream being opened or played move; 0 for a feeder without one. A
  * lane outside this mask only plays idle records. Valid from the prepare port on. */
 uint8_t step_stream_feeder_get_moving_axes(const StepStreamFeeder_t *feeder);
+/* The generator's own status behind a GENERATOR_ERROR fault (OK when the fault was not the generator's). */
+StepStreamGeneratorStatus_t step_stream_feeder_get_generator_fault(const StepStreamFeeder_t *feeder);
 void step_stream_feeder_get_diagnostics(const StepStreamFeeder_t *feeder, StepStreamFeederDiagnostics_t *diagnostics);
 
 #endif /* FM_V3_STEP_STREAM_FEEDER_H */

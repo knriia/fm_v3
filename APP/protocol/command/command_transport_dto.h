@@ -87,7 +87,9 @@ typedef enum {
 /* ERROR payload fields beyond the code. cause is a STEP_GENERATOR_TASK_HALT_CAUSE_* (0 for a refusal that is not a
  * stop), axis the MotionAxis_t that the stop is blamed on or COMMAND_ERROR_AXIS_NONE (0 is X, so it needs its own
  * value), detail depends on the cause: for a limit switch 2 (start) or 3 (end), for a group fault the stream axis
- * fault, for a feeder error the feeder status. */
+ * fault, for a feeder error the feeder status in the low nibble and, when the generator caused it, the generator status
+ * (1 DONE never appears; 2 invalid argument, 3 arithmetic overflow, 4 step interval too short, 5 idle interval too
+ * short) in the high nibble. */
 #define COMMAND_ERROR_AXIS_NONE 0xFFU
 
 /* No client command has sequence 0 (the protocol rejects it), so the device uses it for commands it issues itself. They

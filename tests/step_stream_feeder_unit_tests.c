@@ -1150,6 +1150,76 @@ static void test_generator_errors(void) {
     expect_u32(diagnostics.generator_errors, 2U, "generator errors counted");
 }
 
+static void test_generator_fault_status(void) {
+    StepStreamFeeder_t feeder;
+
+    expect_u32(
+        step_stream_feeder_get_generator_fault(NULL),
+        STEP_STREAM_GENERATOR_STATUS_OK,
+        "no feeder, no generator fault"
+    );
+
+    /* The generator rejects the block when the stream is opened. */
+    setup(&feeder);
+    expect_u32(
+        step_stream_feeder_get_generator_fault(&feeder),
+        STEP_STREAM_GENERATOR_STATUS_OK,
+        "no fault after setup"
+    );
+    MotionPlanBlock_t overflow = make_block(3, 0);
+    overflow.step_event_rate_denominator = UINT64_MAX / STEP_STREAM_GENERATOR_NANOSECONDS_PER_SECOND + 1U;
+    queue_block(&overflow);
+    expect_u32(
+        step_stream_feeder_service(&feeder),
+        STEP_STREAM_FEEDER_STATUS_GENERATOR_ERROR,
+        "init_from_block overflows"
+    );
+    expect_u32(
+        step_stream_feeder_get_generator_fault(&feeder),
+        STEP_STREAM_GENERATOR_STATUS_ARITHMETIC_OVERFLOW,
+        "the generator status of init_from_block is kept"
+    );
+
+    step_stream_feeder_reset(&feeder);
+    expect_u32(
+        step_stream_feeder_get_generator_fault(&feeder),
+        STEP_STREAM_GENERATOR_STATUS_OK,
+        "reset drops the generator fault"
+    );
+
+    /* The generator accepts the block and fails in fill. */
+    setup(&feeder);
+    MotionPlanBlock_t too_fast = make_block(3, 0);
+    too_fast.step_event_rate_numerator = 1000000U;
+    queue_block(&too_fast);
+    expect_u32(
+        step_stream_feeder_service(&feeder),
+        STEP_STREAM_FEEDER_STATUS_GENERATOR_ERROR,
+        "fill rejects the interval"
+    );
+    expect_u32(
+        step_stream_feeder_get_generator_fault(&feeder),
+        STEP_STREAM_GENERATOR_STATUS_STEP_INTERVAL_TOO_SHORT,
+        "the generator status of fill is kept"
+    );
+
+    /* A failure that is not the generator's leaves the status OK. */
+    setup(&feeder);
+    const MotionPlanBlock_t block = make_block(3, 0);
+    queue_block(&block);
+    fake_peek_forced_result = STEP_STREAM_FEEDER_PLAN_ERROR;
+    expect_u32(
+        step_stream_feeder_service(&feeder),
+        STEP_STREAM_FEEDER_STATUS_GENERATOR_ERROR,
+        "the plan read fails"
+    );
+    expect_u32(
+        step_stream_feeder_get_generator_fault(&feeder),
+        STEP_STREAM_GENERATOR_STATUS_OK,
+        "a plan error is no generator status"
+    );
+}
+
 static void test_plan_port_errors(void) {
     StepStreamFeeder_t feeder;
     const MotionPlanBlock_t block = make_block(3, 0);
@@ -1782,6 +1852,7 @@ int main(void) {
     test_a_late_block_cannot_move_an_undecided_axis();
     test_block_for_an_axis_without_lane_is_an_error();
     test_generator_errors();
+    test_generator_fault_status();
     test_plan_port_errors();
     test_single_lane_survives_a_clear();
     test_single_lane_survives_a_clear_before_the_discard();

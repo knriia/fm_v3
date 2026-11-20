@@ -5123,6 +5123,26 @@ static void test_stop_without_a_blamed_axis_reports_axis_none(void) {
     expect_interrupted_at(1U, 860U, TEST_CAUSE_FEEDER_ERROR, TEST_AXIS_NONE, 7U, "no blamed axis is sent as 0xFF");
 }
 
+static void test_feeder_error_detail_keeps_both_nibbles(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t move = xyz_move_to(861U, 1000, 1000U);
+    script_moves(&move, 1U);
+    /* Generator status 3 in the high nibble, feeder status 2 in the low one. */
+    const TestProgressStep_t steps[] = {{
+        .stop_resolved = 1U,
+        .unplayed_sequence = 861U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        .halt_axis = STEP_GENERATOR_TASK_NO_AXIS,
+        .halt_detail = 0x32U,
+    }};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 2U, "one acceptance and one error");
+    expect_interrupted_at(1U, 861U, TEST_CAUSE_FEEDER_ERROR, TEST_AXIS_NONE, 0x32U, "the whole detail byte is sent");
+}
+
 static void test_a_new_generation_drops_the_waiting_moves_without_answers(void) {
     /* A progress that would complete the waiting moves. */
     reset_receive_script();
@@ -5602,6 +5622,7 @@ int main(void) {
     test_stop_without_an_unplayed_block_answers_the_oldest_waiting_move();
     test_halt_call_stop_is_not_reported_but_played_moves_still_are();
     test_stop_without_a_blamed_axis_reports_axis_none();
+    test_feeder_error_detail_keeps_both_nibbles();
     test_a_new_generation_drops_the_waiting_moves_without_answers();
     test_stop_drops_the_waiting_moves_without_answers();
     test_a_started_task_has_no_waiting_moves();
