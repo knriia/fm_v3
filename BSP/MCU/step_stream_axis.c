@@ -180,8 +180,8 @@ static const StepStreamAxisHardware_t step_stream_axis_z_hardware = {
 
 /* Syringe: TIM8 CH1 on PC6 (AF3), APB2 advanced timer like Y. DIR (PC7) and ENA (PG8) are not driven by this channel.
  * DMAMUX1 input 51 is TIM8_UP (RM0468 Rev 3, Table 118); DMAMUX1 channel 3 is wired to DMA1 stream 3 (RM0468 17.3.2).
- * SKELETON: nothing calls step_stream_axis_get_syringe() yet; before the first start the owner of the syringe must set
- * up DIR (PC7) and ENA (PG8), otherwise STEP pulses come out with the driver disabled or the direction undefined.
+ * The step generator is the owner of the syringe channel; it enables the driver and writes DIR (syringe_driver) before
+ * the first start, otherwise STEP pulses would come out with the driver disabled or the direction undefined.
  * TIM8's vector TIM8_TRG_COM_TIM14_IRQHandler is shared with the HAL tick (TIM14) and only dispatches TIM14: this
  * module writes TIM8->DIER only as 0 or TIM_DIER_UDE (a DMA request), so no TIM8 interrupt may ever be enabled here. */
 static const StepStreamAxisHardware_t step_stream_axis_syringe_hardware = {

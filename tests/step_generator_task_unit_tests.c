@@ -3,6 +3,7 @@
 #include "motion_axis_hardware.h"
 #include "step_generator_task.h"
 #include "step_stream_axis.h"
+#include "syringe_driver.h"
 
 #include "cmsis_os.h"
 #include "FreeRTOS.h"
@@ -25,11 +26,18 @@ static void reset_test_plan_buffer(void) {
 #define TEST_WAIT_SCRIPT_LENGTH 4U
 #define TEST_TIMER_CLOCK_HZ 275000000U
 #define TEST_HALF_WORDS (STEP_STREAM_AXIS_HALF_RECORD_COUNT * 3U)
-/* The generator drives three stream channels: channel 0 is X, channel 1 is Y, channel 2 is Z. */
+/* The channels of the axes: channel 0 is X, channel 1 is Y, channel 2 is Z. The per-axis tables (limit switches, driver
+ * outputs) and the loops over them keep to these three. */
 #define TEST_CHANNELS 3U
 #define TEST_CH_X 0U
 #define TEST_CH_Y 1U
 #define TEST_CH_Z 2U
+/* The channel of the syringe follows those of the axes: it is the fourth member of the printing stream. The per-channel
+ * state below has a slot for it. */
+#define TEST_CH_SYRINGE 3U
+#define TEST_ALL_CHANNELS 4U
+/* The member of the syringe in the printing instance, and the number of members that its diagnostic frame lists. */
+#define TEST_MEMBER_SYRINGE 3U
 
 /* Defined by the task source included below, where `static` is switched off for the tests. */
 /* Defined after the include: the group of the one instance. */
@@ -44,6 +52,10 @@ static void test_claim_print_channels(void);
 static const void *test_axis_context(MotionAxis_t axis);
 static const void *test_print_context(uint32_t member);
 static void test_check_print_still_holds(void);
+/* The snapshot of an instance, filled with a marker first so that a field that is not written shows. */
+static StepGeneratorProgress_t read_progress(const StepGeneratorInstance_t *instance);
+/* Gives the one-lane instance of the axis a queue of its own in the config. */
+static void init_axis_plan_buffer(MotionAxis_t axis);
 
 typedef enum {
     TEST_ACTION_NONE = 0,
@@ -68,7 +80,9 @@ typedef enum {
     /* A block of X and Y arrives in the print queue while another instance already streams on X. */
     TEST_ACTION_PUSH_PRINT_BLOCK_XY,
     /* Records what MotionTask can read of the print instance (ready, halted, reset count) before the reset of this wait. */
-    TEST_ACTION_SAMPLE_PRINT
+    TEST_ACTION_SAMPLE_PRINT,
+    /* The channel of the syringe still runs when the task is asked to reset. */
+    TEST_ACTION_SYRINGE_STREAMING
 } TestWaitAction_t;
 
 static uint32_t test_failures;
@@ -90,27 +104,30 @@ static uint32_t test_sampled_halted[TEST_WAIT_SCRIPT_LENGTH];
 static uint32_t test_sampled_reset_count[TEST_WAIT_SCRIPT_LENGTH];
 static uint32_t test_kernel_lock_depth;
 static uint32_t test_delay_calls;
+/* The argument of the latest osDelay. */
+static uint32_t test_delay_last_ticks;
 
-/* Fake stream channels of X and Y: two halves each, EMPTY after prepare. A channel is told apart by its marker. */
-static int test_axis_markers[TEST_CHANNELS];
-static uint16_t test_halves[TEST_CHANNELS][2][TEST_HALF_WORDS];
-static uint8_t test_half_empty[TEST_CHANNELS][2];
-static uint32_t test_prepare_calls[TEST_CHANNELS];
-static uint32_t test_start_calls[TEST_CHANNELS];
-static uint32_t test_last_startup_ns[TEST_CHANNELS];
-static uint32_t test_stop_calls[TEST_CHANNELS];
+/* Fake stream channels of X, Y, Z and the syringe: two halves each, EMPTY after prepare. A channel is told apart by its
+ * marker. */
+static int test_axis_markers[TEST_ALL_CHANNELS];
+static uint16_t test_halves[TEST_ALL_CHANNELS][2][TEST_HALF_WORDS];
+static uint8_t test_half_empty[TEST_ALL_CHANNELS][2];
+static uint32_t test_prepare_calls[TEST_ALL_CHANNELS];
+static uint32_t test_start_calls[TEST_ALL_CHANNELS];
+static uint32_t test_last_startup_ns[TEST_ALL_CHANNELS];
+static uint32_t test_stop_calls[TEST_ALL_CHANNELS];
 /* Calls of step_stream_axis_set_listener, accepted or not. */
-static uint32_t test_listener_calls[TEST_CHANNELS];
+static uint32_t test_listener_calls[TEST_ALL_CHANNELS];
 /* The context of the owner of each channel (the listener's context), NULL while the channel is free; the callbacks of the
  * owner are in test_stream_listener. */
-static const void *test_stream_owner[TEST_CHANNELS];
-static StepStreamAxisListener_t test_stream_listener[TEST_CHANNELS];
+static const void *test_stream_owner[TEST_ALL_CHANNELS];
+static StepStreamAxisListener_t test_stream_listener[TEST_ALL_CHANNELS];
 /* The channel goes on streaming after a stop, as one that plays its braking ramp does. */
-static uint8_t test_axis_stuck[TEST_CHANNELS];
-static uint32_t test_timer_clock_hz[TEST_CHANNELS];
-static uint8_t test_axis_streaming[TEST_CHANNELS];
-static uint32_t test_brake_requests[TEST_CHANNELS];
-static uint32_t test_configure_brake_calls[TEST_CHANNELS];
+static uint8_t test_axis_stuck[TEST_ALL_CHANNELS];
+static uint32_t test_timer_clock_hz[TEST_ALL_CHANNELS];
+static uint8_t test_axis_streaming[TEST_ALL_CHANNELS];
+static uint32_t test_brake_requests[TEST_ALL_CHANNELS];
+static uint32_t test_configure_brake_calls[TEST_ALL_CHANNELS];
 static uint32_t test_trigger_calls;
 static uint32_t test_trigger_axes;
 /* Driver outputs, by motion axis. */
@@ -120,7 +137,7 @@ static MotionAxisHardwareStatus_t test_outputs_result;
 static uint8_t test_fail_prepare;
 static uint8_t test_fail_acquire;
 static uint8_t test_fail_commit;
-/* Channel whose arming fails, or TEST_CHANNELS for none. */
+/* Channel whose arming fails, or TEST_ALL_CHANNELS for none. */
 static uint8_t test_fail_start_channel;
 /* The switch listener of each axis and who owns it; NULL while the axis is free. */
 static MotionAxisHardwareStreamLimitListener_t test_limit_listeners[MOTION_AXIS_HARDWARE_COUNT];
@@ -129,7 +146,7 @@ static void *test_limit_contexts[MOTION_AXIS_HARDWARE_COUNT];
 static uint32_t test_limit_listener_calls[MOTION_AXIS_HARDWARE_COUNT];
 static uint32_t test_limit_releases[MOTION_AXIS_HARDWARE_COUNT];
 /* Calls of step_stream_axis_release_listener, whoever the owner is. */
-static uint32_t test_listener_releases[TEST_CHANNELS];
+static uint32_t test_listener_releases[TEST_ALL_CHANNELS];
 /* A call that carries any other pointer than a channel marker is counted. */
 static uint32_t test_wrong_axis_calls;
 static StepStreamBrakeConfig_t test_brake_config;
@@ -205,8 +222,27 @@ static void push_block_xy(uint32_t sequence, int64_t x_steps, int64_t y_steps) {
 
 static void push_block(uint32_t sequence, int64_t x_steps) { push_block_xy(sequence, x_steps, 0); }
 
+/* A block of the syringe alone: `steps` steps (signed) at 100 kHz, one 10 us step each. */
+static MotionPlanBlock_t make_syringe_block(uint32_t sequence, int64_t steps) {
+    MotionPlanBlock_t block = {
+        .sequence = sequence,
+        .master_step_count = (uint64_t)(steps < 0 ? -steps : steps),
+        .step_event_rate_numerator = 100000U,
+        .step_event_rate_denominator = 1U,
+        .moving_axes_mask = MOTION_PLAN_CHANNEL_SYRINGE_MASK,
+        .positive_direction_mask = steps > 0 ? MOTION_PLAN_CHANNEL_SYRINGE_MASK : 0U,
+    };
+    block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = steps;
+    return block;
+}
+
+static void push_syringe_block(uint32_t sequence, int64_t steps) {
+    const MotionPlanBlock_t block = make_syringe_block(sequence, steps);
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "syringe block is queued");
+}
+
 static uint32_t channel_index(const StepStreamAxis_t *axis) {
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         if (axis == (const StepStreamAxis_t *)&test_axis_markers[channel]) {
             return channel;
         }
@@ -251,7 +287,7 @@ int32_t osKernelUnlock(void) {
 }
 
 uint32_t osDelay(uint32_t milliseconds) {
-    (void)milliseconds;
+    test_delay_last_ticks = milliseconds;
     ++test_delay_calls;
     return osOK;
 }
@@ -264,7 +300,7 @@ uint32_t osThreadFlagsSet(osThreadId_t thread_id, uint32_t flags) {
 }
 
 static void release_half(uint8_t half) {
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         test_half_empty[channel][half] = 1U;
     }
 }
@@ -298,12 +334,16 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
         test_axis_streaming[TEST_CH_X] = 0U;
         test_axis_streaming[TEST_CH_Y] = 0U;
         test_axis_streaming[TEST_CH_Z] = 0U;
+        test_axis_streaming[TEST_CH_SYRINGE] = 0U;
         break;
     case TEST_ACTION_Y_STREAMING:
         test_axis_streaming[TEST_CH_Y] = 1U;
         break;
     case TEST_ACTION_Z_STREAMING:
         test_axis_streaming[TEST_CH_Z] = 1U;
+        break;
+    case TEST_ACTION_SYRINGE_STREAMING:
+        test_axis_streaming[TEST_CH_SYRINGE] = 1U;
         break;
     case TEST_ACTION_PUSH_PRINT_BLOCK_XY:
         push_block_xy(400U + index, 3, 3);
@@ -335,6 +375,7 @@ uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout) {
         test_axis_streaming[TEST_CH_X] = 0U;
         test_axis_streaming[TEST_CH_Y] = 0U;
         test_axis_streaming[TEST_CH_Z] = 0U;
+        test_axis_streaming[TEST_CH_SYRINGE] = 0U;
         step_generator_task_halt_all();
         expect_u32(
             step_stream_group_get_state(test_group()),
@@ -366,6 +407,20 @@ StepStreamAxis_t *step_stream_axis_get(MotionAxis_t axis) {
         return (StepStreamAxis_t *)&test_axis_markers[TEST_CH_Y];
     }
     return axis == MOTION_AXIS_Z ? (StepStreamAxis_t *)&test_axis_markers[TEST_CH_Z] : NULL;
+}
+
+/* The channel of the syringe is the fourth fake channel, with the state of the others. */
+StepStreamAxis_t *step_stream_axis_get_syringe(void) { return (StepStreamAxis_t *)&test_axis_markers[TEST_CH_SYRINGE]; }
+
+/* The DIR/ENA outputs of the syringe: calls, the last direction, and what the driver answers (1 written, 0 refused). */
+static uint32_t test_syringe_outputs_calls;
+static uint8_t test_syringe_outputs_positive;
+static uint8_t test_syringe_outputs_result;
+
+uint8_t syringe_driver_set_stream_outputs(uint8_t positive_direction) {
+    ++test_syringe_outputs_calls;
+    test_syringe_outputs_positive = positive_direction;
+    return test_syringe_outputs_result;
 }
 
 /* As the channel does: BUSY while it streams and while another owner (another context) holds it; the owner may repeat. */
@@ -414,7 +469,7 @@ uint32_t step_stream_axis_get_timer_clock_hz(const StepStreamAxis_t *axis) {
 #define TEST_ALL_AXES_WATCHED 0x07U
 static uint8_t test_watched_axes = TEST_ALL_AXES_WATCHED;
 static uint32_t test_watched_axes_calls;
-static uint8_t test_watched_at_prepare[TEST_CHANNELS];
+static uint8_t test_watched_at_prepare[TEST_ALL_CHANNELS];
 
 StepStreamAxisStatus_t step_stream_axis_prepare_stream(StepStreamAxis_t *axis) {
     const uint32_t channel = channel_index(axis);
@@ -487,8 +542,8 @@ StepStreamAxisState_t step_stream_axis_get_state(const StepStreamAxis_t *axis) {
 }
 
 /* Records of the plan that each channel reports as played, and how often the task asked for them. */
-static uint32_t test_records_played[TEST_CHANNELS];
-static uint32_t test_records_played_calls[TEST_CHANNELS];
+static uint32_t test_records_played[TEST_ALL_CHANNELS];
+static uint32_t test_records_played_calls[TEST_ALL_CHANNELS];
 
 uint32_t step_stream_axis_plan_records_played(const StepStreamAxis_t *axis) {
     const uint32_t channel = channel_index(axis);
@@ -496,9 +551,10 @@ uint32_t step_stream_axis_plan_records_played(const StepStreamAxis_t *axis) {
     return test_records_played[channel];
 }
 
-static StepStreamAxisFault_t test_axis_fault[TEST_CHANNELS];
-static MotionAxisHardwareStatus_t test_hardware_status[TEST_CHANNELS];
-static MotionAxisHardwareStopReason_t test_hardware_stop_reason[TEST_CHANNELS];
+static StepStreamAxisFault_t test_axis_fault[TEST_ALL_CHANNELS];
+/* Indexed by MotionAxis_t: the syringe has no hardware axis. */
+static MotionAxisHardwareStatus_t test_hardware_status[MOTION_AXIS_HARDWARE_COUNT];
+static MotionAxisHardwareStopReason_t test_hardware_stop_reason[MOTION_AXIS_HARDWARE_COUNT];
 
 StepStreamAxisFault_t step_stream_axis_get_fault(const StepStreamAxis_t *axis) {
     return test_axis_fault[channel_index(axis)];
@@ -598,23 +654,28 @@ static void test_check_print_still_holds(void) {
             test_stream_owner[member] == test_print_context(member),
             "the print instance stays the owner of a channel that still streams"
         );
+    }
+    /* The syringe has no switch: only the three axes have a switch owner. */
+    for (uint32_t axis = 0U; axis < TEST_CHANNELS; ++axis) {
         expect_true(
-            test_limit_contexts[member] == &step_generator_task_instance,
+            test_limit_contexts[axis] == &step_generator_task_instance,
             "the print instance stays the owner of the switch of a channel that still streams"
         );
     }
     /* One attempt when the feeder stopped the stream, one when the pass ended with an idle feeder. */
     expect_u32(test_listener_releases[TEST_CH_X], 2U, "the release was tried twice while the channel streamed");
+    expect_u32(test_listener_releases[TEST_CH_SYRINGE], 2U, "the release of the syringe was tried twice as well");
 }
 
-/* A second instance with the same tables, standing for a stream of HOME or CALIBRATE: every link of it points to
- * itself. */
+/* A second instance with the tables of the axes X, Y and Z as its three members, standing for a stream of the axes
+ * only: every link of it points to itself. It has the policy of the single-axis instances. */
 static void make_other_instance(StepGeneratorInstance_t *other) {
     *other = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL(
         *other,
-        step_generator_task_member_axes,
-        step_generator_task_member_planner_axes,
-        STEP_GENERATOR_TASK_MEMBER_COUNT
+        step_generator_channels_axis_members,
+        step_generator_channels_axis_planner_channels,
+        STEP_GENERATOR_CHANNELS_AXIS_COUNT,
+        0U
     );
 }
 
@@ -624,12 +685,8 @@ static PlanBuffer_t test_axis_plan_buffer[MOTION_AXIS_HARDWARE_COUNT];
 static MotionPlanBlock_t test_axis_plan_entries[MOTION_AXIS_HARDWARE_COUNT][PLAN_BUFFER_CAPACITY];
 
 static void reset_instances(void) {
-    step_generator_task_instance = (StepGeneratorInstance_t)STEP_GENERATOR_TASK_INSTANCE_INITIAL(
-        step_generator_task_instance,
-        step_generator_task_member_axes,
-        step_generator_task_member_planner_axes,
-        STEP_GENERATOR_TASK_MEMBER_COUNT
-    );
+    step_generator_task_instance =
+        (StepGeneratorInstance_t)STEP_GENERATOR_TASK_PRINT_INSTANCE_INITIAL(step_generator_task_instance);
     step_generator_task_axis_instances[MOTION_AXIS_X] =
         (StepGeneratorInstance_t)STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_X);
     step_generator_task_axis_instances[MOTION_AXIS_Y] =
@@ -669,6 +726,7 @@ static void reset_fixture(void) {
     memset(test_sampled_reset_count, 0xFF, sizeof(test_sampled_reset_count));
     test_kernel_lock_depth = 0U;
     test_delay_calls = 0U;
+    test_delay_last_ticks = 0U;
     memset(test_halves, 0, sizeof(test_halves));
     memset(test_half_empty, 0, sizeof(test_half_empty));
     memset(test_prepare_calls, 0, sizeof(test_prepare_calls));
@@ -680,7 +738,7 @@ static void reset_fixture(void) {
     memset(test_axis_streaming, 0, sizeof(test_axis_streaming));
     memset(test_brake_requests, 0, sizeof(test_brake_requests));
     memset(test_configure_brake_calls, 0, sizeof(test_configure_brake_calls));
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         test_timer_clock_hz[channel] = TEST_TIMER_CLOCK_HZ;
     }
     memset(test_outputs_calls, 0, sizeof(test_outputs_calls));
@@ -689,8 +747,11 @@ static void reset_fixture(void) {
     test_fail_prepare = 0U;
     test_fail_acquire = 0U;
     test_fail_commit = 0U;
-    test_fail_start_channel = TEST_CHANNELS;
+    test_fail_start_channel = TEST_ALL_CHANNELS;
     test_wrong_axis_calls = 0U;
+    test_syringe_outputs_calls = 0U;
+    test_syringe_outputs_positive = 0xFFU;
+    test_syringe_outputs_result = 1U;
     test_trigger_calls = 0U;
     test_trigger_axes = 0U;
     memset(test_limit_listener_calls, 0, sizeof(test_limit_listener_calls));
@@ -741,6 +802,11 @@ static void test_task_streams_a_block(void) {
     expect_true(test_stream_owner[TEST_CH_X] == test_print_context(0U), "X channel belongs to the print instance");
     expect_true(test_stream_owner[TEST_CH_Y] == test_print_context(1U), "Y channel belongs to the print instance");
     expect_true(test_stream_owner[TEST_CH_Z] == test_print_context(2U), "Z channel belongs to the print instance");
+    expect_u32(test_listener_calls[TEST_CH_SYRINGE], 1U, "the stream registers the stream listener of the syringe once");
+    expect_true(
+        test_stream_owner[TEST_CH_SYRINGE] == test_print_context(TEST_MEMBER_SYRINGE),
+        "the syringe channel belongs to the print instance as its member 3"
+    );
     expect_u32(step_generator_task_instance.channels_held, 1U, "the print instance holds its channels while it streams");
     expect_u32(
         test_watched_axes,
@@ -752,9 +818,11 @@ static void test_task_streams_a_block(void) {
     expect_u32(test_prepare_calls[TEST_CH_Y], 1U, "the stream of Y is prepared with it");
     expect_u32(test_prepare_calls[TEST_CH_Z], 1U, "the stream of Z is prepared with it");
     expect_u32(test_trigger_calls, 1U, "the group triggers the channels once, after arming them");
-    expect_u32(test_trigger_axes, 3U, "one trigger covers all three channels of the group");
+    expect_u32(test_prepare_calls[TEST_CH_SYRINGE], 1U, "the stream of the syringe is prepared with it");
+    expect_u32(test_trigger_axes, 4U, "one trigger covers all four channels of the group");
     expect_u32(step_stream_group_get_state(test_group()), STEP_STREAM_GROUP_STATE_RUNNING, "the group runs the stream");
-    expect_u32(test_wrong_axis_calls, 0U, "every stream call goes to the channel of X, Y or Z");
+    expect_u32(test_wrong_axis_calls, 0U, "every stream call goes to the channel of X, Y, Z or the syringe");
+    expect_u32(test_syringe_outputs_calls, 0U, "a block that does not move the syringe leaves its driver alone");
     expect_u32(test_outputs_calls[MOTION_AXIS_X], 1U, "the driver outputs of X are set once");
     expect_u32(test_outputs_positive[MOTION_AXIS_X], 1U, "positive block sets the positive direction");
     expect_u32(test_outputs_calls[MOTION_AXIS_Y], 0U, "a block that does not move Y leaves its driver alone");
@@ -763,11 +831,17 @@ static void test_task_streams_a_block(void) {
     expect_u32(test_start_calls[TEST_CH_X], 1U, "the channel of X starts once both halves are filled");
     expect_u32(test_start_calls[TEST_CH_Y], 1U, "the channel of Y starts with it");
     expect_u32(test_start_calls[TEST_CH_Z], 1U, "the channel of Z starts with it");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 1U, "the channel of the syringe starts with it");
+    expect_u32(
+        test_last_startup_ns[TEST_CH_SYRINGE],
+        STEP_STREAM_AXIS_MIN_STARTUP_NS,
+        "startup period is passed to the syringe"
+    );
     expect_u32(test_last_startup_ns[TEST_CH_X], STEP_STREAM_AXIS_MIN_STARTUP_NS, "startup period is passed to X");
     expect_u32(test_last_startup_ns[TEST_CH_Y], STEP_STREAM_AXIS_MIN_STARTUP_NS, "startup period is passed to Y");
     expect_u32(test_last_startup_ns[TEST_CH_Z], STEP_STREAM_AXIS_MIN_STARTUP_NS, "startup period is passed to Z");
     expect_u32(test_kernel_lock_depth, 0U, "task switching is resumed after the start");
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_u32(test_half_empty[channel][0] + test_half_empty[channel][1], 0U, "both halves are committed");
     }
     expect_u32(test_halves[TEST_CH_X][0][0], 2749U, "X step interval is 10 us in ticks");
@@ -778,6 +852,8 @@ static void test_task_streams_a_block(void) {
     expect_u32(test_halves[TEST_CH_Y][0][2], 0U, "Y has no pulse in a block that does not move it");
     expect_u32(test_halves[TEST_CH_Z][0][0], 8249U, "Z waits out the block in one idle record of its length");
     expect_u32(test_halves[TEST_CH_Z][0][2], 0U, "Z has no pulse in a block that does not move it");
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][0], 8249U, "the syringe waits out the block in one idle record");
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][2], 0U, "the syringe has no pulse in a block that does not move it");
 
     StepGeneratorTaskDiagnostics diagnostics = {0};
     step_generator_task_get_diagnostics(&diagnostics);
@@ -833,7 +909,7 @@ static void test_y_and_xy_blocks_reach_their_channels(void) {
     expect_u32(test_outputs_positive[MOTION_AXIS_Y], 0U, "Y goes the negative way");
     expect_u32(test_halves[TEST_CH_X][0][2], 1375U, "the diagonal has a pulse on X");
     expect_u32(test_halves[TEST_CH_Y][0][2], 1375U, "the diagonal has a pulse on Y");
-    expect_u32(test_trigger_axes, 3U, "all three channels start together");
+    expect_u32(test_trigger_axes, 4U, "all four channels start together");
     expect_u32(test_outputs_calls[MOTION_AXIS_Z], 0U, "a diagonal of X and Y leaves the driver of Z alone");
     expect_u32(test_halves[TEST_CH_Z][0][2], 0U, "Z has no pulse in a diagonal of X and Y");
     expect_u32(test_watched_axes, (1U << MOTION_AXIS_X) | (1U << MOTION_AXIS_Y), "a diagonal watches both axes");
@@ -861,7 +937,7 @@ static void test_z_and_xyz_blocks_reach_their_channels(void) {
     );
     expect_u32(test_watched_axes, 1U << MOTION_AXIS_Z, "only Z is watched while only Z moves");
     expect_u32(test_start_calls[TEST_CH_Z], 1U, "the stream of Z starts");
-    expect_u32(test_trigger_axes, 3U, "Z starts in the same trigger as X and Y");
+    expect_u32(test_trigger_axes, 4U, "Z starts in the same trigger as X, Y and the syringe");
     expect_u32(test_wrong_axis_calls, 0U, "every call goes to a known channel");
     expect_u32(step_generator_task_instance.diagnostics.generator_errors, 0U, "a block of Z is no generator error");
     expect_u32(step_generator_task_instance.diagnostics.axis_errors, 0U, "a block of Z is no axis error");
@@ -903,10 +979,13 @@ static void test_idle_stream_stops(void) {
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "an idle stream is stopped on the channel of X");
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "and on the channel of Y");
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "and on the channel of Z");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "and on the channel of the syringe");
     expect_u32(step_generator_task_instance.diagnostics.streams_stopped, 1U, "stream stop is counted");
     expect_u32(step_generator_task_instance.halted, 0U, "a normal end does not halt the task");
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_true(test_stream_owner[channel] == NULL, "the channel is free once its stream has stopped");
+    }
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         expect_true(test_limit_contexts[channel] == NULL, "the switch of the axis is free once its stream has stopped");
         expect_u32(test_limit_releases[channel], 1U, "the switch listener is let go once, at the stop of the stream");
     }
@@ -926,6 +1005,8 @@ static void test_idle_stream_stops(void) {
     expect_u32(test_start_calls[TEST_CH_X], 2U, "the next block starts a second stream on X");
     expect_u32(test_start_calls[TEST_CH_Y], 2U, "and on Y");
     expect_u32(test_start_calls[TEST_CH_Z], 2U, "and on Z");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 2U, "and on the syringe");
+    expect_u32(test_listener_calls[TEST_CH_SYRINGE], 2U, "each stream takes the channel of the syringe again");
     expect_u32(test_listener_calls[TEST_CH_X], 2U, "each stream takes the channel of X again");
     expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 2U, "each stream takes the switch of X again");
     expect_true(test_stream_owner[TEST_CH_X] == test_print_context(0U), "the second stream owns the channel of X");
@@ -953,9 +1034,9 @@ static void test_unusable_timing_disables_feeding(void) {
     expect_u32(step_generator_task_instance.halted, 1U, "still halted");
 
     reset_fixture();
-    test_timer_clock_hz[TEST_CH_X] = 0U;
-    test_timer_clock_hz[TEST_CH_Y] = 0U;
-    test_timer_clock_hz[TEST_CH_Z] = 0U;
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        test_timer_clock_hz[channel] = 0U;
+    }
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
     expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "unusable clock is counted");
@@ -968,9 +1049,9 @@ static void test_unusable_timing_disables_feeding(void) {
     /* Timing whose tick count does not fit 32 bits is refused when the feeder config is built. */
     reset_fixture();
     test_task_config.step_low_time_ns = UINT32_MAX;
-    test_timer_clock_hz[TEST_CH_X] = UINT32_MAX;
-    test_timer_clock_hz[TEST_CH_Y] = UINT32_MAX;
-    test_timer_clock_hz[TEST_CH_Z] = UINT32_MAX;
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        test_timer_clock_hz[channel] = UINT32_MAX;
+    }
     (void)run_task_until_jump(&test_task_config);
     expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "overflowing timing is counted");
 }
@@ -1003,6 +1084,38 @@ static void test_channels_on_different_clocks_disable_feeding(void) {
     expect_u32(step_generator_task_instance.halted, 1U, "no channel is fed when only Z has a different clock");
     expect_u32(test_prepare_calls[TEST_CH_X], 0U, "no stream is prepared when Z has a different clock");
     expect_u32(test_configure_brake_calls[TEST_CH_Z], 0U, "no feeder, no ramp for Z");
+
+    /* The syringe is member 3: a clock that differs only there also disables the printing stream. */
+    reset_fixture();
+    push_block_xy(42U, 3, 3);
+    test_timer_clock_hz[TEST_CH_SYRINGE] = TEST_TIMER_CLOCK_HZ / 2U;
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "a different clock of the syringe is counted");
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "the print instance is not ready");
+    expect_u32(step_generator_task_instance.halted, 1U, "no channel is fed when only the syringe has a different clock");
+    expect_u32(test_prepare_calls[TEST_CH_X], 0U, "no stream is prepared when the syringe has a different clock");
+    expect_u32(
+        test_configure_brake_calls[TEST_CH_SYRINGE],
+        0U,
+        "no feeder, no ramp for the syringe"
+    );
+
+    /* The first member is the reference of the timing: the other clocks only have to agree with it. All four channels
+     * on 137.5 MHz are ready and the records are counted in the ticks of that clock: 10 us are 1375 ticks (the record
+     * holds one less), and 5 us are 687.5, rounded up to 688. */
+    reset_fixture();
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        test_timer_clock_hz[channel] = TEST_TIMER_CLOCK_HZ / 2U;
+    }
+    push_block(43U, 3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+    expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 1U, "all channels on one clock are ready");
+    expect_u32(test_halves[TEST_CH_X][0][0], 1374U, "the interval is counted in the ticks of the common clock");
+    expect_u32(test_halves[TEST_CH_X][0][2], 688U, "the pulse is counted in the ticks of the common clock");
 }
 
 static void test_stop_halts_and_resets(void) {
@@ -1015,7 +1128,8 @@ static void test_stop_halts_and_resets(void) {
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP stops the channel of X at once, only for the instance that holds it");
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP stops the channel of Y at once, only for the instance that holds it");
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP stops the channel of Z at once, only for the instance that holds it");
-    expect_u32(test_wrong_axis_calls, 0U, "STOP reaches the channels of X, Y and Z only");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "STOP stops the channel of the syringe at once as well");
+    expect_u32(test_wrong_axis_calls, 0U, "STOP reaches the channels of X, Y, Z and the syringe only");
     expect_u32(step_generator_task_instance.halted, 1U, "STOP halts feeding");
     expect_u32(step_generator_instance_is_halted(&step_generator_task_instance), 1U, "the halt is visible to MotionTask");
     test_wait_script_count = 1U;
@@ -1057,7 +1171,7 @@ static void test_instance_api(void) {
     expect_u32(step_generator_instance_is_busy(NULL), 0U, "NULL instance is not busy");
     expect_u32(step_generator_instance_is_halted(NULL), 0U, "NULL instance is not halted");
     expect_u32(step_generator_task_instance.halts_total, 0U, "NULL halt touches no instance");
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_u32(test_stop_calls[channel], 0U, "NULL halt stops no channel");
     }
     expect_u32(step_generator_task_instance.reset_requested, 0U, "NULL resume touches no instance");
@@ -1065,7 +1179,7 @@ static void test_instance_api(void) {
 
     /* An instance that holds no channel halts feeding but stops no channel: they are not its own. */
     step_generator_instance_halt(&step_generator_task_instance);
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_u32(test_stop_calls[channel], 0U, "halt of an instance without channels stops none");
     }
     expect_u32(step_generator_task_instance.halted, 1U, "instance halt halts feeding");
@@ -1082,6 +1196,7 @@ static void test_instance_api(void) {
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "instance halt stops the channel of X");
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "instance halt stops the channel of Y");
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "instance halt stops the channel of Z");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "instance halt stops the channel of the syringe");
 
     /* STOP of all instances reaches the channels of the instance that holds them. */
     reset_fixture();
@@ -1090,6 +1205,7 @@ static void test_instance_api(void) {
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "STOP of all stops the channel of X once, for its holder");
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "STOP of all stops the channel of Y once, for its holder");
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "STOP of all stops the channel of Z once, for its holder");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "STOP of all stops the channel of the syringe once, for its holder");
     expect_u32(step_generator_task_instance.halts_total, 1U, "STOP of all halts the instance once");
 
     /* Resume marks the instance, then wakes the task. */
@@ -1146,16 +1262,20 @@ static void test_instance_api(void) {
     test_task_config.plan_buffer = NULL;
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_u32(test_listener_calls[channel], 0U, "a failed setup offers no stream listener");
-        expect_u32(test_limit_listener_calls[channel], 0U, "a failed setup offers no switch listener");
         expect_true(test_stream_owner[channel] == NULL, "a failed setup owns no channel");
+    }
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_limit_listener_calls[channel], 0U, "a failed setup offers no switch listener");
     }
     reset_fixture();
     test_wait_script_count = 0U;
     (void)run_task_until_jump(&test_task_config);
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_u32(test_listener_calls[channel], 0U, "a good setup does not take the stream listener before a stream");
+    }
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         expect_u32(test_limit_listener_calls[channel], 0U, "a good setup does not take the switch listener either");
     }
     expect_u32(step_generator_task_instance.channels_held, 0U, "a ready instance without a stream holds nothing");
@@ -1170,9 +1290,10 @@ static void test_start_is_refused_while_halted(void) {
         "a stream cannot start after STOP"
     );
     expect_u32(
-        test_start_calls[TEST_CH_X] + test_start_calls[TEST_CH_Y] + test_start_calls[TEST_CH_Z],
+        test_start_calls[TEST_CH_X] + test_start_calls[TEST_CH_Y] + test_start_calls[TEST_CH_Z] +
+            test_start_calls[TEST_CH_SYRINGE],
         0U,
-        "no axis is started while halted"
+        "no channel is started while halted"
     );
     expect_u32(test_kernel_lock_depth, 0U, "task switching is resumed");
 }
@@ -1196,10 +1317,17 @@ static void test_direction_is_refused_while_halted(void) {
         "the driver of Z is not touched after STOP either"
     );
     expect_u32(
-        test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Y] + test_outputs_calls[MOTION_AXIS_Z],
+        step_generator_task_port_set_direction(&step_generator_task_instance, TEST_MEMBER_SYRINGE, 1U),
+        STEP_STREAM_FEEDER_AXIS_ERROR,
+        "the driver of the syringe is not touched after STOP either"
+    );
+    expect_u32(
+        test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Y] + test_outputs_calls[MOTION_AXIS_Z] +
+            test_syringe_outputs_calls,
         0U,
         "no DIR or ENA write while halted"
     );
+    expect_u32(test_delay_calls, 0U, "no settle wait after a refusal while halted");
     expect_u32(test_kernel_lock_depth, 0U, "task switching is resumed");
 }
 
@@ -1232,6 +1360,68 @@ static void test_direction_goes_to_the_axis_of_the_lane(void) {
     expect_u32(test_outputs_calls[MOTION_AXIS_X], x_calls_before_lane_2, "lane 2 does not touch X");
     expect_u32(test_outputs_calls[MOTION_AXIS_Y], y_calls_before_lane_2, "lane 2 does not touch Y");
     expect_u32(test_outputs_positive[MOTION_AXIS_Z], 1U, "the direction reaches Z");
+    expect_u32(test_syringe_outputs_calls, 0U, "lanes 0 to 2 do not touch the syringe");
+
+    /* Lane 3 is the syringe: its own driver, no axis. */
+    expect_u32(
+        step_generator_task_port_set_direction(&step_generator_task_instance, TEST_MEMBER_SYRINGE, 1U),
+        STEP_STREAM_FEEDER_AXIS_OK,
+        "the direction of lane 3 is set"
+    );
+    expect_u32(test_syringe_outputs_calls, 1U, "lane 3 is the driver of the syringe");
+    expect_u32(test_syringe_outputs_positive, 1U, "the positive direction reaches the syringe");
+    expect_u32(
+        step_generator_task_port_set_direction(&step_generator_task_instance, TEST_MEMBER_SYRINGE, 0U),
+        STEP_STREAM_FEEDER_AXIS_OK,
+        "the negative direction of lane 3 is set"
+    );
+    expect_u32(test_syringe_outputs_calls, 2U, "the second write reached the syringe");
+    expect_u32(test_syringe_outputs_positive, 0U, "the negative direction reaches the syringe");
+    expect_u32(
+        test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Y] + test_outputs_calls[MOTION_AXIS_Z],
+        x_calls_before_lane_2 + y_calls_before_lane_2 + 1U,
+        "lane 3 does not touch an axis"
+    );
+
+    /* A syringe driver that refuses (not set up) is a refusal of the lane, without a settle wait. */
+    const uint32_t delays_before_refusal = test_delay_calls;
+    test_syringe_outputs_result = 0U;
+    expect_u32(
+        step_generator_task_port_set_direction(&step_generator_task_instance, TEST_MEMBER_SYRINGE, 1U),
+        STEP_STREAM_FEEDER_AXIS_ERROR,
+        "a refusal of the syringe driver is a refusal of lane 3"
+    );
+    expect_u32(test_delay_calls, delays_before_refusal, "no settle wait after a refusal of the syringe driver");
+}
+
+/* The DIR setup time: every written direction is followed by a delay of STEP_GENERATOR_TASK_DIRECTION_SETTLE_TICKS. */
+static void test_direction_waits_the_settle_time(void) {
+    reset_fixture();
+    /* 1 ms at the 1 kHz tick of the test configuration is one tick, and one more tick because the first is cut short:
+     * two ticks, counted here independently of the macro. */
+    expect_u32(
+        step_generator_task_port_set_direction(&step_generator_task_instance, 0U, 1U),
+        STEP_STREAM_FEEDER_AXIS_OK,
+        "the direction of X is written"
+    );
+    expect_u32(test_delay_calls, 1U, "one wait follows the write");
+    expect_u32(test_delay_last_ticks, 2U, "the wait lasts two ticks");
+    test_delay_last_ticks = 0U;
+    expect_u32(
+        step_generator_task_port_set_direction(&step_generator_task_instance, TEST_MEMBER_SYRINGE, 0U),
+        STEP_STREAM_FEEDER_AXIS_OK,
+        "the direction of the syringe is written"
+    );
+    expect_u32(test_delay_calls, 2U, "the write of the syringe is followed by a wait too");
+    expect_u32(test_delay_last_ticks, 2U, "the wait after the syringe lasts two ticks");
+
+    /* Through a whole stream: the wait comes once per moving channel with that length. */
+    reset_fixture();
+    push_block(44U, 3);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_delay_calls, 1U, "a stream that moves X waits once");
+    expect_u32(test_delay_last_ticks, 2U, "the wait of the stream lasts two ticks");
 }
 
 static void test_busy_covers_queue_and_stream(void) {
@@ -1332,7 +1522,12 @@ static void test_faults_halt_the_task(void) {
     expect_u32(step_generator_task_instance.diagnostics.streams_started, 0U, "no stream started");
     /* Once by the group that undoes the refused arming, once by the feeder's stop of the instance that holds X. */
     expect_u32(test_stop_calls[TEST_CH_X], 2U, "the channel of X is stopped by the group and by the feeder on a fault");
-    expect_u32(test_wrong_axis_calls, 0U, "the feeder stops and starts the channels of X and Y only");
+    expect_u32(
+        test_stop_calls[TEST_CH_SYRINGE],
+        2U,
+        "the channel of the syringe is stopped by the group and by the feeder on a fault as well"
+    );
+    expect_u32(test_wrong_axis_calls, 0U, "the feeder stops and starts the channels of the group only");
 
     /* The channel of Y refuses after X was armed: X must not be left waiting for a trigger. */
     reset_fixture();
@@ -1359,6 +1554,44 @@ static void test_faults_halt_the_task(void) {
     expect_u32(test_axis_streaming[TEST_CH_X], 0U, "the channel of X that was armed is not left running");
     expect_u32(test_axis_streaming[TEST_CH_Y], 0U, "the channel of Y that was armed is not left running");
     expect_u32(test_trigger_calls, 0U, "no trigger after Z refused arming");
+
+    /* The channel of the syringe refuses last: X, Y and Z were armed and must not be left waiting for a trigger. */
+    reset_fixture();
+    push_block(17U, 3);
+    test_fail_start_channel = TEST_CH_SYRINGE;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_task_instance.halted, 1U, "a refusal of the channel of the syringe halts feeding");
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "a refusal of the syringe is an axis error");
+    expect_u32(test_start_calls[TEST_CH_X], 1U, "X was armed before the syringe refused");
+    expect_u32(test_start_calls[TEST_CH_Y], 1U, "Y was armed before the syringe refused");
+    expect_u32(test_start_calls[TEST_CH_Z], 1U, "Z was armed before the syringe refused");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 1U, "the syringe was asked to arm");
+    expect_u32(test_axis_streaming[TEST_CH_X], 0U, "the armed channel of X is not left running");
+    expect_u32(test_axis_streaming[TEST_CH_Y], 0U, "the armed channel of Y is not left running");
+    expect_u32(test_axis_streaming[TEST_CH_Z], 0U, "the armed channel of Z is not left running");
+    expect_u32(test_axis_streaming[TEST_CH_SYRINGE], 0U, "the channel of the syringe is not running");
+    expect_u32(test_trigger_calls, 0U, "no trigger after the syringe refused arming");
+
+    /* The driver of the syringe refuses DIR (not set up): a block that moves it does not start. */
+    reset_fixture();
+    {
+        MotionPlanBlock_t syringe_block = make_syringe_block(18U, 3);
+        expect_u32(plan_buffer_try_push(&test_plan_buffer, &syringe_block), PLAN_BUFFER_STATUS_OK, "block is queued");
+    }
+    test_syringe_outputs_result = 0U;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_syringe_outputs_calls, 1U, "the driver of the syringe was asked once");
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "a refused DIR of the syringe is an axis error");
+    expect_u32(step_generator_task_instance.halted, 1U, "a refused DIR of the syringe halts feeding");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        "the refusal is a feeder error"
+    );
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 0U, "nothing starts after the refusal");
+    expect_u32(test_delay_calls, 0U, "no settle wait after the refusal");
 
     reset_fixture();
     push_block(8U, 3);
@@ -1460,7 +1693,8 @@ static void test_listener_and_notifications(void) {
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "the channel of X is stopped for the fault of Y");
     expect_u32(test_stop_calls[TEST_CH_Y], 0U, "the failed channel of Y stopped itself");
     expect_u32(test_stop_calls[TEST_CH_Z], 1U, "the channel of Z is stopped for the fault of Y");
-    expect_u32(test_wrong_axis_calls, 0U, "the group stops and starts the channels of X, Y and Z only");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "the channel of the syringe is stopped for the fault of Y");
+    expect_u32(test_wrong_axis_calls, 0U, "the group stops and starts the channels of its members only");
 
     step_generator_task_instance.halted = 0U;
     test_stream_listener[TEST_CH_X].on_brake(test_stream_listener[TEST_CH_X].context);
@@ -1501,6 +1735,57 @@ static void test_listener_and_notifications(void) {
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "the channel of X is stopped for the fault of Z");
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "the channel of Y is stopped for the fault of Z");
     expect_u32(test_stop_calls[TEST_CH_Z], 0U, "the failed channel of Z stopped itself");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "the channel of the syringe is stopped for the fault of Z");
+
+    /* The channel of the syringe is member 3: its events reach the print instance with that number. */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+    test_flags_set_value = 0U;
+    test_stream_listener[TEST_CH_SYRINGE].on_half_released(test_stream_listener[TEST_CH_SYRINGE].context);
+    expect_u32(
+        test_flags_set_value,
+        STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED,
+        "a released ring half of the syringe wakes the task"
+    );
+    expect_u32(step_generator_task_instance.halted, 0U, "a released half of the syringe does not halt the task");
+    run_group_prepared_and_started();
+    test_stream_listener[TEST_CH_SYRINGE].on_fault(
+        test_stream_listener[TEST_CH_SYRINGE].context,
+        STEP_STREAM_AXIS_FAULT_UNDERRUN
+    );
+    expect_u32(step_generator_task_instance.halted, 1U, "a fault of the syringe halts feeding");
+    expect_u32(step_stream_group_get_fault_member(test_group()), TEST_MEMBER_SYRINGE, "the fault is that of member 3");
+    expect_u32(
+        step_stream_group_get_fault(test_group()),
+        (uint32_t)STEP_STREAM_AXIS_FAULT_UNDERRUN,
+        "the group keeps the fault of the syringe"
+    );
+    expect_u32(step_generator_task_instance.halt_member, TEST_MEMBER_SYRINGE, "the halt is blamed on member 3");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT,
+        "the fault of the syringe is a group fault"
+    );
+    expect_u32(test_stop_calls[TEST_CH_X], 1U, "the channel of X is stopped for the fault of the syringe");
+    expect_u32(test_stop_calls[TEST_CH_Y], 1U, "the channel of Y is stopped for the fault of the syringe");
+    expect_u32(test_stop_calls[TEST_CH_Z], 1U, "the channel of Z is stopped for the fault of the syringe");
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 0U, "the failed channel of the syringe stopped itself");
+
+    /* The syringe brakes with the axes when the group does: with no switch reported it is the braking member. */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_claim_print_channels();
+    test_stream_listener[TEST_CH_SYRINGE].on_brake(test_stream_listener[TEST_CH_SYRINGE].context);
+    expect_u32(step_generator_task_instance.halted, 1U, "braking of the syringe halts feeding");
+    expect_u32(step_generator_task_instance.halt_member, TEST_MEMBER_SYRINGE, "braking of the syringe is blamed on member 3");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_LIMIT,
+        "braking of the syringe is named as a limit"
+    );
 
     reset_fixture();
     step_generator_task_notify_block_ready();
@@ -1697,6 +1982,50 @@ static void test_stream_diagnostics_name_the_cause_of_a_halt(void) {
     );
 }
 
+/* The diagnostic frame lists the three axes; the syringe, member 3 of the instance, writes no entry of its own. */
+static void test_stream_diagnostics_list_only_the_axes(void) {
+    reset_fixture();
+    /* The frame is followed by a canary: a write of a fourth entry would overwrite it. */
+    struct {
+        StepGeneratorTaskStreamDiagnostics_t frame;
+        StepGeneratorTaskMemberDiagnostics_t canary;
+    } framed;
+    (void)memset(&framed, 0xA5, sizeof(framed));
+    expect_u32(
+        (uint32_t)((const char *)&framed.canary - (const char *)&framed.frame.members[3]),
+        0U,
+        "the canary sits right behind the third entry"
+    );
+    /* The syringe has a state of its own that differs from the others, so that a write of its entry would show. */
+    test_axis_streaming[TEST_CH_SYRINGE] = 1U;
+    test_axis_fault[TEST_CH_SYRINGE] = STEP_STREAM_AXIS_FAULT_DMA;
+    step_generator_task_instance.limit_trips[TEST_MEMBER_SYRINGE] = 7U;
+    step_generator_task_get_stream_diagnostics(&framed.frame);
+    const unsigned char *const canary_bytes = (const unsigned char *)&framed.canary;
+    uint32_t canary_intact = 1U;
+    for (uint32_t index = 0U; index < sizeof(framed.canary); ++index) {
+        if (canary_bytes[index] != 0xA5U) {
+            canary_intact = 0U;
+        }
+    }
+    expect_u32(canary_intact, 1U, "the syringe writes nothing behind the entries of the axes");
+    expect_u32(framed.frame.members[0].channel_state, (uint32_t)STEP_STREAM_AXIS_STATE_IDLE, "X entry is written");
+    expect_u32(framed.frame.members[2].limit_trips, 0U, "Z entry is written");
+
+    /* A fault of the syringe is blamed on member 3 in the frame, and on no axis in the progress. */
+    reset_fixture();
+    const uint32_t fault = (uint32_t)STEP_STREAM_AXIS_FAULT_DMA;
+    step_generator_task_group_fault(&step_generator_task_instance, TEST_MEMBER_SYRINGE, fault);
+    StepGeneratorTaskStreamDiagnostics_t stream = {0};
+    step_generator_task_get_stream_diagnostics(&stream);
+    expect_u32(stream.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, "a ring fault is the cause");
+    expect_u32(stream.halt_member, TEST_MEMBER_SYRINGE, "the frame names member 3");
+    expect_u32(stream.halt_fault, fault, "the fault code is kept");
+    const StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "the syringe is no axis to blame");
+    expect_u32(progress.halt_detail, fault, "the detail is the fault code");
+}
+
 static void test_limit_switch_brakes_through_the_group(void) {
     reset_fixture();
     test_wait_script_count = 0U;
@@ -1724,7 +2053,8 @@ static void test_limit_switch_brakes_through_the_group(void) {
         MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT
     );
     expect_u32(
-        test_brake_requests[TEST_CH_X] + test_brake_requests[TEST_CH_Y] + test_brake_requests[TEST_CH_Z],
+        test_brake_requests[TEST_CH_X] + test_brake_requests[TEST_CH_Y] + test_brake_requests[TEST_CH_Z] +
+            test_brake_requests[TEST_CH_SYRINGE],
         0U,
         "a switch of an axis without a channel brakes nothing"
     );
@@ -1736,7 +2066,8 @@ static void test_limit_switch_brakes_through_the_group(void) {
     StepGeneratorTaskStreamDiagnostics_t no_channel = {0};
     step_generator_task_get_stream_diagnostics(&no_channel);
     expect_u32(
-        no_channel.members[0].limit_trips + no_channel.members[1].limit_trips + no_channel.members[2].limit_trips,
+        no_channel.members[0].limit_trips + no_channel.members[1].limit_trips + no_channel.members[2].limit_trips +
+            step_generator_task_instance.limit_trips[TEST_MEMBER_SYRINGE],
         0U,
         "a switch of an axis without a channel is counted for no member"
     );
@@ -1750,6 +2081,12 @@ static void test_limit_switch_brakes_through_the_group(void) {
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of X brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of X brakes the channel of Y too");
     expect_u32(test_brake_requests[TEST_CH_Z], 1U, "the switch of X brakes the channel of Z too");
+    expect_u32(test_brake_requests[TEST_CH_SYRINGE], 1U, "the switch of X brakes the channel of the syringe too");
+    expect_u32(
+        step_generator_task_instance.limit_trips[TEST_MEMBER_SYRINGE],
+        0U,
+        "the switch of an axis is not counted for the syringe"
+    );
     expect_u32(
         step_stream_group_get_state(test_group()),
         STEP_STREAM_GROUP_STATE_STOPPING,
@@ -1789,6 +2126,7 @@ static void test_limit_switch_brakes_through_the_group(void) {
     expect_u32(test_brake_requests[TEST_CH_X], 1U, "the switch of Z brakes the channel of X");
     expect_u32(test_brake_requests[TEST_CH_Y], 1U, "the switch of Z brakes the channel of Y");
     expect_u32(test_brake_requests[TEST_CH_Z], 1U, "the switch of Z brakes the channel of Z");
+    expect_u32(test_brake_requests[TEST_CH_SYRINGE], 1U, "the switch of Z brakes the channel of the syringe too");
     expect_u32(
         step_stream_group_get_state(test_group()),
         STEP_STREAM_GROUP_STATE_STOPPING,
@@ -2018,8 +2356,10 @@ static void test_stop_reset_clears_a_group_fault(void) {
     expect_u32(step_generator_task_instance.halted, 0U, "feeding goes on after the reset");
     expect_u32(step_generator_task_instance.diagnostics.axis_errors, 0U, "a clean reset is no error");
     expect_u32(step_generator_task_instance.channels_held, 0U, "a clean reset lets go of the channels");
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_true(test_stream_owner[channel] == NULL, "the channel is free after the reset");
+    }
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         expect_true(test_limit_contexts[channel] == NULL, "the switch is free after the reset");
     }
 }
@@ -2048,6 +2388,23 @@ static void test_reset_is_refused_while_a_channel_runs(void) {
         "a channel of Z that still runs is an axis error"
     );
     expect_u32(step_generator_task_instance.halted, 1U, "nothing is fed while the channel of Z runs after STOP");
+
+    reset_fixture();
+    test_wait_script_count = 1U;
+    test_wait_actions[0] = TEST_ACTION_SYRINGE_STREAMING;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_STOP_RESET;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_generator_task_instance.diagnostics.axis_errors,
+        1U,
+        "a channel of the syringe that still runs is an axis error"
+    );
+    expect_u32(step_generator_task_instance.halted, 1U, "nothing is fed while the channel of the syringe runs after STOP");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED,
+        "the cause is the failed reset"
+    );
 }
 
 static void test_brake_ramp_is_built_from_the_driver_timing(void) {
@@ -2057,6 +2414,11 @@ static void test_brake_ramp_is_built_from_the_driver_timing(void) {
     expect_u32(test_configure_brake_calls[TEST_CH_X], 1U, "the braking ramp of X is configured once");
     expect_u32(test_configure_brake_calls[TEST_CH_Y], 1U, "the braking ramp of Y is configured once");
     expect_u32(test_configure_brake_calls[TEST_CH_Z], 1U, "the braking ramp of Z is configured once");
+    expect_u32(
+        test_configure_brake_calls[TEST_CH_SYRINGE],
+        1U,
+        "the braking ramp of the syringe is configured once: the group brakes it with the axes"
+    );
     expect_u32(test_brake_config.timer_clock_hz, TEST_TIMER_CLOCK_HZ, "ramp uses the timer clock");
     expect_u32(test_brake_config.pulse_ticks, 1375U, "ramp uses the STEP pulse of the driver");
     expect_u32(test_brake_config.min_period_ticks, 2063U, "ramp keeps pulse and low time");
@@ -2077,6 +2439,44 @@ static void test_brake_ramp_is_built_from_the_driver_timing(void) {
     (void)run_task_until_jump(&test_task_config);
     expect_u32(test_brake_config.min_period_ticks, 550U, "the shortest record sets the ramp period");
     expect_u32(test_brake_config.pulse_ticks, 110U, "ramp pulse follows the driver");
+
+    /* Every instance builds the ramps of its own members: with all of them set up, each axis channel gets one ramp from
+     * the print instance and one from the instance of its axis, the syringe only the one of the print instance. */
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    init_axis_plan_buffer(MOTION_AXIS_Z);
+    test_wait_script_count = 1U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_instance_is_ready(step_generator_task_get_axis_instance(MOTION_AXIS_Y)), 1U, "Y instance is ready");
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_configure_brake_calls[channel], 2U, "an axis channel gets a ramp from the print instance and its own");
+    }
+    expect_u32(test_configure_brake_calls[TEST_CH_SYRINGE], 1U, "the syringe gets the ramp of the print instance only");
+}
+
+/* The print instance cannot be built (the syringe is on another clock): the instances of the axes still build the ramps
+ * of their own channels, so the homing of an axis keeps its braking. */
+static void test_axis_instances_build_their_ramps_when_the_print_instance_cannot_be_built(void) {
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_X);
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    init_axis_plan_buffer(MOTION_AXIS_Z);
+    test_timer_clock_hz[TEST_CH_SYRINGE] = TEST_TIMER_CLOCK_HZ / 2U;
+    test_wait_script_count = 1U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_instance_is_ready(step_generator_task_get_print_instance()), 0U, "the print instance is not ready");
+    for (uint32_t axis = 0U; axis < TEST_CHANNELS; ++axis) {
+        expect_u32(
+            step_generator_instance_is_ready(step_generator_task_get_axis_instance((MotionAxis_t)axis)),
+            1U,
+            "the instance of the axis is ready"
+        );
+        expect_u32(test_configure_brake_calls[axis], 1U, "the instance of the axis builds the ramp of its channel once");
+    }
+    expect_u32(test_configure_brake_calls[TEST_CH_SYRINGE], 0U, "no instance owns the syringe but the print instance");
+    expect_u32(test_brake_config.timer_clock_hz, TEST_TIMER_CLOCK_HZ, "the ramps use the clock of the axes");
+    expect_u32(test_brake_config.min_period_ticks, 2063U, "the ramp keeps pulse and low time");
 }
 
 static void test_brake_is_skipped_or_counted(void) {
@@ -2086,7 +2486,7 @@ static void test_brake_is_skipped_or_counted(void) {
     (void)run_task_until_jump(&test_task_config);
     expect_u32(
         test_configure_brake_calls[TEST_CH_X] + test_configure_brake_calls[TEST_CH_Y] +
-            test_configure_brake_calls[TEST_CH_Z],
+            test_configure_brake_calls[TEST_CH_Z] + test_configure_brake_calls[TEST_CH_SYRINGE],
         0U,
         "no deceleration setting, no ramp"
     );
@@ -2122,13 +2522,13 @@ static void test_brake_is_skipped_or_counted(void) {
 
     /* An unusable timing builds no feeder, so no ramp either. */
     reset_fixture();
-    test_timer_clock_hz[TEST_CH_X] = 0U;
-    test_timer_clock_hz[TEST_CH_Y] = 0U;
-    test_timer_clock_hz[TEST_CH_Z] = 0U;
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        test_timer_clock_hz[channel] = 0U;
+    }
     (void)run_task_until_jump(&test_task_config);
     expect_u32(
         test_configure_brake_calls[TEST_CH_X] + test_configure_brake_calls[TEST_CH_Y] +
-            test_configure_brake_calls[TEST_CH_Z],
+            test_configure_brake_calls[TEST_CH_Z] + test_configure_brake_calls[TEST_CH_SYRINGE],
         0U,
         "no feeder, no ramp"
     );
@@ -2260,8 +2660,13 @@ static void test_ports_read_the_queue_of_the_config(void) {
     expect_u32(other_diagnostics.dequeued_total, 0U, "nothing is discarded from the other queue");
 }
 
-static const MotionAxis_t test_owner_axes_x[] = {MOTION_AXIS_X};
-static const MotionAxis_t test_owner_axes_yz[] = {MOTION_AXIS_Y, MOTION_AXIS_Z};
+static const StepGeneratorMember_t test_owner_members_x[] = {
+    {&step_generator_channels_axis_driver, MOTION_AXIS_X, MOTION_AXIS_X},
+};
+static const StepGeneratorMember_t test_owner_members_yz[] = {
+    {&step_generator_channels_axis_driver, MOTION_AXIS_Y, MOTION_AXIS_Y},
+    {&step_generator_channels_axis_driver, MOTION_AXIS_Z, MOTION_AXIS_Z},
+};
 
 /* Two instances hold different axes at the same time: the switch of an axis reaches only the instance that owns it. */
 static void test_two_instances_own_different_axes(void) {
@@ -2270,9 +2675,9 @@ static void test_two_instances_own_different_axes(void) {
     StepGeneratorInstance_t second;
     make_other_instance(&first);
     make_other_instance(&second);
-    first.member_axes = test_owner_axes_x;
+    first.members = test_owner_members_x;
     first.member_count = 1U;
-    second.member_axes = test_owner_axes_yz;
+    second.members = test_owner_members_yz;
     second.member_count = 2U;
 
     expect_u32(step_generator_task_claim_channels(&first), 1U, "the first instance takes the channel of X");
@@ -2413,11 +2818,19 @@ static void test_axis_instance_plays_a_block_on_its_own_lane(void) {
     expect_true(test_limit_contexts[MOTION_AXIS_Y] == axis_y, "the switch of Y reports to the instance of Y");
     expect_true(test_limit_listeners[MOTION_AXIS_X] == NULL, "the switch of X has no listener");
     expect_true(test_limit_listeners[MOTION_AXIS_Z] == NULL, "the switch of Z has no listener");
-    expect_u32(test_listener_calls[TEST_CH_X] + test_listener_calls[TEST_CH_Z], 0U, "X and Z are never offered a listener");
-    /* The ramp belongs to the axis and the print instance builds it for all three; the one-lane ones build none. */
-    expect_u32(test_configure_brake_calls[TEST_CH_X], 1U, "the ramp of X is built once");
-    expect_u32(test_configure_brake_calls[TEST_CH_Y], 1U, "the ramp of Y is built once, not again by its instance");
-    expect_u32(test_configure_brake_calls[TEST_CH_Z], 1U, "the ramp of Z is built once");
+    expect_u32(
+        test_listener_calls[TEST_CH_X] + test_listener_calls[TEST_CH_Z] + test_listener_calls[TEST_CH_SYRINGE],
+        0U,
+        "X, Z and the syringe are never offered a listener"
+    );
+    expect_u32(test_prepare_calls[TEST_CH_SYRINGE] + test_start_calls[TEST_CH_SYRINGE], 0U, "the syringe is not touched");
+    expect_u32(test_syringe_outputs_calls, 0U, "the DIR of the syringe is not written by a block of Y");
+    /* The print instance builds the ramps of its four members; only the instance of Y, the one with a queue, builds one
+     * more, for its own channel. */
+    expect_u32(test_configure_brake_calls[TEST_CH_X], 1U, "the ramp of X is built by the print instance only");
+    expect_u32(test_configure_brake_calls[TEST_CH_Y], 2U, "the ramp of Y is built by the print instance and by its own");
+    expect_u32(test_configure_brake_calls[TEST_CH_Z], 1U, "the ramp of Z is built by the print instance only");
+    expect_u32(test_configure_brake_calls[TEST_CH_SYRINGE], 1U, "the ramp of the syringe is built once");
 }
 
 /* X and Y stream at the same time, each with its own channel, switch listener and group. */
@@ -2534,9 +2947,20 @@ static void test_refused_claim_fails_the_stream_and_spares_the_owner(void) {
     expect_u32(test_listener_calls[TEST_CH_X], 2U, "the channel of X was offered by its owner and by the print instance");
     expect_u32(test_listener_calls[TEST_CH_Y], 0U, "the members after the refused one are not asked");
     expect_u32(test_listener_calls[TEST_CH_Z], 0U, "Z is not asked either");
+    expect_u32(test_listener_calls[TEST_CH_SYRINGE], 0U, "the syringe is not asked either");
     expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 1U, "the switch of X is asked once, by its owner");
-    expect_u32(test_prepare_calls[TEST_CH_X] + test_prepare_calls[TEST_CH_Y] + test_prepare_calls[TEST_CH_Z], 0U, "no ring is prepared");
-    expect_u32(test_start_calls[TEST_CH_X] + test_start_calls[TEST_CH_Y] + test_start_calls[TEST_CH_Z], 0U, "no channel starts");
+    expect_u32(
+        test_prepare_calls[TEST_CH_X] + test_prepare_calls[TEST_CH_Y] + test_prepare_calls[TEST_CH_Z] +
+            test_prepare_calls[TEST_CH_SYRINGE],
+        0U,
+        "no ring is prepared"
+    );
+    expect_u32(
+        test_start_calls[TEST_CH_X] + test_start_calls[TEST_CH_Y] + test_start_calls[TEST_CH_Z] +
+            test_start_calls[TEST_CH_SYRINGE],
+        0U,
+        "no channel starts"
+    );
     expect_u32(
         test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Y] + test_outputs_calls[MOTION_AXIS_Z],
         0U,
@@ -2571,6 +2995,7 @@ static void test_refused_claim_fails_the_stream_and_spares_the_owner(void) {
     expect_u32(test_listener_calls[TEST_CH_X], 1U, "X was offered once");
     expect_u32(test_listener_calls[TEST_CH_Y], 2U, "Y was offered by its owner and by the print instance");
     expect_u32(test_listener_calls[TEST_CH_Z], 0U, "Z is not asked after the refusal");
+    expect_u32(test_listener_calls[TEST_CH_SYRINGE], 0U, "the syringe is not asked after the refusal");
     expect_true(test_stream_owner[TEST_CH_X] == NULL, "the channel of X that the print instance took is let go");
     expect_true(test_limit_contexts[MOTION_AXIS_X] == NULL, "the switch of X that the print instance took is let go");
     expect_true(test_limit_listeners[MOTION_AXIS_X] == NULL, "X has no switch listener after the rollback");
@@ -2610,6 +3035,26 @@ static void test_refused_claim_fails_the_stream_and_spares_the_owner(void) {
     );
     expect_true(test_limit_listeners[MOTION_AXIS_Y] == test_foreign_limit, "its handler is still installed");
     expect_u32(step_generator_task_instance.channels_held, 0U, "the refused instance holds nothing");
+
+    /* The channel of the syringe, the last member, refuses: the three axes that were taken are let go. */
+    reset_fixture();
+    test_axis_streaming[TEST_CH_SYRINGE] = 1U;
+    expect_u32(step_generator_task_claim_channels(&step_generator_task_instance), 0U, "a streaming syringe refuses the claim");
+    expect_u32(test_listener_calls[TEST_CH_SYRINGE], 1U, "the syringe was offered the listener");
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        expect_true(test_stream_owner[channel] == NULL, "no channel stays with the refused instance");
+    }
+    for (uint32_t axis = 0U; axis < TEST_CHANNELS; ++axis) {
+        expect_true(test_limit_contexts[axis] == NULL, "no switch stays with the refused instance");
+        expect_u32(test_limit_releases[axis], 1U, "the switch of an axis that was taken is let go once");
+    }
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the refused instance holds nothing after the rollback");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z] +
+            test_stop_calls[TEST_CH_SYRINGE],
+        0U,
+        "the rollback stops no channel, least of all the one that streams"
+    );
 }
 
 /* A release lets go of the listeners of its own instance only; the instance that holds nothing releases nothing. */
@@ -2622,7 +3067,9 @@ static void test_release_lets_go_only_of_its_own(void) {
     expect_u32(step_generator_task_instance.channels_held, 1U, "the print instance holds its channels");
     for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
         expect_true(test_stream_owner[member] == test_print_context(member), "the print instance owns the channel");
-        expect_true(test_limit_contexts[member] == &step_generator_task_instance, "and the switch of its axis");
+    }
+    for (uint32_t axis = 0U; axis < TEST_CHANNELS; ++axis) {
+        expect_true(test_limit_contexts[axis] == &step_generator_task_instance, "and the switch of its axis");
     }
 
     expect_u32(step_generator_task_claim_channels(axis_x), 0U, "the instance of X cannot take what the print instance holds");
@@ -2631,16 +3078,20 @@ static void test_release_lets_go_only_of_its_own(void) {
     expect_u32(axis_x->channels_held, 0U, "the refused instance holds nothing");
     for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
         expect_true(test_stream_owner[member] == test_print_context(member), "the release did not take the channel away");
-        expect_true(test_limit_contexts[member] == &step_generator_task_instance, "nor the switch");
-        expect_true(test_limit_listeners[member] == step_generator_task_limit_reached, "nor its handler");
+    }
+    for (uint32_t axis = 0U; axis < TEST_CHANNELS; ++axis) {
+        expect_true(test_limit_contexts[axis] == &step_generator_task_instance, "nor the switch");
+        expect_true(test_limit_listeners[axis] == step_generator_task_limit_reached, "nor its handler");
     }
 
     step_generator_task_release_channels(&step_generator_task_instance);
     expect_u32(step_generator_task_instance.channels_held, 0U, "the owner let go of everything");
     for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_MEMBER_COUNT; ++member) {
         expect_true(test_stream_owner[member] == NULL, "the channel is free after the release of its owner");
-        expect_true(test_limit_contexts[member] == NULL, "the switch is free after the release of its owner");
-        expect_true(test_limit_listeners[member] == NULL, "its handler is removed");
+    }
+    for (uint32_t axis = 0U; axis < TEST_CHANNELS; ++axis) {
+        expect_true(test_limit_contexts[axis] == NULL, "the switch is free after the release of its owner");
+        expect_true(test_limit_listeners[axis] == NULL, "its handler is removed");
     }
     const uint32_t releases_before = test_listener_releases[TEST_CH_X];
     step_generator_task_release_channels(&step_generator_task_instance);
@@ -2652,7 +3103,7 @@ static void test_release_lets_go_only_of_its_own(void) {
 static void test_release_is_retried_while_a_channel_streams(void) {
     reset_fixture();
     push_block(80U, 3);
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         test_axis_stuck[channel] = 1U;
     }
     test_wait_script_count = 3U;
@@ -2666,11 +3117,32 @@ static void test_release_is_retried_while_a_channel_streams(void) {
 
     expect_u32(step_generator_task_instance.diagnostics.streams_stopped, 1U, "the stream ended");
     expect_u32(step_generator_task_instance.channels_held, 0U, "the channels are let go once they are at rest");
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_true(test_stream_owner[channel] == NULL, "the channel is free after the retry");
+    }
+    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
         expect_true(test_limit_contexts[channel] == NULL, "the switch is free after the retry");
     }
     expect_u32(test_listener_releases[TEST_CH_X], 3U, "two refused attempts and the one that succeeded");
+    expect_u32(test_listener_releases[TEST_CH_SYRINGE], 3U, "the syringe was released with the same attempts");
+
+    /* Only the channel of the syringe still streams: the axes are let go, the instance keeps holding the syringe. */
+    reset_fixture();
+    test_claim_print_channels();
+    test_axis_streaming[TEST_CH_SYRINGE] = 1U;
+    step_generator_task_release_channels(&step_generator_task_instance);
+    expect_u32(step_generator_task_instance.channels_held, 1U, "a streaming syringe keeps the instance the holder");
+    expect_true(
+        test_stream_owner[TEST_CH_SYRINGE] == test_print_context(TEST_MEMBER_SYRINGE),
+        "the instance stays the owner of the channel of the syringe"
+    );
+    expect_true(test_stream_owner[TEST_CH_X] == NULL, "the channel of X is let go");
+    expect_true(test_stream_owner[TEST_CH_Y] == NULL, "the channel of Y is let go");
+    expect_true(test_stream_owner[TEST_CH_Z] == NULL, "the channel of Z is let go");
+    test_axis_streaming[TEST_CH_SYRINGE] = 0U;
+    step_generator_task_release_channels(&step_generator_task_instance);
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the next attempt lets go of the syringe");
+    expect_true(test_stream_owner[TEST_CH_SYRINGE] == NULL, "the channel of the syringe is free after the next attempt");
 
     /* Only the switch listener refuses: the channel listener is let go but the instance still holds the axis. */
     reset_fixture();
@@ -2877,14 +3349,19 @@ static void test_halt_stops_only_the_channels_the_instance_holds(void) {
     step_generator_instance_halt(&step_generator_task_instance);
     expect_u32(step_generator_task_instance.halted, 1U, "the print instance is halted");
     expect_u32(
-        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z] +
+            test_stop_calls[TEST_CH_SYRINGE],
         0U,
         "the halt of the print instance stops no channel, X belongs to the instance of X"
     );
     expect_u32(axis_x->halted, 0U, "the instance of X is not halted by it");
     step_generator_instance_halt(axis_x);
     expect_u32(test_stop_calls[TEST_CH_X], 1U, "the halt of the holder stops its channel of X");
-    expect_u32(test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z], 0U, "and no other channel");
+    expect_u32(
+        test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z] + test_stop_calls[TEST_CH_SYRINGE],
+        0U,
+        "and no other channel"
+    );
 
     /* The instance of Y holds only Y: its halt leaves X and Z alone. */
     reset_fixture();
@@ -2895,7 +3372,11 @@ static void test_halt_stops_only_the_channels_the_instance_holds(void) {
     );
     step_generator_instance_halt(&step_generator_task_axis_instances[MOTION_AXIS_Y]);
     expect_u32(test_stop_calls[TEST_CH_Y], 1U, "the instance of Y stops the channel of Y once");
-    expect_u32(test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Z], 0U, "and not the channels of X and Z");
+    expect_u32(
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Z] + test_stop_calls[TEST_CH_SYRINGE],
+        0U,
+        "and not the channels of X, Z and the syringe"
+    );
 
     /* A refused claim while another instance streams on X: the stream goes on, no channel is stopped. */
     reset_fixture();
@@ -2915,7 +3396,8 @@ static void test_halt_stops_only_the_channels_the_instance_holds(void) {
     );
     expect_u32(step_generator_task_instance.diagnostics.axis_errors, 1U, "the refusal is one axis error");
     expect_u32(
-        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z],
+        test_stop_calls[TEST_CH_X] + test_stop_calls[TEST_CH_Y] + test_stop_calls[TEST_CH_Z] +
+            test_stop_calls[TEST_CH_SYRINGE],
         0U,
         "the refusal stops no channel, least of all the one that streams"
     );
@@ -2945,6 +3427,10 @@ static void test_stop_reset_frees_the_channels(void) {
     expect_u32(step_generator_task_claim_channels(&step_generator_task_instance), 1U, "another instance takes the channels");
     expect_true(test_stream_owner[TEST_CH_X] == test_print_context(0U), "the print instance owns the channel of X now");
     expect_true(test_limit_contexts[MOTION_AXIS_X] == &step_generator_task_instance, "and the switch of X");
+    expect_true(
+        test_stream_owner[TEST_CH_SYRINGE] == test_print_context(TEST_MEMBER_SYRINGE),
+        "and the channel of the syringe"
+    );
 
     /* A channel that still runs after STOP: the reset fails and the instance goes on holding its channels. */
     reset_fixture();
@@ -3017,6 +3503,15 @@ static void test_instance_is_ready_once_its_feeder_is_built(void) {
     test_timer_clock_hz[TEST_CH_Y] = TEST_TIMER_CLOCK_HZ / 2U;
     (void)run_task_until_jump(&test_task_config);
     expect_u32(step_generator_instance_is_ready(&step_generator_task_instance), 0U, "clocks that differ, not ready");
+
+    reset_fixture();
+    test_timer_clock_hz[TEST_CH_SYRINGE] = TEST_TIMER_CLOCK_HZ / 2U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_generator_instance_is_ready(&step_generator_task_instance),
+        0U,
+        "the syringe on another clock than the first member: not ready"
+    );
 }
 
 /* MotionTask waits for this count after STOP: it rises once per finished reset, and only for an instance that is reset. */
@@ -3128,11 +3623,15 @@ static StepGeneratorProgress_t read_progress(const StepGeneratorInstance_t *inst
 
 static void run_print_pass(void) { step_generator_task_run_instance(&step_generator_task_instance); }
 
-static void set_records_played(uint32_t x, uint32_t y, uint32_t z) {
+/* The syringe idles like Z in the blocks of these tests, so it has played as many records as Z. */
+static void set_records_played_all(uint32_t x, uint32_t y, uint32_t z, uint32_t syringe) {
     test_records_played[TEST_CH_X] = x;
     test_records_played[TEST_CH_Y] = y;
     test_records_played[TEST_CH_Z] = z;
+    test_records_played[TEST_CH_SYRINGE] = syringe;
 }
+
+static void set_records_played(uint32_t x, uint32_t y, uint32_t z) { set_records_played_all(x, y, z, z); }
 
 /* A block of x_steps on X whose MotionPlanBlock_t.order is `order`. */
 static void push_ordered_block(uint32_t order, int64_t x_steps) {
@@ -3142,7 +3641,7 @@ static void push_ordered_block(uint32_t order, int64_t x_steps) {
 }
 
 /* The task has run one pass: the print stream plays three blocks of 3 steps on X (orders 21, 22, 23) and its channels
- * stream. On Y and Z each block is one idle record, so the block ends there are records 1, 2 and 3. */
+ * stream. On Y, Z and the syringe each block is one idle record, so the block ends there are records 1, 2 and 3. */
 static void start_print_stream_with_three_blocks(void) {
     reset_fixture();
     push_ordered_block(21U, 3);
@@ -3248,6 +3747,7 @@ static void test_running_stream_advances_played_blocks_by_block_ends(void) {
     expect_u32(test_records_played_calls[TEST_CH_X], 1U, "the pass asked X for its played records once");
     expect_u32(test_records_played_calls[TEST_CH_Y], 1U, "the pass asked Y for its played records once");
     expect_u32(test_records_played_calls[TEST_CH_Z], 1U, "the pass asked Z for its played records once");
+    expect_u32(test_records_played_calls[TEST_CH_SYRINGE], 1U, "the pass asked the syringe for its played records once");
     StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
     expect_u32(progress.played_blocks, 0U, "nothing is played at the start");
     expect_u32(progress.played_order, 0U, "no block order is reported at the start");
@@ -3285,6 +3785,28 @@ static void test_running_stream_advances_played_blocks_by_block_ends(void) {
     expect_u32(progress.generation, 0U, "playing blocks does not change the generation");
 }
 
+/* The syringe is a lane of the stream: a block is played only once the syringe, too, has reached its end. */
+static void test_a_block_is_played_only_when_the_syringe_reaches_its_end(void) {
+    start_print_stream_with_three_blocks();
+    set_records_played_all(1000U, 1000U, 1000U, 0U);
+    run_print_pass();
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 0U, "no block is played while the syringe has not reached its end");
+    expect_u32(progress.played_order, 0U, "no order is reported while the syringe lags");
+
+    set_records_played_all(1000U, 1000U, 1000U, 1U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 1U, "the first block is played once the syringe has reached record 1");
+    expect_u32(progress.played_order, 21U, "the order of the first block is reported");
+
+    set_records_played_all(1000U, 1000U, 1000U, 2U);
+    run_print_pass();
+    progress = read_progress(&step_generator_task_instance);
+    expect_u32(progress.played_blocks, 2U, "the second block is played with the syringe at record 2");
+    expect_u32(progress.played_order, 22U, "the order of the second block is reported");
+}
+
 /* Z trips its end switch and Y is the first channel to brake: the stop is resolved only when every channel rests. */
 static void test_limit_stop_is_resolved_when_every_channel_rests(void) {
     start_print_stream_with_three_blocks();
@@ -3304,6 +3826,7 @@ static void test_limit_stop_is_resolved_when_every_channel_rests(void) {
     test_axis_streaming[TEST_CH_X] = 0U;
     test_axis_streaming[TEST_CH_Y] = 1U;
     test_axis_streaming[TEST_CH_Z] = 0U;
+    test_axis_streaming[TEST_CH_SYRINGE] = 0U;
     set_records_played(1000U, 1000U, 1000U);
     run_print_pass();
     StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
@@ -3357,7 +3880,7 @@ static void test_stop_with_blocks_only_in_the_plan_names_the_head_of_the_plan(vo
     expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "a STOP call blames no axis");
     expect_u32(progress.halt_detail, 0U, "a STOP call has no detail");
     expect_u32(progress.generation, 1U, "the STOP call raised the generation");
-    for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         expect_u32(test_records_played_calls[channel], 0U, "an instance that holds no channel reads no records");
     }
 
@@ -3540,10 +4063,632 @@ static void test_progress_listener_is_called_when_the_print_snapshot_changes(voi
     step_generator_task_set_progress_listener(NULL);
 }
 
-int main(void) {
+/* ---- The syringe: the fourth member of the printing stream ---- */
+
+/* A block of X, Y, Z and the syringe: X and Z move by `x_steps` and `z_steps`, the syringe by `syringe_steps`. */
+static MotionPlanBlock_t make_block_with_syringe(
+    uint32_t sequence,
+    int64_t x_steps,
+    int64_t y_steps,
+    int64_t z_steps,
+    int64_t syringe_steps
+) {
+    MotionPlanBlock_t block = make_block_xyz(sequence, x_steps, y_steps, z_steps);
+    const uint64_t syringe_magnitude = (uint64_t)(syringe_steps < 0 ? -syringe_steps : syringe_steps);
+    block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = syringe_steps;
+    if (syringe_magnitude > block.master_step_count) {
+        block.master_step_count = syringe_magnitude;
+        block.path_length_um = syringe_magnitude;
+    }
+    if (syringe_steps != 0) {
+        block.moving_axes_mask = (uint8_t)(block.moving_axes_mask | MOTION_PLAN_CHANNEL_SYRINGE_MASK);
+        if (syringe_steps > 0) {
+            block.positive_direction_mask = (uint8_t)(block.positive_direction_mask | MOTION_PLAN_CHANNEL_SYRINGE_MASK);
+        }
+    }
+    return block;
+}
+
+static void push_block_with_syringe(
+    uint32_t sequence,
+    int64_t x_steps,
+    int64_t y_steps,
+    int64_t z_steps,
+    int64_t syringe_steps
+) {
+    const MotionPlanBlock_t block = make_block_with_syringe(sequence, x_steps, y_steps, z_steps, syringe_steps);
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "block is queued");
+}
+
+/* A block of the syringe alone in the printing queue plays on all four channels: the syringe steps, the axes wait. */
+static void test_a_syringe_block_plays_in_the_print_stream(void) {
+    reset_fixture();
+    push_syringe_block(80U, 3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    expect_u32((uint32_t)run_task_until_jump(&test_task_config), 2U, "task ends at the scripted wait");
+
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        expect_u32(test_prepare_calls[channel], 1U, "every channel of the group is prepared");
+        expect_u32(test_start_calls[channel], 1U, "every channel of the group starts");
+    }
+    expect_u32(test_trigger_calls, 1U, "the group triggers once");
+    expect_u32(test_trigger_axes, 4U, "the trigger covers all four channels");
+    expect_u32(test_syringe_outputs_calls, 1U, "DIR of the syringe is written once");
+    expect_u32(test_syringe_outputs_positive, 1U, "a positive block sets the positive direction");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(test_outputs_calls[axis], 0U, "the driver of an axis is not touched by a block of the syringe");
+    }
+    expect_u32(test_delay_calls, 1U, "DIR setup time is waited once, for the syringe");
+    expect_u32(test_delay_last_ticks, 2U, "the DIR wait lasts two ticks");
+    /* 3 steps of 10 us: the interval is 2750 ticks at 275 MHz, the record holds it minus one; the pulse is 5 us. The
+     * axes wait out the 30 us block in one idle record of 8250 ticks. */
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][0], 2749U, "the ring of the syringe holds the step interval");
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][2], 1375U, "the ring of the syringe holds the pulse");
     for (uint32_t channel = 0U; channel < TEST_CHANNELS; ++channel) {
+        expect_u32(test_halves[channel][0][0], 8249U, "an axis waits out the block in one idle record");
+        expect_u32(test_halves[channel][0][2], 0U, "an axis has no pulse in a block of the syringe");
+    }
+    /* The block moves no axis, so no axis is watched: the switches of an axis that only idles stop nothing. The syringe
+     * has no switch and its watch is ignored, so only the three axes are set. */
+    expect_u32(test_watched_axes, 0U, "no axis is watched while only the syringe moves");
+    expect_u32(test_watched_axes_calls, 3U, "the watched state is set for the three axes, not for the syringe");
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        expect_u32(test_watched_at_prepare[channel], 0U, "the axes are narrowed before every channel is prepared");
+    }
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_X], 1U, "the switch of X is still taken by the stream");
+    expect_true(
+        test_stream_owner[TEST_CH_SYRINGE] == test_print_context(TEST_MEMBER_SYRINGE),
+        "the print instance owns the channel of the syringe"
+    );
+    expect_u32(test_wrong_axis_calls, 0U, "every call went to a known channel");
+
+    expect_u32(step_generator_task_instance.diagnostics.streams_started, 1U, "one stream started");
+    expect_u32(step_generator_task_instance.diagnostics.blocks_started, 1U, "it started the block");
+    expect_u32(step_generator_task_instance.diagnostics.blocks_completed, 1U, "it generated the whole block");
+    expect_u32(step_generator_task_instance.diagnostics.halves_filled, 2U, "both halves of the ring are filled");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 0U, "no generator error");
+    expect_u32(step_generator_task_instance.diagnostics.axis_errors, 0U, "no axis error");
+    expect_u32(step_generator_task_instance.halted, 0U, "the print instance feeds");
+    PlanBufferDiagnostics_t queue = {0};
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &queue);
+    expect_u32(queue.dequeued_total, 1U, "the block left the print queue");
+
+    /* A retract block sets the negative direction, again on the syringe only. */
+    reset_fixture();
+    push_syringe_block(81U, -3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_syringe_outputs_calls, 1U, "DIR of the syringe is written once");
+    expect_u32(test_syringe_outputs_positive, 0U, "a negative block sets the negative direction");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 1U, "the channel of the syringe starts");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(test_outputs_calls[axis], 0U, "no driver of an axis is written");
+    }
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][2], 1375U, "the retract has a pulse as well");
+}
+
+/* The directions follow the channels that a block moves: each driver gets its own. */
+static void test_a_block_of_the_axes_and_the_syringe_sets_the_directions_of_the_moving_channels(void) {
+    reset_fixture();
+    push_block_with_syringe(82U, 3, 0, -3, 3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_outputs_calls[MOTION_AXIS_X], 1U, "X driver is set");
+    expect_u32(test_outputs_positive[MOTION_AXIS_X], 1U, "X goes the positive way");
+    expect_u32(test_outputs_calls[MOTION_AXIS_Y], 0U, "Y is not moved, its driver is left alone");
+    expect_u32(test_outputs_calls[MOTION_AXIS_Z], 1U, "Z driver is set");
+    expect_u32(test_outputs_positive[MOTION_AXIS_Z], 0U, "Z goes the negative way");
+    expect_u32(test_syringe_outputs_calls, 1U, "the driver of the syringe is set");
+    expect_u32(test_syringe_outputs_positive, 1U, "the syringe goes the positive way");
+    expect_u32(test_delay_calls, 3U, "DIR setup time is waited once per moving channel");
+    expect_u32(test_halves[TEST_CH_X][0][2], 1375U, "X has a pulse");
+    expect_u32(test_halves[TEST_CH_Y][0][2], 0U, "Y has no pulse");
+    expect_u32(test_halves[TEST_CH_Z][0][2], 1375U, "Z has a pulse");
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][2], 1375U, "the syringe has a pulse");
+    expect_u32(test_watched_axes, (1U << MOTION_AXIS_X) | (1U << MOTION_AXIS_Z), "X and Z are watched, Y is not");
+    expect_u32(test_trigger_axes, 4U, "all four channels start together");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 0U, "no generator error");
+
+    /* The syringe retracts while Y goes forward. */
+    reset_fixture();
+    push_block_with_syringe(83U, 0, 3, 0, -3);
+    test_wait_script_count = 1U;
+    test_wait_results[0] = STEP_GENERATOR_TASK_FLAG_BLOCK_READY;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_outputs_calls[MOTION_AXIS_Y], 1U, "Y driver is set");
+    expect_u32(test_outputs_positive[MOTION_AXIS_Y], 1U, "Y goes the positive way");
+    expect_u32(test_syringe_outputs_calls, 1U, "the driver of the syringe is set");
+    expect_u32(test_syringe_outputs_positive, 0U, "the syringe goes the negative way");
+    expect_u32(test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Z], 0U, "X and Z are left alone");
+    expect_u32(test_watched_axes, 1U << MOTION_AXIS_Y, "only Y is watched");
+}
+
+/* DIR changes only while the stream is stopped: a block that turns the syringe waits for the stream to end. */
+static void test_a_syringe_direction_change_waits_for_the_stream_to_stop(void) {
+    reset_fixture();
+    push_syringe_block(84U, 3);
+    push_syringe_block(85U, -3);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(test_syringe_outputs_calls, 1U, "the stream sets DIR of the syringe once");
+    expect_u32(test_syringe_outputs_positive, 1U, "the first block decides the positive direction");
+    expect_u32(step_generator_task_instance.diagnostics.blocks_started, 1U, "only the first block starts");
+    expect_u32(step_generator_task_instance.diagnostics.streams_started, 1U, "one stream is open");
+    PlanBufferDiagnostics_t queue = {0};
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &queue);
+    expect_u32(queue.queued, 1U, "the block that turns the syringe stays in the queue");
+
+    /* The first half has played: the stream carries no block any more and is not stopped yet. */
+    release_half(0U);
+    run_print_pass();
+    expect_u32(test_syringe_outputs_calls, 1U, "DIR is not changed while the stream runs");
+    expect_u32(step_generator_task_instance.diagnostics.streams_stopped, 0U, "the stream is not stopped yet");
+
+    /* Both halves of every lane are idle now: the stream stops and the next one opens with the other direction. */
+    release_half(1U);
+    run_print_pass();
+    expect_u32(step_generator_task_instance.diagnostics.streams_stopped, 1U, "the first stream stopped");
+    expect_u32(step_generator_task_instance.diagnostics.streams_started, 2U, "a second stream opened");
+    expect_u32(test_syringe_outputs_calls, 2U, "DIR of the syringe is written again");
+    expect_u32(test_syringe_outputs_positive, 0U, "the second block turns the syringe back");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 2U, "the channel of the syringe starts a second time");
+    expect_u32(step_generator_task_instance.diagnostics.blocks_started, 2U, "the second block started");
+    expect_u32(step_generator_task_instance.halted, 0U, "a direction change is no error");
+}
+
+/* The highest STEP rate of an instance: the timer clock over the longer of pulse + low time and the shortest record. */
+static void test_the_maximum_step_rate_follows_the_timing_of_the_generator(void) {
+    expect_u32(step_generator_instance_get_max_step_rate_hz(NULL), 0U, "a NULL instance has no rate");
+
+    /* An instance that is not set up does not know its timing. */
+    reset_fixture();
+    expect_u32(
+        step_generator_instance_get_max_step_rate_hz(&step_generator_task_instance),
+        0U,
+        "an instance that is not ready has no rate"
+    );
+
+    /* 275 MHz, pulse 5000 ns = 1375 ticks, low 2500 ns = 687.5 -> 688 ticks, the shortest record 2000 ns = 550 ticks:
+     * pulse plus low is 2063 ticks and wins. 2063 ticks last 2063e9 / 275e6 = 7501.8 ns, so a step needs 7502 whole
+     * nanoseconds; 1e9 / 7502 = 133297.8, rounded down 133297 (7502 * 133297 = 999994094, 7502 * 133298 > 1e9). */
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_generator_instance_get_max_step_rate_hz(&step_generator_task_instance),
+        133297U,
+        "the rate is the clock over pulse plus low time, in whole nanoseconds"
+    );
+
+    /* The shortest record wins: 400 ns + 400 ns are 110 + 110 ticks, the record is 550 ticks = 2000 ns exactly, so a step
+     * needs 2000 ns and 1e9 / 2000 = 500000. */
+    reset_fixture();
+    test_task_config.step_pulse_width_ns = 400U;
+    test_task_config.step_low_time_ns = 400U;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_generator_instance_get_max_step_rate_hz(&step_generator_task_instance),
+        500000U,
+        "the rate is the clock over the shortest record when it is longer than pulse plus low time"
+    );
+
+    /* 137.5 MHz, the default timing: pulse 687.5 -> 688 ticks, low 343.75 -> 344 ticks, the record 275 ticks; the sum is
+     * 1032 ticks, which last 1032e9 / 137.5e6 = 7505.45 ns, so a step needs 7506 ns; 1e9 / 7506 = 133226.7 -> 133226
+     * (7506 * 133226 = 999994356). */
+    reset_fixture();
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        test_timer_clock_hz[channel] = TEST_TIMER_CLOCK_HZ / 2U;
+    }
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_generator_instance_get_max_step_rate_hz(&step_generator_task_instance),
+        133226U,
+        "the rate follows the clock of the timers of the instance"
+    );
+
+    /* The rate of one instance is that of its own timing: a single-axis instance on the same clock reads the same. */
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(
+        step_generator_instance_get_max_step_rate_hz(step_generator_task_get_axis_instance(MOTION_AXIS_Y)),
+        133297U,
+        "the instance of Y has the same rate on the same timing"
+    );
+    expect_u32(
+        step_generator_instance_get_max_step_rate_hz(step_generator_task_get_axis_instance(MOTION_AXIS_X)),
+        0U,
+        "an instance of an axis without a queue is not ready and has no rate"
+    );
+
+}
+
+/* A block of the syringe alone at a given rate. */
+static void push_syringe_block_at_rate(uint32_t sequence, int64_t steps, uint32_t rate_hz) {
+    MotionPlanBlock_t block = make_syringe_block(sequence, steps);
+    block.step_event_rate_numerator = rate_hz;
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "syringe block is queued");
+}
+
+/* The rate that the instance reports is what its real generator plays: a block at that rate runs without a generator
+ * error, a block well above it stops the stream. */
+static void test_the_reported_maximum_rate_is_played_by_the_generator(void) {
+    reset_fixture();
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    const uint32_t max_rate_hz = step_generator_instance_get_max_step_rate_hz(&step_generator_task_instance);
+    expect_u32(max_rate_hz, 133297U, "the rate of the default timing");
+
+    /* 60 steps at 133297 Hz: the duration is 60e9 / 133297 = 450122.66 ns, rounded up to 450123 ns, so the steps last
+     * 7502 ns (57 of them) or 7503 ns (3 of them). 7502 ns are 2063.05 ticks at 275 MHz: never less than the 2063 ticks
+     * of pulse plus low time. */
+    reset_fixture();
+    push_syringe_block_at_rate(90U, 60, max_rate_hz);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_task_instance.halted, 0U, "a block at the reported rate does not halt the stream");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 0U, "the generator accepts the reported rate");
+    expect_u32(step_generator_task_instance.feeder_status, 0U, "the feeder reports no error");
+    expect_u32(step_generator_task_instance.diagnostics.blocks_completed, 1U, "the whole block is generated");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 1U, "the stream starts");
+    uint32_t ticks_total = 0U;
+    for (uint32_t record = 0U; record < 60U; ++record) {
+        const uint16_t *const words = &test_halves[TEST_CH_SYRINGE][0][record * 3U];
+        expect_true(words[0] >= 2062U, "every step lasts at least the 2063 ticks of pulse plus low time");
+        expect_u32(words[2], 1375U, "every step has its pulse");
+        ticks_total += (uint32_t)words[0] + 1U;
+    }
+    /* The steps add up to 450123 ns: 450123 * 275 MHz = 123783.825 ticks, whole ticks 123783. */
+    expect_u32(ticks_total, 123783U, "the steps last as long as the block");
+    expect_u32(test_halves[TEST_CH_SYRINGE][0][60U * 3U + 2U], 0U, "the record after the steps is idle");
+
+    /* 133400 Hz is well above it: the steps last 7496 or 7497 ns, which are about 2061 ticks, fewer than 2063. The
+     * generator refuses the first step and the stream halts with the feeder error. (One hertz above the reported rate
+     * is not used: the generator rounds the duration up and carries the tick remainder, so on a given count of steps it
+     * may still pass.) */
+    reset_fixture();
+    push_syringe_block_at_rate(91U, 60, 133400U);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_task_instance.halted, 1U, "a block above the reported rate halts the stream");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_FEEDER_ERROR,
+        "the cause is a feeder error"
+    );
+    expect_u32(
+        step_generator_task_instance.feeder_status,
+        (uint32_t)STEP_STREAM_FEEDER_STATUS_GENERATOR_ERROR,
+        "the feeder names the generator"
+    );
+    expect_u32(
+        step_generator_task_instance.feeder_generator_status,
+        (uint32_t)STEP_STREAM_GENERATOR_STATUS_STEP_INTERVAL_TOO_SHORT,
+        "the generator refused a step that is too short"
+    );
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "the generator error is counted");
+    expect_u32(test_start_calls[TEST_CH_SYRINGE], 0U, "no stream starts");
+}
+
+/* STOP while the stream of the syringe runs: all four channels are stopped, and the reset frees them. */
+static void test_stop_during_a_syringe_stream_stops_all_four_channels(void) {
+    reset_fixture();
+    push_syringe_block(86U, 3);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_task_instance.channels_held, 1U, "the print instance holds its channels");
+    expect_u32(test_axis_streaming[TEST_CH_SYRINGE], 1U, "the channel of the syringe streams");
+
+    step_generator_task_halt_all();
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        expect_u32(test_stop_calls[channel], 1U, "STOP stops every channel of the print instance once");
+        expect_u32(test_axis_streaming[channel], 0U, "the channel is at rest after STOP");
+    }
+    expect_u32(step_generator_task_instance.halted, 1U, "STOP halts the print instance");
+
+    step_generator_task_resume_all_after_stop();
+    run_print_pass();
+    expect_u32(step_generator_task_instance.halted, 0U, "the reset lifts the halt");
+    expect_u32(step_generator_task_instance.diagnostics.stop_resets, 1U, "the reset is counted");
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the reset lets go of the channels");
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
+        expect_true(test_stream_owner[channel] == NULL, "the channel is free after the reset");
+    }
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "the reset stops nothing again");
+
+    /* The channel of the syringe still runs after STOP (a braking ramp): the reset fails and the channels stay held. */
+    reset_fixture();
+    push_syringe_block(87U, 3);
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    test_axis_stuck[TEST_CH_SYRINGE] = 1U;
+    step_generator_task_halt_all();
+    expect_u32(test_stop_calls[TEST_CH_SYRINGE], 1U, "STOP asks the syringe to stop");
+    expect_u32(test_axis_streaming[TEST_CH_SYRINGE], 1U, "the syringe goes on after the stop");
+    expect_u32(test_axis_streaming[TEST_CH_X], 0U, "the other channels are at rest");
+    step_generator_task_resume_all_after_stop();
+    run_print_pass();
+    expect_u32(step_generator_task_instance.halted, 1U, "the reset fails while the syringe runs");
+    expect_u32(
+        step_generator_task_instance.halt_cause,
+        STEP_GENERATOR_TASK_HALT_CAUSE_RESET_FAILED,
+        "the cause is the failed reset"
+    );
+    expect_u32(step_generator_task_instance.reset_failures, 1U, "the failed reset is counted");
+    expect_u32(step_generator_task_instance.channels_held, 1U, "the instance goes on holding its channels");
+    expect_true(
+        test_stream_owner[TEST_CH_SYRINGE] == test_print_context(TEST_MEMBER_SYRINGE),
+        "the channel of the syringe is still owned"
+    );
+    /* The syringe is at rest at last: the next reset succeeds. */
+    test_axis_stuck[TEST_CH_SYRINGE] = 0U;
+    test_axis_streaming[TEST_CH_SYRINGE] = 0U;
+    step_generator_task_resume_all_after_stop();
+    run_print_pass();
+    expect_u32(step_generator_task_instance.halted, 0U, "the second reset lifts the halt");
+    expect_u32(step_generator_task_instance.channels_held, 0U, "the second reset lets go of the channels");
+}
+
+/* The tables of the members: which driver, which axis a halt blames, which channel of the plan block. */
+static void test_the_member_tables_name_the_channels(void) {
+    for (uint32_t member = 0U; member < 3U; ++member) {
+        expect_true(
+            step_generator_channels_print_members[member].driver == &step_generator_channels_axis_driver,
+            "an axis member uses the axis driver"
+        );
+        expect_u32(step_generator_channels_print_members[member].id, member, "the id of an axis member is its MotionAxis_t");
+        expect_u32(
+            step_generator_channels_print_members[member].reported_axis,
+            member,
+            "a halt of an axis member blames that axis"
+        );
+        expect_u32(step_generator_channels_print_planner_channels[member], member, "an axis member plays its plan channel");
+        expect_true(
+            step_generator_channels_axis_members[member].driver == &step_generator_channels_axis_driver,
+            "a single-axis member uses the axis driver"
+        );
+        expect_u32(step_generator_channels_axis_members[member].id, member, "the id of a single-axis member is its axis");
+        expect_u32(
+            step_generator_channels_axis_members[member].reported_axis,
+            member,
+            "a halt of a single-axis member blames its axis"
+        );
+        expect_u32(step_generator_channels_axis_planner_channels[member], member, "a single-axis member plays its plan channel");
+    }
+    expect_true(
+        step_generator_channels_print_members[TEST_MEMBER_SYRINGE].driver == &step_generator_channels_syringe_driver,
+        "member 3 uses the syringe driver"
+    );
+    expect_u32(
+        step_generator_channels_print_members[TEST_MEMBER_SYRINGE].reported_axis,
+        STEP_GENERATOR_CHANNELS_NO_AXIS,
+        "a halt of the syringe blames no axis"
+    );
+    expect_u32(
+        step_generator_channels_print_planner_channels[TEST_MEMBER_SYRINGE],
+        MOTION_PLAN_CHANNEL_SYRINGE,
+        "the syringe plays the syringe channel of the plan block"
+    );
+}
+
+/* What the static instances are before any test touches them: the policy and the tables of each. */
+static void test_the_static_instances_are_defined_as_designed(void) {
+    /* The instances are built afresh by the initializer macros, so the result does not depend on what ran before. */
+    reset_fixture();
+    expect_true(step_generator_task_instance.members == step_generator_channels_print_members, "print members");
+    expect_true(
+        step_generator_task_instance.member_planner_channels == step_generator_channels_print_planner_channels,
+        "print plan channels"
+    );
+    expect_u32(step_generator_task_instance.member_count, 4U, "the print instance has four members");
+    expect_u32(step_generator_task_instance.group.member_count, 4U, "its group has four members");
+    expect_u32(step_generator_task_instance.reports_progress, 1U, "only the print instance reports its progress");
+    for (uint32_t axis = 0U; axis < STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT; ++axis) {
+        const StepGeneratorInstance_t *const instance = &step_generator_task_axis_instances[axis];
+        expect_true(instance->members == &step_generator_channels_axis_members[axis], "single-axis member");
+        expect_true(
+            instance->member_planner_channels == &step_generator_channels_axis_planner_channels[axis],
+            "single-axis plan channel"
+        );
+        expect_u32(instance->member_count, 1U, "a single-axis instance has one member");
+        expect_u32(instance->group.member_count, 1U, "its group has one member");
+        expect_u32(instance->reports_progress, 0U, "a single-axis instance reports no progress");
+    }
+}
+
+/* The reference of the timing is the first member of an instance: an instance of Y is timed by Y itself. */
+static void test_a_single_axis_instance_is_timed_by_its_own_channel(void) {
+    reset_fixture();
+    init_axis_plan_buffer(MOTION_AXIS_Y);
+    test_timer_clock_hz[TEST_CH_X] = TEST_TIMER_CLOCK_HZ / 2U;
+    test_wait_script_count = 0U;
+    (void)run_task_until_jump(&test_task_config);
+    expect_u32(step_generator_instance_is_ready(step_generator_task_get_print_instance()), 0U, "X on another clock: not ready");
+    expect_u32(step_generator_task_instance.diagnostics.generator_errors, 1U, "the mismatch is counted");
+    expect_u32(step_generator_task_instance.halted, 1U, "the print instance halts");
+    expect_u32(
+        step_generator_instance_is_ready(step_generator_task_get_axis_instance(MOTION_AXIS_Y)),
+        1U,
+        "the one-lane instance of Y is ready on its own clock"
+    );
+}
+
+static void test_halt_axis_is_the_reported_axis_of_the_member(void) {
+    reset_fixture();
+    const uint32_t fault = (uint32_t)STEP_STREAM_AXIS_FAULT_DMA;
+
+    step_generator_task_group_fault(&step_generator_task_instance, TEST_MEMBER_SYRINGE, fault);
+    StepGeneratorProgress_t progress = read_progress(&step_generator_task_instance);
+    expect_u32(step_generator_task_instance.halt_member, TEST_MEMBER_SYRINGE, "the fault is member 3, the syringe");
+    expect_u32(progress.halt_cause, STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT, "a ring fault is the cause");
+    expect_u32(progress.halt_axis, STEP_GENERATOR_TASK_NO_AXIS, "the syringe is no axis to blame");
+    expect_u32(progress.halt_detail, fault, "the detail is the fault code");
+
+    /* The members of the axes in the printing instance blame their own axis. */
+    reset_fixture();
+    step_generator_task_group_fault(&step_generator_task_instance, 0U, fault);
+    expect_u32(read_progress(&step_generator_task_instance).halt_axis, (uint32_t)MOTION_AXIS_X, "member 0 blames X");
+    reset_fixture();
+    step_generator_task_group_fault(&step_generator_task_instance, 2U, fault);
+    expect_u32(read_progress(&step_generator_task_instance).halt_axis, (uint32_t)MOTION_AXIS_Z, "member 2 blames Z");
+
+    step_generator_task_group_fault(&step_generator_task_axis_instances[MOTION_AXIS_X], 0U, fault);
+    progress = read_progress(&step_generator_task_axis_instances[MOTION_AXIS_X]);
+    expect_u32(progress.halt_axis, (uint32_t)MOTION_AXIS_X, "the lane of the instance of X blames X");
+
+    /* The lane 0 of the instance of Z is Z, not the axis with the number of the lane. */
+    step_generator_task_group_fault(&step_generator_task_axis_instances[MOTION_AXIS_Z], 0U, fault);
+    progress = read_progress(&step_generator_task_axis_instances[MOTION_AXIS_Z]);
+    expect_u32(progress.halt_axis, (uint32_t)MOTION_AXIS_Z, "the lane of the instance of Z blames Z");
+}
+
+/* A switch of an axis names no member of the syringe: it is not counted and does not latch. */
+static void test_a_switch_report_does_not_reach_a_member_of_the_syringe(void) {
+    reset_fixture();
+    StepGeneratorInstance_t *const print = &step_generator_task_instance;
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        step_generator_task_limit_reached(print, (MotionAxis_t)axis, MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT);
+        expect_u32(print->limit_trips[axis], 1U, "the switch of an axis is counted for that axis member");
+    }
+    expect_u32(print->limit_trips[TEST_MEMBER_SYRINGE], 0U, "no switch of an axis is counted for the syringe member");
+    expect_u32(print->halted, 0U, "a switch that finds the group idle halts nothing");
+}
+
+static void test_axis_driver_delegates_to_the_axis_hardware(void) {
+    reset_fixture();
+    const StepGeneratorChannelDriver_t *const driver = &step_generator_channels_axis_driver;
+
+    expect_true(driver->stream(MOTION_AXIS_X) == (StepStreamAxis_t *)&test_axis_markers[TEST_CH_X], "the stream of X");
+    expect_true(driver->stream(MOTION_AXIS_Y) == (StepStreamAxis_t *)&test_axis_markers[TEST_CH_Y], "the stream of Y");
+    expect_true(driver->stream(MOTION_AXIS_Z) == (StepStreamAxis_t *)&test_axis_markers[TEST_CH_Z], "the stream of Z");
+
+    /* A direction is written when the axis ends in a status it can start from; any other is a refusal. */
+    const struct {
+        MotionAxisHardwareStatus_t status;
+        uint8_t written;
+    } directions[] = {
+        {MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_READY, 1U},
+        {MOTION_AXIS_HARDWARE_STATUS_STARTING, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_WAITING, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_RUNNING, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_COMPLETE, 1U},
+        {MOTION_AXIS_HARDWARE_STATUS_FAULT_LIMIT, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_FAULT_UNDERRUN, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_FAULT_EVENT, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_FAULT_TIMING, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_FAULT_CONFIG, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_FAULT_CLOCK, 0U},
+        {MOTION_AXIS_HARDWARE_STATUS_STOPPED, 1U},
+    };
+    for (uint32_t index = 0U; index < sizeof(directions) / sizeof(directions[0]); ++index) {
+        test_outputs_result = directions[index].status;
+        expect_u32(
+            driver->set_direction(MOTION_AXIS_Z, 1U),
+            directions[index].written,
+            "the result of the direction follows the status the axis is left in"
+        );
+    }
+    expect_u32(test_outputs_calls[MOTION_AXIS_Z], (uint32_t)(sizeof(directions) / sizeof(directions[0])), "every write reached Z");
+    expect_u32(test_outputs_positive[MOTION_AXIS_Z], 1U, "the direction reached Z");
+    expect_u32(test_outputs_calls[MOTION_AXIS_X] + test_outputs_calls[MOTION_AXIS_Y], 0U, "X and Y are not written");
+    test_outputs_result = MOTION_AXIS_HARDWARE_STATUS_READY;
+    expect_u32(driver->set_direction(MOTION_AXIS_X, 0U), 1U, "a negative direction is written");
+    expect_u32(test_outputs_positive[MOTION_AXIS_X], 0U, "the negative direction reached X");
+    expect_u32(test_syringe_outputs_calls, 0U, "the DIR of the syringe is not written by an axis");
+
+    /* The status and the stop reason of the axis named by the id. */
+    test_hardware_status[MOTION_AXIS_X] = MOTION_AXIS_HARDWARE_STATUS_RUNNING;
+    test_hardware_stop_reason[MOTION_AXIS_X] = MOTION_AXIS_HARDWARE_STOP_REASON_START_LIMIT;
+    test_hardware_status[MOTION_AXIS_Y] = MOTION_AXIS_HARDWARE_STATUS_STOPPED;
+    test_hardware_stop_reason[MOTION_AXIS_Y] = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
+    uint32_t status = UINT32_MAX;
+    uint32_t stop_reason = UINT32_MAX;
+    driver->get_hardware(MOTION_AXIS_Y, &status, &stop_reason);
+    expect_u32(status, (uint32_t)MOTION_AXIS_HARDWARE_STATUS_STOPPED, "the status of Y");
+    expect_u32(stop_reason, (uint32_t)MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT, "the stop reason of Y");
+
+    /* The watched state of one axis. */
+    test_watched_axes = TEST_ALL_AXES_WATCHED;
+    driver->set_watched(MOTION_AXIS_Y, 0U);
+    expect_u32(test_watched_axes, 0x05U, "Y is no longer watched");
+    expect_u32(test_watched_axes_calls, 1U, "one call reached the axis hardware");
+    driver->set_watched(MOTION_AXIS_Y, 1U);
+    expect_u32(test_watched_axes, TEST_ALL_AXES_WATCHED, "Y is watched again");
+    expect_u32(test_watched_axes_calls, 2U, "the second call reached the axis hardware");
+
+    /* The switch listener: the answer is the one of the axis hardware. */
+    int owner_a = 0;
+    int owner_b = 0;
+    expect_u32(driver->set_limit_listener(MOTION_AXIS_Z, test_foreign_limit, &owner_a), 1U, "the free switch of Z is taken");
+    expect_true(test_limit_listeners[MOTION_AXIS_Z] == test_foreign_limit, "the listener of Z is the offered one");
+    expect_true(test_limit_contexts[MOTION_AXIS_Z] == &owner_a, "the owner of the switch of Z is the offered one");
+    expect_u32(driver->set_limit_listener(MOTION_AXIS_Z, test_foreign_limit, &owner_b), 0U, "a switch another owner holds is refused");
+    expect_true(test_limit_contexts[MOTION_AXIS_Z] == &owner_a, "the refusal leaves the owner");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_Z], 2U, "both offers reached the axis hardware");
+    expect_u32(driver->set_limit_listener(MOTION_AXIS_Z, NULL, &owner_a), 1U, "the owner lets go of the switch");
+    expect_true(test_limit_listeners[MOTION_AXIS_Z] == NULL, "the switch of Z is free again");
+    expect_u32(test_limit_releases[MOTION_AXIS_Z], 1U, "the release reached the axis hardware");
+    expect_u32(test_limit_listener_calls[MOTION_AXIS_X] + test_limit_listener_calls[MOTION_AXIS_Y], 0U, "X and Y were not offered a listener");
+}
+
+static void test_syringe_driver_drives_only_the_syringe(void) {
+    reset_fixture();
+    const StepGeneratorChannelDriver_t *const driver = &step_generator_channels_syringe_driver;
+
+    expect_true(driver->stream(0U) == step_stream_axis_get_syringe(), "the stream is the channel of the syringe");
+    expect_true(driver->stream(2U) == (StepStreamAxis_t *)&test_axis_markers[TEST_CH_SYRINGE], "whatever the id, it is the syringe");
+
+    /* DIR goes to the driver of the syringe with the direction as given, and its answer is the answer of the member. */
+    expect_u32(driver->set_direction(0U, 1U), 1U, "a written direction is reported");
+    expect_u32(test_syringe_outputs_calls, 1U, "the syringe driver was asked once");
+    expect_u32(test_syringe_outputs_positive, 1U, "the positive direction reached it");
+    expect_u32(driver->set_direction(0U, 0U), 1U, "a negative direction is written");
+    expect_u32(test_syringe_outputs_positive, 0U, "the negative direction reached it");
+    test_syringe_outputs_result = 0U;
+    expect_u32(driver->set_direction(0U, 1U), 0U, "a refusal of the syringe driver is reported");
+    expect_u32(test_syringe_outputs_calls, 3U, "all three writes reached the syringe driver");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(test_outputs_calls[axis], 0U, "no driver of an axis is written");
+    }
+
+    /* No switches: the watched state and the listener of an axis are left alone. */
+    test_watched_axes = 0x05U;
+    driver->set_watched(0U, 0U);
+    driver->set_watched(0U, 1U);
+    expect_u32(test_watched_axes, 0x05U, "the watched axes are unchanged");
+    expect_u32(test_watched_axes_calls, 0U, "no watch is set");
+    int owner = 0;
+    expect_u32(driver->set_limit_listener(0U, test_foreign_limit, &owner), 1U, "a listener is always taken");
+    expect_u32(driver->set_limit_listener(0U, NULL, &owner), 1U, "a release always succeeds");
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(test_limit_listener_calls[axis], 0U, "no axis is offered a listener");
+        expect_u32(test_limit_releases[axis], 0U, "no axis is asked to let go");
+        expect_true(test_limit_listeners[axis] == NULL, "no axis keeps a listener");
+    }
+
+    /* No hardware axis: both values are 0 whatever the axes report. */
+    test_hardware_status[MOTION_AXIS_X] = MOTION_AXIS_HARDWARE_STATUS_RUNNING;
+    test_hardware_stop_reason[MOTION_AXIS_X] = MOTION_AXIS_HARDWARE_STOP_REASON_END_LIMIT;
+    uint32_t status = UINT32_MAX;
+    uint32_t stop_reason = UINT32_MAX;
+    driver->get_hardware(0U, &status, &stop_reason);
+    expect_u32(status, 0U, "the syringe has no hardware status");
+    expect_u32(stop_reason, 0U, "the syringe has no stop reason");
+}
+
+int main(void) {
+    for (uint32_t channel = 0U; channel < TEST_ALL_CHANNELS; ++channel) {
         test_axis_markers[channel] = (int)channel;
     }
+    test_the_static_instances_are_defined_as_designed();
+    test_the_member_tables_name_the_channels();
     test_task_streams_a_block();
     test_instance_api();
     test_y_and_xy_blocks_reach_their_channels();
@@ -3570,6 +4715,7 @@ int main(void) {
     test_stop_reset_clears_a_group_fault();
     test_reset_is_refused_while_a_channel_runs();
     test_brake_ramp_is_built_from_the_driver_timing();
+    test_axis_instances_build_their_ramps_when_the_print_instance_cannot_be_built();
     test_brake_is_skipped_or_counted();
     test_callbacks_act_on_their_own_instance();
     test_config_without_plan_buffer_halts_the_task();
@@ -3599,6 +4745,20 @@ int main(void) {
     test_halt_detail_follows_the_cause();
     test_halt_detail_carries_the_generator_status();
     test_progress_listener_is_called_when_the_print_snapshot_changes();
+    test_a_block_is_played_only_when_the_syringe_reaches_its_end();
+    test_a_syringe_block_plays_in_the_print_stream();
+    test_a_block_of_the_axes_and_the_syringe_sets_the_directions_of_the_moving_channels();
+    test_a_syringe_direction_change_waits_for_the_stream_to_stop();
+    test_the_maximum_step_rate_follows_the_timing_of_the_generator();
+    test_the_reported_maximum_rate_is_played_by_the_generator();
+    test_stop_during_a_syringe_stream_stops_all_four_channels();
+    test_a_single_axis_instance_is_timed_by_its_own_channel();
+    test_halt_axis_is_the_reported_axis_of_the_member();
+    test_a_switch_report_does_not_reach_a_member_of_the_syringe();
+    test_stream_diagnostics_list_only_the_axes();
+    test_direction_waits_the_settle_time();
+    test_axis_driver_delegates_to_the_axis_hardware();
+    test_syringe_driver_drives_only_the_syringe();
 
     if (test_failures != 0U) {
         (void)fprintf(stderr, "Step generator task unit tests failed: %u\n", (unsigned int)test_failures);

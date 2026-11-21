@@ -243,7 +243,7 @@ static void test_motion_operation_validation_and_decode(void) {
     expect_u32(
         command_decoder_validate_command(&request),
         COMMAND_ERROR_INVALID_PARAMETER,
-        "requested extruder motion requires nonzero speed"
+        "requested doser motion requires nonzero speed"
     );
 
     request = make_motion_request(305U);
@@ -271,6 +271,39 @@ static void test_motion_operation_validation_and_decode(void) {
         0U,
         "unused motion axes do not require speed values"
     );
+}
+
+/* A syringe move alone: only the E fields count, the linear speed is not asked for. */
+static void test_doser_move_validation_and_decode(void) {
+    reset_decoder();
+    CommandRequestDTO_t request = make_motion_request(321U);
+    request.payload[1] = COMMAND_MOTION_OPERATION_FLAG_DOSER_MOVE;
+    write_u32_le(&request.payload[14], 0U);
+    write_u32_le(&request.payload[18], (uint32_t)-300);
+    write_u32_le(&request.payload[22], 2500U);
+    expect_u32(command_decoder_validate_command(&request), 0U, "doser move with a nonzero E speed is accepted");
+    CommandDecoderResult_t result = command_decoder_decode_request(&request);
+    expect_u32(result.type, COMMAND_DECODER_RESULT_COMMAND_READY, "doser move decodes");
+    expect_u32(result.command.sequence, 321U, "doser move preserves sequence");
+    expect_u32(result.command.parameters.motion_operation.operation_flags, 0x02U, "doser flag is preserved");
+    expect_u32((uint32_t)result.command.parameters.motion_operation.e_delta, (uint32_t)-300, "E delta stays signed");
+    expect_u32(result.command.parameters.motion_operation.e_speed, 2500U, "E speed decodes");
+
+    write_u32_le(&request.payload[22], 0U);
+    expect_u32(
+        command_decoder_validate_command(&request),
+        COMMAND_ERROR_INVALID_PARAMETER,
+        "doser move requires nonzero E speed"
+    );
+    result = command_decoder_decode_request(&request);
+    expect_u32(result.type, COMMAND_DECODER_RESULT_RESPONSE_READY, "doser move without E speed is answered, not decoded");
+    expect_u32(result.response_type, COMMAND_MESSAGE_TYPE_ERROR, "doser move without E speed gets an ERROR");
+    expect_u32(result.error_code, COMMAND_ERROR_INVALID_PARAMETER, "doser move without E speed is an invalid parameter");
+
+    /* Zero steps are a legal command: the answer to it is MotionTask's. */
+    write_u32_le(&request.payload[18], 0U);
+    write_u32_le(&request.payload[22], 1U);
+    expect_u32(command_decoder_validate_command(&request), 0U, "doser move of zero steps is accepted by the decoder");
 }
 
 static void test_motion_operation_relative_flag(void) {
@@ -454,6 +487,7 @@ int main(void) {
     test_calibrate_command_validation_and_decode();
     test_motion_operation_validation_and_decode();
     test_motion_operation_relative_flag();
+    test_doser_move_validation_and_decode();
     test_temperature_output_tool_and_stop_commands();
     test_decoder_diagnostics();
 

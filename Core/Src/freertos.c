@@ -36,6 +36,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "syringe_driver.h"
 
 /* USER CODE END Includes */
 
@@ -96,6 +97,13 @@ static MotionPlanBlock_t print_plan_buffer_entries[PLAN_BUFFER_CAPACITY];
 #define AXIS_PLAN_BUFFER_CAPACITY 2U
 static PlanBuffer_t axis_plan_buffers[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT];
 static MotionPlanBlock_t axis_plan_buffer_entries[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT][AXIS_PLAN_BUFFER_CAPACITY];
+/* The driver of the syringe motor, set up like the axes (ENA active low, positive direction on a high DIR, the DM556
+ * enable lead time); the values are to be chosen on the hardware. */
+static const SyringeDriverConfig_t syringe_driver_settings = {
+  .enable_active_high = 0U,
+  .positive_direction_high = 1U,
+  .enable_setup_ns = MOTION_AXIS_HARDWARE_DM556_MIN_ENABLE_LEAD_NS,
+};
 static const osThreadAttr_t motion_task_attr = {
   .name = MOTION_TASK_NAME,
   .stack_size = MOTION_TASK_STACK_SIZE_BYTES,
@@ -152,6 +160,11 @@ void MX_FREERTOS_Init(void)
       Error_Handler();
     }
     step_generator_task_config.axis_plan_buffers[axis] = &axis_plan_buffers[axis];
+  }
+
+  if (syringe_driver_init(&syringe_driver_settings) == 0U)
+  {
+    Error_Handler();
   }
 
   motion_task_context.plan_buffer = &print_plan_buffer;

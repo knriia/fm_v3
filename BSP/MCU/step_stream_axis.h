@@ -44,9 +44,8 @@ typedef struct StepStreamAxis StepStreamAxis_t;
 
 /* The channel of the axis, or NULL when the axis has no stream channel (yet). The instances exist for the whole run. */
 StepStreamAxis_t *step_stream_axis_get(MotionAxis_t axis);
-/* The channel of the syringe: TIM8 CH1 on PC6. It is not a MotionAxis_t; it drives STEP only. SKELETON: no caller yet,
- * and DIR (PC7) / ENA (PG8) are not set up by anyone, so the owner must drive them before the first start. Never NULL.
- */
+/* The channel of the syringe: TIM8 CH1 on PC6. It is not a MotionAxis_t; it drives STEP only. DIR (PC7) and ENA (PG8)
+ * belong to syringe_driver, which the generator task drives before a stream opens. Never NULL. */
 StepStreamAxis_t *step_stream_axis_get_syringe(void);
 
 /* All callbacks run in the DMA interrupt and must not block; each gets `context` back. */

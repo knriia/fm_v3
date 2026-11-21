@@ -52,6 +52,9 @@ typedef struct {
     MachineCalibration_t calibration;
     /* The queue the task pushes plan blocks into; it outlives the task. */
     PlanBuffer_t *plan_buffer;
+    /* The most steps one DOSER_MOVE may ask for (the stroke of the piston, which has no switch to stop at); a longer
+     * move is refused. 0 means no limit is set. */
+    uint32_t doser_max_step_count;
 } MotionTaskContext_t;
 
 void MotionTask(void *argument);

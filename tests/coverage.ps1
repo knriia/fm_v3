@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
-    $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'cmake-build-coverage'))
+    $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'cmake_build/coverage'))
 } elseif ([System.IO.Path]::IsPathRooted($BuildDirectory)) {
     $buildRoot = [System.IO.Path]::GetFullPath($BuildDirectory)
 } else {

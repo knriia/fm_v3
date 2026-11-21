@@ -1,7 +1,7 @@
 # Сборка и артефакты
 Debug/
 Release/
-/cmake-build-debug
+/cmake_build/
 /tests/build/
 /docs
 cmake-build-*/
