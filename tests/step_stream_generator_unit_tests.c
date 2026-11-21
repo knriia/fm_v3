@@ -190,7 +190,7 @@ static int test_block_wrapper_and_duration(void) {
     CHECK(step_stream_generator_init_from_block(&generator, &config, NULL, 0U, NULL) ==
           STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT);
     CHECK(step_stream_generator_init_from_block(&generator, &config, &block,
-                                                MOTION_PLANNER_AXIS_COUNT, NULL) ==
+                                                MOTION_PLAN_CHANNEL_COUNT, NULL) ==
           STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT);
 
     block.step_delta[0] = 11;
@@ -226,6 +226,61 @@ static int test_block_wrapper_and_duration(void) {
     block.step_event_rate_numerator = 3U;
     CHECK(step_stream_generator_init_from_block(&generator, &config, &block, 0U, NULL) ==
           STEP_STREAM_GENERATOR_STATUS_OK);
+    return 1;
+}
+
+/* The syringe is the plan channel 3: its steps come from step_delta[3], not from an axis. */
+static int test_syringe_channel_takes_its_own_steps(void) {
+    StepStreamGeneratorConfig_t config = default_config();
+    config.timer_clock_hz = 1000U;
+    config.pulse_ticks = 10U;
+    config.low_ticks = 5U;
+    config.min_record_ticks = 5U;
+    MotionPlanBlock_t block = valid_block();
+    block.step_delta[0] = 7;
+    block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = 3;
+    StepStreamGenerator_t generator;
+    uint16_t records[12 * STEP_STREAM_GENERATOR_RECORD_WORDS] = {0};
+    size_t written = 0U;
+
+    /* 10 steps at 4 Hz are 2.5 s = 2500 ticks; 3 steps of the syringe: 833, 833, 834 ticks as in the axis case. */
+    CHECK(step_stream_generator_init_from_block(&generator, &config, &block, MOTION_PLAN_CHANNEL_SYRINGE, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 12U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 3U);
+    CHECK(count_pulses(records, written) == 3U);
+    CHECK(record_period(records, 0U) == 833U);
+    CHECK(record_period(records, 1U) == 833U);
+    CHECK(record_period(records, 2U) == 834U);
+
+    /* The axis 0 of the same block takes its own 7 steps. */
+    CHECK(step_stream_generator_init_from_block(&generator, &config, &block, 0U, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 12U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 7U);
+    CHECK(count_pulses(records, written) == 7U);
+    /* 2.5e9 ns / 7 = 357142857 ns with 1 ns left over; the ns-to-ticks carry (142858000, 285715000, ... 857143000 in
+     * units of 1e-9 tick) adds up over the steps and the whole tick falls to the last one: 357 x 6, then 358. */
+    for (size_t index = 0U; index < 6U; ++index) {
+        CHECK(record_period(records, index) == 357U);
+    }
+    CHECK(record_period(records, 6U) == 358U);
+
+    /* A block without syringe steps leaves its lane waiting out the whole block. A wait is cut into 1 s chunks: the
+     * 2.5 s block is 1000 ticks, then the remaining 1500 ticks at 1 kHz. */
+    block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = 0;
+    CHECK(step_stream_generator_init_from_block(&generator, &config, &block, MOTION_PLAN_CHANNEL_SYRINGE, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_OK);
+    CHECK(step_stream_generator_fill(&generator, records, 12U, &written) == STEP_STREAM_GENERATOR_STATUS_DONE);
+    CHECK(written == 2U);
+    CHECK(count_pulses(records, written) == 0U);
+    CHECK(record_period(records, 0U) == 1000U);
+    CHECK(record_period(records, 1U) == 1500U);
+
+    /* The syringe cannot have more steps than the master channel. */
+    block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = 11;
+    CHECK(step_stream_generator_init_from_block(&generator, &config, &block, MOTION_PLAN_CHANNEL_SYRINGE, NULL) ==
+          STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT);
     return 1;
 }
 
@@ -705,7 +760,8 @@ static int test_max_record_ticks(void) {
 }
 
 int main(void) {
-    if (!test_invalid_arguments() || !test_block_wrapper_and_duration() || !test_idle_and_split_boundaries() ||
+    if (!test_invalid_arguments() || !test_block_wrapper_and_duration() ||
+        !test_syringe_channel_takes_its_own_steps() || !test_idle_and_split_boundaries() ||
         !test_resume_and_exact_sums() || !test_carry_and_overflow() || !test_speed_profiles() ||
         !test_max_record_ticks() || !test_long_idle_is_chunked() || !test_long_block_duration_reduces_fraction()) {
         return 1;

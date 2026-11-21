@@ -216,7 +216,7 @@ StepStreamGeneratorStatus_t step_stream_generator_init_from_block(
     uint32_t axis_index,
     const StepStreamGeneratorCarry_t *input_carry
 ) {
-    if (generator == NULL || config == NULL || block == NULL || axis_index >= MOTION_PLANNER_AXIS_COUNT) {
+    if (generator == NULL || config == NULL || block == NULL || axis_index >= MOTION_PLAN_CHANNEL_COUNT) {
         return STEP_STREAM_GENERATOR_STATUS_INVALID_ARGUMENT;
     }
 

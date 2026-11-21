@@ -6,6 +6,8 @@
 
 #include <stdint.h>
 
+/* The generator of the interrupt-driven path (HOME and CALIBRATE on one axis): it drives the planner axes only and
+ * rejects a block that moves the syringe channel (INVALID_BLOCK). */
 typedef enum {
     MOTION_SEGMENT_GENERATOR_STATUS_OK = 0,
     MOTION_SEGMENT_GENERATOR_STATUS_DONE,

@@ -102,14 +102,14 @@ static uint8_t step_stream_feeder_ports_are_complete(const StepStreamFeederPorts
                      ports->plan_epoch != NULL && ports->peek_block != NULL && ports->discard_blocks != NULL);
 }
 
-/* Every lane drives its own planner axis. */
+/* Every lane drives its own plan channel. */
 static uint8_t step_stream_feeder_lanes_are_valid(const StepStreamFeederConfig_t *config) {
     if (config->lane_count == 0U || config->lane_count > STEP_STREAM_FEEDER_MAX_LANES) {
         return 0U;
     }
     uint8_t seen = 0U;
     for (uint32_t lane = 0U; lane < config->lane_count; ++lane) {
-        if (config->axis_index[lane] >= MOTION_PLANNER_AXIS_COUNT || ((seen >> config->axis_index[lane]) & 1U) != 0U) {
+        if (config->axis_index[lane] >= MOTION_PLAN_CHANNEL_COUNT || ((seen >> config->axis_index[lane]) & 1U) != 0U) {
             return 0U;
         }
         seen = (uint8_t)(seen | (1U << config->axis_index[lane]));
@@ -194,7 +194,7 @@ static uint8_t step_stream_feeder_bit(uint8_t mask, uint32_t axis) { return (uin
 /* Does the block fit the stream? Every axis that it moves must have its direction decided and the same as the block
  * wants: DIR changes only while the stream is stopped. */
 static uint8_t step_stream_feeder_block_fits(const StepStreamFeeder_t *feeder, const MotionPlanBlock_t *block) {
-    for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+    for (uint32_t axis = 0U; axis < MOTION_PLAN_CHANNEL_COUNT; ++axis) {
         if (step_stream_feeder_bit(block->moving_axes_mask, axis) == 0U) {
             continue;
         }
@@ -437,7 +437,7 @@ static int8_t step_stream_feeder_decide_directions(StepStreamFeeder_t *feeder, u
         }
 
         uint8_t agrees = 1U;
-        for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        for (uint32_t axis = 0U; axis < MOTION_PLAN_CHANNEL_COUNT; ++axis) {
             if (step_stream_feeder_bit(block.moving_axes_mask, axis) != 0U &&
                 step_stream_feeder_bit(known, axis) != 0U &&
                 step_stream_feeder_bit(positive, axis) != step_stream_feeder_bit(block.positive_direction_mask, axis)) {
@@ -448,7 +448,7 @@ static int8_t step_stream_feeder_decide_directions(StepStreamFeeder_t *feeder, u
             break;
         }
         /* The first block that moves an axis decides its direction. */
-        for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        for (uint32_t axis = 0U; axis < MOTION_PLAN_CHANNEL_COUNT; ++axis) {
             if (step_stream_feeder_bit(block.moving_axes_mask, axis) != 0U &&
                 step_stream_feeder_bit(known, axis) == 0U) {
                 known = (uint8_t)(known | (1U << axis));

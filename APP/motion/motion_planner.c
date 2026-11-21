@@ -64,6 +64,21 @@ static int motion_planner_ratio_exceeds_limit(uint64_t numerator, uint64_t denom
     return quotient > limit || (quotient == limit && remainder != 0U);
 }
 
+/* Syringe steps of a block from its path, with the fraction left over by the earlier blocks carried in. It cannot
+ * overflow: the path is the root of a sum of squares that fits uint64, so it is below 2^32, and with a 32-bit factor
+ * and a 32-bit remainder the sum stays below 2^64. */
+static uint64_t motion_planner_syringe_steps(
+    uint64_t path_length_um,
+    const MotionPlannerConfig_t *config,
+    uint32_t remainder_in,
+    uint32_t *remainder_out
+) {
+    const uint64_t denominator = config->syringe_steps_per_um_denominator;
+    const uint64_t total = path_length_um * config->syringe_steps_per_um_numerator + remainder_in;
+    *remainder_out = (uint32_t)(total % denominator);
+    return total / denominator;
+}
+
 MotionPlannerResult_t motion_planner_plan_linear(
     const MotionPlannerRequest_t *request,
     const MotionPlannerMachineState_t *machine_state,
@@ -90,7 +105,8 @@ MotionPlannerResult_t motion_planner_plan_linear(
         return result;
     }
 
-    if (config->max_step_event_rate_hz == 0U) {
+    if (config->max_step_event_rate_hz == 0U ||
+        (config->syringe_steps_per_um_numerator != 0U && config->syringe_steps_per_um_denominator == 0U)) {
         result.status = MOTION_PLANNER_STATUS_INVALID_CONFIGURATION;
         return result;
     }
@@ -163,6 +179,29 @@ MotionPlannerResult_t motion_planner_plan_linear(
 
     block.path_length_um = motion_planner_integer_sqrt(distance_squared);
 
+    /* The syringe feeds in proportion to the path; it only ever pushes, so its direction is positive. */
+    result.syringe_step_remainder = machine_state->syringe_step_remainder;
+    if (config->syringe_steps_per_um_numerator != 0U) {
+        const uint64_t syringe_steps = motion_planner_syringe_steps(
+            block.path_length_um,
+            config,
+            machine_state->syringe_step_remainder,
+            &result.syringe_step_remainder
+        );
+        if (syringe_steps > (uint64_t)INT64_MAX) {
+            result.status = MOTION_PLANNER_STATUS_ARITHMETIC_OVERFLOW;
+            return result;
+        }
+        if (syringe_steps != 0U) {
+            block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = (int64_t)syringe_steps;
+            block.moving_axes_mask |= MOTION_PLAN_CHANNEL_SYRINGE_MASK;
+            block.positive_direction_mask |= MOTION_PLAN_CHANNEL_SYRINGE_MASK;
+            if (syringe_steps > block.master_step_count) {
+                block.master_step_count = syringe_steps;
+            }
+        }
+    }
+
     for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
         if (absolute_delta_um[axis] == 0U) {
             continue;
@@ -184,6 +223,8 @@ MotionPlannerResult_t motion_planner_plan_linear(
         return result;
     }
 
+    /* The master channel may be the syringe, so the one rate limit of the planner bounds the syringe too; it has no
+     * limit of its own. */
     block.step_event_rate_numerator = (uint64_t)request->feedrate_um_per_s * block.master_step_count;
     block.step_event_rate_denominator = block.path_length_um;
     if (motion_planner_ratio_exceeds_limit(

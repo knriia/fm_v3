@@ -360,6 +360,7 @@ void step_generator_task_set_progress_listener(StepGeneratorProgressListener_t l
 #define TEST_BLOCK_RECORD_CAPACITY 160U
 static uint32_t test_block_record_sequences[TEST_BLOCK_RECORD_CAPACITY];
 static uint32_t test_block_record_orders[TEST_BLOCK_RECORD_CAPACITY];
+static int64_t test_block_record_syringe_steps[TEST_BLOCK_RECORD_CAPACITY];
 static uint32_t test_block_record_count;
 
 /* One change of the stream snapshot, applied while MotionTask sleeps on its flags. The played and unplayed blocks are
@@ -4952,6 +4953,7 @@ static void record_print_blocks(void) {
            plan_buffer_try_pop(&test_plan_buffer, &block) == PLAN_BUFFER_STATUS_OK) {
         test_block_record_sequences[test_block_record_count] = block.sequence;
         test_block_record_orders[test_block_record_count] = block.order;
+        test_block_record_syringe_steps[test_block_record_count] = block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE];
         ++test_block_record_count;
     }
 }
@@ -4964,6 +4966,7 @@ static void record_print_blocks_at_read(uint32_t read_index) {
 static void record_block(uint32_t sequence, uint32_t order) {
     test_block_record_sequences[test_block_record_count] = sequence;
     test_block_record_orders[test_block_record_count] = order;
+    test_block_record_syringe_steps[test_block_record_count] = 0;
     ++test_block_record_count;
 }
 
@@ -6140,6 +6143,132 @@ static void test_a_refusal_by_the_guard_gives_the_order_and_the_position_back(vo
     expect_u32(test_block_ready_notifications, 2U, "the refused block woke no generator");
 }
 
+/* The syringe steps that the block of the move with this sequence carried into the queue. */
+static int64_t recorded_syringe_steps_of(uint32_t sequence) {
+    for (uint32_t index = 0U; index < test_block_record_count; ++index) {
+        if (test_block_record_sequences[index] == sequence) {
+            return test_block_record_syringe_steps[index];
+        }
+    }
+    ++test_failures;
+    (void)fprintf(stderr, "FAIL: no block was recorded for sequence %lu\n", (unsigned long)sequence);
+    return -1;
+}
+
+/* Syringe 1/3 step per um and X at 1 step per um, so a move of 10 um is 10 X steps and 10/3 syringe steps. */
+static MotionTaskContext_t syringe_motion_context(void) {
+    MotionTaskContext_t context = valid_motion_context();
+    context.planner_config.axis[0].steps_per_um_numerator = 1000U;
+    context.planner_config.syringe_steps_per_um_numerator = 1U;
+    context.planner_config.syringe_steps_per_um_denominator = 3U;
+    return context;
+}
+
+static const MotionTaskContext_t *test_remainder_watch_context;
+static uint32_t test_remainders_in_state_at_read[4];
+static uint32_t test_remainders_of_planner_at_read[4];
+
+/* Before the read k the move k - 1 is over, so this is what the task holds after each accepted move. */
+static void watch_syringe_remainder_at_reads(uint32_t read_index) {
+    if (read_index < 4U) {
+        const uint32_t in_state = test_remainder_watch_context->machine_state.syringe_step_remainder;
+        test_remainders_in_state_at_read[read_index] = in_state;
+        test_remainders_of_planner_at_read[read_index] =
+            motion_task_test_get_last_planner_result().syringe_step_remainder;
+    }
+}
+
+static void test_the_syringe_remainder_carries_from_one_accepted_move_to_the_next(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = syringe_motion_context();
+    test_remainder_watch_context = &context;
+    (void)memset(test_remainders_in_state_at_read, 0xFF, sizeof(test_remainders_in_state_at_read));
+    (void)memset(test_remainders_of_planner_at_read, 0xFF, sizeof(test_remainders_of_planner_at_read));
+    test_receive_hook = watch_syringe_remainder_at_reads;
+    const CommandDTO_t moves[] = {
+        xyz_move_to(930U, 10, 1000U),
+        xyz_move_to(931U, 20, 1000U),
+        xyz_move_to(932U, 30, 1000U),
+    };
+    run_commands(&context, moves, 3U);
+    record_print_blocks();
+
+    expect_u32(test_result_count, 3U, "each move is answered once");
+    expect_done_at(0U, 930U, COMMAND_DONE_ACCEPTED, "the first move is accepted");
+    expect_done_at(1U, 931U, COMMAND_DONE_ACCEPTED, "the second move is accepted");
+    expect_done_at(2U, 932U, COMMAND_DONE_ACCEPTED, "the third move is accepted");
+    /* 10 um at 1/3: 10/3 = 3 r1; with 1 carried 11/3 = 3 r2; with 2 carried 12/3 = 4 r0. */
+    expect_i64(recorded_syringe_steps_of(930U), 3, "the first block has 3 syringe steps");
+    expect_i64(recorded_syringe_steps_of(931U), 3, "the second block has 3 syringe steps");
+    expect_i64(recorded_syringe_steps_of(932U), 4, "the third block takes the step that the first two left over");
+    expect_u32(context.machine_state.syringe_step_remainder, 0U, "the remainder is closed after three blocks");
+    /* Remainders after the moves 1, 2, 3 in units of 1/3 step: 10 mod 3 = 1, 11 mod 3 = 2, 12 mod 3 = 0. */
+    expect_u32(test_remainders_in_state_at_read[1], 1U, "the state holds the remainder after the first move");
+    expect_u32(test_remainders_in_state_at_read[2], 2U, "the state holds the remainder after the second move");
+    expect_u32(test_remainders_in_state_at_read[3], 0U, "the state holds the remainder after the third move");
+    expect_u32(test_remainders_of_planner_at_read[1], 1U, "the planner returned the first remainder");
+    expect_u32(test_remainders_of_planner_at_read[2], 2U, "the planner returned the second remainder");
+    expect_u32(test_remainders_of_planner_at_read[3], 0U, "the planner returned the third remainder");
+    expect_u32(
+        motion_task_test_get_last_planner_result().syringe_step_remainder,
+        0U,
+        "the planner returned a closed remainder for the third move"
+    );
+    expect_i64(context.machine_state.position_um[0], 30, "the position follows the accepted moves");
+}
+
+static void test_a_refused_push_keeps_the_syringe_remainder(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = syringe_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(940U, 10, 1000U),
+        /* The buffer is filled behind its back. */
+        xyz_move_to(941U, 20, 1000U),
+        xyz_move_to(942U, 20, 1000U),
+    };
+    script_moves(moves, 3U);
+    test_receive_hook = guard_hook_at_reads;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    record_print_blocks();
+
+    expect_u32(test_result_count, 3U, "three answers");
+    expect_done_at(0U, 940U, COMMAND_DONE_ACCEPTED, "the first move is accepted");
+    expect_result_at(1U, 941U, TEST_ERROR_PLAN_QUEUE_FULL, "the move whose block does not fit is refused");
+    expect_done_at(2U, 942U, COMMAND_DONE_ACCEPTED, "the same move is accepted when the stream made room");
+    expect_i64(recorded_syringe_steps_of(940U), 3, "the first block has 3 syringe steps");
+    /* Had the refused block left its remainder (2) behind, this block would carry it: 12/3 = 4 steps. */
+    expect_i64(
+        recorded_syringe_steps_of(942U),
+        3,
+        "the block after the refusal carries the remainder of the first one"
+    );
+    expect_u32(
+        context.machine_state.syringe_step_remainder,
+        2U,
+        "the remainder is the one of the accepted blocks only"
+    );
+    expect_i64(context.machine_state.position_um[0], 20, "the position follows the accepted moves");
+}
+
+static void test_a_refused_push_leaves_the_syringe_remainder_of_the_state(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = syringe_motion_context();
+    context.machine_state.syringe_step_remainder = 1U;
+    const CommandDTO_t move = xyz_move_to(943U, 10, 1000U);
+    script_moves(&move, 1U);
+    test_receive_hook = arm_plan_fill_at_read_0;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_result_at(0U, 943U, TEST_ERROR_PLAN_QUEUE_FULL, "the block does not fit");
+    expect_u32(
+        motion_task_test_get_last_planner_result().syringe_step_remainder,
+        2U,
+        "the planner had a new remainder for the refused block: 11/3 = 3 r2"
+    );
+    expect_u32(context.machine_state.syringe_step_remainder, 1U, "the refused block does not change the remainder");
+    expect_i64(context.machine_state.position_um[0], 0, "nor the position");
+}
+
 static void make_print_instance_ready_at_read_1(uint32_t read_index) {
     if (read_index == 1U) {
         gen_print.ready = 1U;
@@ -6427,6 +6556,9 @@ int main(void) {
     test_planner_refusal_drops_the_waiting_moves_and_the_next_move_completes();
     test_move_waits_while_the_result_tracker_is_full();
     test_a_refusal_by_the_guard_gives_the_order_and_the_position_back();
+    test_the_syringe_remainder_carries_from_one_accepted_move_to_the_next();
+    test_a_refused_push_keeps_the_syringe_remainder();
+    test_a_refused_push_leaves_the_syringe_remainder_of_the_state();
     test_move_without_a_feeder_is_refused_before_it_is_tracked();
     test_move_into_a_full_plan_buffer_waits_until_room_appears();
     test_commands_behind_a_waiting_move_keep_their_order();
