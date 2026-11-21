@@ -79,7 +79,7 @@ typedef struct {
 typedef struct {
     StepStreamGeneratorConfig_t generator;
     uint32_t lane_count;
-    /* Planner axis that each lane drives. */
+    /* Plan channel (MOTION_PLAN_CHANNEL_*: an axis or the syringe) that each lane drives. */
     uint32_t axis_index[STEP_STREAM_FEEDER_MAX_LANES];
     uint32_t startup_period_ns;
     /* Length of one filler record in an empty stretch. It bounds how long a new block waits behind an idle half:

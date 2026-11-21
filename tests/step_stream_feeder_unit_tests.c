@@ -8,7 +8,7 @@
 #define TEST_PULSE_TICKS 2500U
 #define TEST_IDLE_TICKS 7000U
 #define TEST_QUEUE_SIZE 16U
-#define TEST_LANES 2U
+#define TEST_LANES 4U
 #define TEST_WORDS (TEST_HALF_RECORDS * STEP_STREAM_GENERATOR_RECORD_WORDS)
 
 static uint32_t test_failures;
@@ -215,6 +215,23 @@ static MotionPlanBlock_t make_block3(int64_t x_steps, int64_t y_steps, int64_t z
 
 static MotionPlanBlock_t make_block(int64_t x_steps, int64_t y_steps) { return make_block3(x_steps, y_steps, 0); }
 
+/* The block of the planner with the syringe as the fourth channel; the syringe only ever pushes. */
+static MotionPlanBlock_t make_block4(int64_t x_steps, int64_t y_steps, int64_t z_steps, int64_t syringe_steps) {
+    MotionPlanBlock_t block = make_block3(x_steps, y_steps, z_steps);
+    const uint64_t syringe_magnitude = (uint64_t)(syringe_steps < 0 ? -syringe_steps : syringe_steps);
+    block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE] = syringe_steps;
+    if (syringe_steps != 0) {
+        block.moving_axes_mask = (uint8_t)(block.moving_axes_mask | MOTION_PLAN_CHANNEL_SYRINGE_MASK);
+    }
+    if (syringe_steps > 0) {
+        block.positive_direction_mask = (uint8_t)(block.positive_direction_mask | MOTION_PLAN_CHANNEL_SYRINGE_MASK);
+    }
+    if (syringe_magnitude > block.master_step_count) {
+        block.master_step_count = syringe_magnitude;
+    }
+    return block;
+}
+
 static StepStreamFeederConfig_t make_config(uint32_t lane_count) {
     StepStreamFeederConfig_t config = {
         .generator =
@@ -229,9 +246,11 @@ static StepStreamFeederConfig_t make_config(uint32_t lane_count) {
         .idle_record_ticks = TEST_IDLE_TICKS,
         .half_record_count = TEST_HALF_RECORDS,
     };
-    /* Lane 0 drives X, lane 1 drives Y. */
+    /* Lane 0 drives X, lane 1 drives Y, lane 2 drives Z, lane 3 drives the syringe. */
     config.axis_index[0] = 0U;
     config.axis_index[1] = 1U;
+    config.axis_index[2] = 2U;
+    config.axis_index[3] = 3U;
     return config;
 }
 
@@ -571,7 +590,7 @@ static void test_init_validation(void) {
         "too many lanes"
     );
     bad = config;
-    bad.axis_index[1] = MOTION_PLANNER_AXIS_COUNT;
+    bad.axis_index[1] = MOTION_PLAN_CHANNEL_COUNT;
     expect_u32(
         step_stream_feeder_init(&feeder, &bad, &ports),
         STEP_STREAM_FEEDER_STATUS_INVALID_ARGUMENT,
@@ -1111,6 +1130,110 @@ static void test_block_for_an_axis_without_lane_is_an_error(void) {
     );
     expect_u32(fake_direction_calls, 1U, "the lookahead stopped before the Z block");
     expect_u32(fake_start_calls, 0U, "the stream never started");
+}
+
+static void test_syringe_channel_is_a_valid_lane(void) {
+    StepStreamFeeder_t feeder;
+    const StepStreamFeederPorts_t ports = make_ports();
+
+    StepStreamFeederConfig_t config = make_config(4U);
+    expect_u32(
+        step_stream_feeder_init(&feeder, &config, &ports),
+        STEP_STREAM_FEEDER_STATUS_OK,
+        "four lanes X Y Z syringe"
+    );
+    expect_u32(feeder.lane_axes_mask, 0x0FU, "four lanes cover the three axes and the syringe");
+
+    config = make_config(2U);
+    config.axis_index[1] = MOTION_PLAN_CHANNEL_SYRINGE;
+    expect_u32(
+        step_stream_feeder_init(&feeder, &config, &ports),
+        STEP_STREAM_FEEDER_STATUS_OK,
+        "axis index 3 is accepted"
+    );
+    expect_u32(feeder.lane_axes_mask, 0x09U, "the lanes of X and the syringe");
+
+    config.axis_index[1] = MOTION_PLAN_CHANNEL_COUNT;
+    expect_u32(
+        step_stream_feeder_init(&feeder, &config, &ports),
+        STEP_STREAM_FEEDER_STATUS_INVALID_ARGUMENT,
+        "axis index 4 is rejected"
+    );
+
+    config = make_config(2U);
+    config.axis_index[0] = MOTION_PLAN_CHANNEL_SYRINGE;
+    config.axis_index[1] = MOTION_PLAN_CHANNEL_SYRINGE;
+    expect_u32(
+        step_stream_feeder_init(&feeder, &config, &ports),
+        STEP_STREAM_FEEDER_STATUS_INVALID_ARGUMENT,
+        "the syringe cannot have two lanes"
+    );
+}
+
+static void test_syringe_steps_go_to_its_lane(void) {
+    StepStreamFeeder_t feeder;
+    setup_lanes(&feeder, 4U);
+    /* X 2 steps and the syringe 3 steps: the syringe leads (3 steps of 10000 ticks), X steps every 15000 ticks. */
+    const MotionPlanBlock_t block = make_block4(2, 0, 0, 3);
+    queue_block(&block);
+
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start");
+    expect_u32(step_stream_feeder_get_phase(&feeder), STEP_STREAM_FEEDER_PHASE_STREAMING, "streaming");
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 0x09U, "X and the syringe move");
+    expect_u32(fake_direction_calls, 2U, "DIR only for the lanes that move");
+    expect_u32(fake_direction_lane_log[0], 0U, "first DIR on the X lane");
+    expect_u32(fake_direction_lane_log[1], 3U, "second DIR on the syringe lane");
+    expect_u32(fake_direction_set[1], 0U, "Y has no DIR");
+    expect_u32(fake_direction_set[2], 0U, "Z has no DIR");
+    expect_u32(fake_direction_value[3], 1U, "the syringe direction is positive");
+    expect_u32(fake_start_calls, 1U, "one start for four lanes");
+
+    expect_u32(count_step_records_of(3U, 0U), 3U, "three steps on the syringe lane");
+    expect_u32(fake_halves[3][0][0], 9999U, "syringe step interval");
+    expect_u32(fake_halves[3][0][2], TEST_PULSE_TICKS, "syringe step pulse");
+    expect_u32(count_step_records_of(0U, 0U), 2U, "two steps on the X lane");
+    expect_u32(fake_halves[0][0][0], 14999U, "X step interval");
+    expect_u32(count_step_records_of(1U, 0U), 0U, "no steps on Y");
+    expect_u32(count_step_records_of(2U, 0U), 0U, "no steps on Z");
+    expect_u32(fake_halves[1][0][0], 29999U, "Y waits out the block in one record");
+    expect_u32(block_ticks_of(0U, 0U), 30000U, "X covers the block");
+    expect_u32(block_ticks_of(1U, 0U), 30000U, "Y covers the block");
+    expect_u32(block_ticks_of(2U, 0U), 30000U, "Z covers the block");
+    expect_u32(block_ticks_of(3U, 0U), 30000U, "the syringe covers the block");
+    expect_u32(fake_plan_count, 0U, "every lane has started the block");
+
+    /* A block of the syringe alone: only its lane gets DIR and steps. */
+    setup_lanes(&feeder, 4U);
+    const MotionPlanBlock_t syringe_only = make_block4(0, 0, 0, 3);
+    queue_block(&syringe_only);
+    expect_u32(step_stream_feeder_service(&feeder), STEP_STREAM_FEEDER_STATUS_OK, "start syringe only");
+    expect_u32(step_stream_feeder_get_moving_axes(&feeder), 0x08U, "only the syringe moves");
+    expect_u32(fake_direction_calls, 1U, "one DIR call");
+    expect_u32(fake_direction_lane_log[0], 3U, "on the syringe lane");
+    expect_u32(count_step_records_of(3U, 0U), 3U, "syringe steps");
+    expect_u32(count_step_records_of(0U, 0U), 0U, "no X steps");
+}
+
+static void test_syringe_block_without_syringe_lane_is_an_error(void) {
+    StepStreamFeeder_t feeder;
+    setup_lanes(&feeder, 3U);
+    const MotionPlanBlock_t block = make_block4(2, 0, 0, 3);
+    queue_block(&block);
+    expect_u32(
+        step_stream_feeder_service(&feeder),
+        STEP_STREAM_FEEDER_STATUS_GENERATOR_ERROR,
+        "a block with syringe steps cannot run on three lanes"
+    );
+    expect_u32(step_stream_feeder_get_phase(&feeder), STEP_STREAM_FEEDER_PHASE_FAULT, "the feeder is in fault");
+    expect_u32(feeder.lane_axes_mask, 0x07U, "three lanes cover X Y Z");
+    expect_u32(fake_prepare_calls, 0U, "no stream is opened for it");
+    expect_u32(fake_start_calls, 0U, "nothing started");
+    expect_u32(fake_stop_calls, 1U, "the fault stops the streams");
+    expect_u32(
+        step_stream_feeder_get_generator_fault(&feeder),
+        STEP_STREAM_GENERATOR_STATUS_OK,
+        "the generator did not fail, the plan cannot be driven"
+    );
 }
 
 static void test_generator_errors(void) {
@@ -1851,6 +1974,9 @@ int main(void) {
     test_direction_is_decided_per_axis();
     test_a_late_block_cannot_move_an_undecided_axis();
     test_block_for_an_axis_without_lane_is_an_error();
+    test_syringe_channel_is_a_valid_lane();
+    test_syringe_steps_go_to_its_lane();
+    test_syringe_block_without_syringe_lane_is_an_error();
     test_generator_errors();
     test_generator_fault_status();
     test_plan_port_errors();

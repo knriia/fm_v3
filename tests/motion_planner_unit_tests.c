@@ -366,7 +366,283 @@ static void test_step_rate_numerator_overflow_is_rejected(void) {
     );
 }
 
+static void set_syringe(MotionPlannerConfig_t *config, uint32_t numerator, uint32_t denominator) {
+    config->syringe_steps_per_um_numerator = numerator;
+    config->syringe_steps_per_um_denominator = denominator;
+}
+
+static void test_syringe_off_leaves_block_and_remainder_untouched(void) {
+    MotionPlannerConfig_t config = valid_config();
+    MotionPlannerMachineState_t state = homed_origin();
+    state.syringe_step_remainder = 7U;
+    const MotionPlannerRequest_t request = request_to(10000, 0, 0, 1000U);
+
+    /* Numerator 0 is the off switch, whatever the denominator. */
+    set_syringe(&config, 0U, 5U);
+    MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "move without syringe is planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 0, "no syringe steps");
+    expect_u32(result.block.moving_axes_mask, MOTION_PLANNER_AXIS_X_MASK, "syringe bit not in the moving mask");
+    expect_u32(
+        result.block.positive_direction_mask,
+        MOTION_PLANNER_AXIS_X_MASK,
+        "syringe bit not in the direction mask"
+    );
+    expect_u32(result.syringe_step_remainder, 7U, "the remainder is carried over unchanged");
+    expect_u64(result.block.master_step_count, 800U, "the X axis stays the master channel");
+
+    set_syringe(&config, 0U, 0U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "zero numerator with zero denominator is no syringe");
+    expect_u32(result.syringe_step_remainder, 7U, "remainder unchanged without a denominator");
+}
+
+static void test_syringe_steps_follow_the_path(void) {
+    MotionPlannerConfig_t config = valid_config();
+    const MotionPlannerMachineState_t state = homed_origin();
+    set_syringe(&config, 1U, 2U);
+
+    /* Even path: 1000 um * 1/2 = 500 steps, nothing left. */
+    MotionPlannerRequest_t request = request_to(1000, 0, 0, 1000U);
+    MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "even path planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 500, "half a step per micrometre");
+    expect_u32(result.block.moving_axes_mask, 0x09U, "X and the syringe move");
+    expect_u32(result.block.positive_direction_mask, 0x09U, "the syringe direction is positive");
+    expect_u32(result.syringe_step_remainder, 0U, "even path leaves no remainder");
+    expect_i64(result.block.step_delta[0], 80, "the axis steps are unchanged");
+
+    /* Odd path: 1001 um * 1/2 = 500 steps and one half-step (1 in units of 1/2). */
+    request = request_to(1001, 0, 0, 1000U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "odd path planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 500, "the half step is not taken");
+    expect_u32(result.syringe_step_remainder, 1U, "one half step is left");
+
+    /* The path is the diagonal: 3-4-5 gives 5000 um, so 2500 steps. */
+    request = request_to(3000, 4000, 0, 1000U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "diagonal planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 2500, "syringe follows the path, not one axis");
+}
+
+static void test_syringe_remainder_carries_over_blocks(void) {
+    MotionPlannerConfig_t config = valid_config();
+    config.axis[0].steps_per_um_numerator = 1000U;
+    set_syringe(&config, 1U, 3U);
+    MotionPlannerMachineState_t state = homed_origin();
+
+    /* Three blocks of 10 um at 1/3 step per um: 10/3 -> 3 r1, then 11/3 -> 3 r2, then 12/3 -> 4 r0. */
+    MotionPlannerRequest_t request = request_to(10, 0, 0, 1000U);
+    MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "first block planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 3, "first block steps");
+    expect_u32(result.syringe_step_remainder, 1U, "first block remainder");
+
+    state.position_um[0] = 10;
+    state.syringe_step_remainder = result.syringe_step_remainder;
+    request = request_to(20, 0, 0, 1000U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "second block planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 3, "second block steps");
+    expect_u32(result.syringe_step_remainder, 2U, "second block remainder");
+
+    state.position_um[0] = 20;
+    state.syringe_step_remainder = result.syringe_step_remainder;
+    request = request_to(30, 0, 0, 1000U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "third block planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 4, "third block takes the carried step");
+    expect_u32(result.syringe_step_remainder, 0U, "third block closes the fraction");
+}
+
+static void test_syringe_path_shorter_than_a_step(void) {
+    MotionPlannerConfig_t config = valid_config();
+    config.axis[0].steps_per_um_numerator = 1000U;
+    set_syringe(&config, 1U, 100U);
+    MotionPlannerMachineState_t state = homed_origin();
+    state.syringe_step_remainder = 5U;
+    const MotionPlannerRequest_t request = request_to(10, 0, 0, 1000U);
+
+    const MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "short path planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 0, "no whole syringe step in 10 um");
+    expect_u32(result.block.moving_axes_mask, MOTION_PLANNER_AXIS_X_MASK, "no syringe bit without steps");
+    expect_u32(
+        result.block.positive_direction_mask,
+        MOTION_PLANNER_AXIS_X_MASK,
+        "no syringe direction bit without steps"
+    );
+    expect_u32(result.syringe_step_remainder, 15U, "remainder grows by path * numerator: 5 + 10");
+    expect_u64(result.block.master_step_count, 10U, "the axis is the master channel");
+}
+
+static void test_syringe_as_master_channel(void) {
+    MotionPlannerConfig_t config = valid_config();
+    const MotionPlannerMachineState_t state = homed_origin();
+    const MotionPlannerRequest_t request = request_to(1000, 0, 0, 1000U);
+
+    /* X: 1000 um * 80/1000 = 80 steps. Syringe 2 steps per um: 2000 steps. */
+    set_syringe(&config, 2U, 1U);
+    MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "syringe-led block planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 2000, "syringe steps");
+    expect_u64(result.block.master_step_count, 2000U, "the syringe is the master");
+    expect_u64(result.block.step_event_rate_numerator, 2000000U, "rate numerator: 1000 um/s * 2000 steps");
+    expect_u64(result.block.step_event_rate_denominator, 1000U, "rate denominator is the path");
+
+    /* Syringe 1/1000 step per um: 1 step; X has 80 and stays the master. */
+    set_syringe(&config, 1U, 1000U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "axis-led block planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 1, "syringe steps");
+    expect_u64(result.block.master_step_count, 80U, "the axis is the master");
+    expect_u32(result.block.moving_axes_mask, 0x09U, "both move");
+
+    /* Equal step counts: 80 each, the master stays 80. */
+    set_syringe(&config, 80U, 1000U);
+    result = motion_planner_plan_linear(&request, &state, &config);
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 80, "equal syringe steps");
+    expect_u64(result.block.master_step_count, 80U, "equal counts keep the master");
+}
+
+static void test_syringe_configuration_is_validated(void) {
+    MotionPlannerConfig_t config = valid_config();
+    const MotionPlannerMachineState_t state = homed_origin();
+    const MotionPlannerRequest_t request = request_to(1000, 0, 0, 1000U);
+
+    set_syringe(&config, 1U, 0U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_INVALID_CONFIGURATION,
+        "syringe numerator without denominator is rejected"
+    );
+}
+
+static void test_syringe_step_count_overflow_is_rejected(void) {
+    MotionPlannerConfig_t config = valid_config();
+    for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        config.axis[axis].min_position_um = INT32_MIN;
+        config.axis[axis].max_position_um = INT32_MAX;
+        config.axis[axis].steps_per_um_numerator = 1U;
+        config.axis[axis].steps_per_um_denominator = 1U;
+        config.axis[axis].max_speed_um_per_s = UINT32_MAX;
+    }
+    config.max_step_event_rate_hz = UINT32_MAX;
+    const MotionPlannerMachineState_t state = {
+        .position_um = {INT32_MIN, 0, 0},
+        .homed_axes_mask = MOTION_PLANNER_ALL_AXES_MASK,
+    };
+    /* The path is 2^32 - 1 um, the largest that fits the sum of squares. */
+    const MotionPlannerRequest_t request = request_to(INT32_MAX, 0, 0, 1U);
+
+    /* (2^32 - 1) * (2^32 - 1) = 18446744065119617025 steps: more than INT64_MAX. */
+    set_syringe(&config, UINT32_MAX, 1U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_ARITHMETIC_OVERFLOW,
+        "syringe steps above INT64_MAX are rejected"
+    );
+
+    /* (2^32 - 1) * 2^31 = 2^63 - 2^31 = 9223372034707292160 steps: still below INT64_MAX, accepted. */
+    set_syringe(&config, 0x80000000U, 1U);
+    const MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "syringe steps below INT64_MAX are accepted");
+    expect_i64(
+        result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE],
+        9223372034707292160LL,
+        "syringe steps near the limit"
+    );
+    expect_u64(result.block.master_step_count, 9223372034707292160ULL, "the syringe is the master");
+
+    /* (2^32 - 1) * (2^31 + 1) = 2^63 + 2^31 - 1 steps: above INT64_MAX, rejected. */
+    set_syringe(&config, 0x80000001U, 1U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_ARITHMETIC_OVERFLOW,
+        "syringe steps just above INT64_MAX are rejected"
+    );
+}
+
+static void test_syringe_arithmetic_holds_at_the_maximum_inputs(void) {
+    MotionPlannerConfig_t config = valid_config();
+    for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
+        config.axis[axis].min_position_um = INT32_MIN;
+        config.axis[axis].max_position_um = INT32_MAX;
+        config.axis[axis].steps_per_um_numerator = 1U;
+        config.axis[axis].steps_per_um_denominator = 1U;
+        config.axis[axis].max_speed_um_per_s = UINT32_MAX;
+    }
+    config.max_step_event_rate_hz = UINT32_MAX;
+    set_syringe(&config, UINT32_MAX, UINT32_MAX);
+    MotionPlannerMachineState_t state = {
+        .position_um = {INT32_MIN, 0, 0},
+        .homed_axes_mask = MOTION_PLANNER_ALL_AXES_MASK,
+        .syringe_step_remainder = UINT32_MAX - 1U,
+    };
+    /* The path is 2^32 - 1 um. With N = D = 2^32 - 1 and the remainder r = D - 1 the sum path * N + r is
+     * 2^64 - 2^32 - 1, below 2^64. It divides as path * D + r = path whole steps and the remainder r, as r < D. */
+    const MotionPlannerRequest_t request = request_to(INT32_MAX, 0, 0, 1U);
+
+    const MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "the largest path with the largest factor is planned");
+    expect_i64(result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 4294967295LL, "the syringe has one step per um");
+    expect_u32(result.syringe_step_remainder, UINT32_MAX - 1U, "the remainder stays as it was");
+    expect_u64(result.block.master_step_count, 4294967295U, "the master has 2^32 - 1 steps");
+}
+
+static void test_syringe_remainder_without_steps_builds_up_over_a_chain(void) {
+    MotionPlannerConfig_t config = valid_config();
+    config.axis[0].steps_per_um_numerator = 1000U;
+    set_syringe(&config, 1U, 100U);
+    MotionPlannerMachineState_t state = homed_origin();
+
+    /* A step needs 100 um at 1/100 step per um; each block of 10 um adds 10 to the remainder. */
+    for (uint32_t call = 1U; call <= 10U; ++call) {
+        const MotionPlannerRequest_t request = request_to((int32_t)(10U * call), 0, 0, 1000U);
+        const MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+        expect_status(result.status, MOTION_PLANNER_STATUS_OK, "the block of the chain is planned");
+        expect_i64(
+            result.block.step_delta[MOTION_PLAN_CHANNEL_SYRINGE],
+            call == 10U ? 1 : 0,
+            "only the tenth block has a syringe step"
+        );
+        expect_u32(result.syringe_step_remainder, call == 10U ? 0U : 10U * call, "the remainder after the block");
+        state.position_um[0] = (int32_t)(10U * call);
+        state.syringe_step_remainder = result.syringe_step_remainder;
+    }
+}
+
+static void test_syringe_rate_limit_applies_to_the_syringe_channel(void) {
+    MotionPlannerConfig_t config = valid_config();
+    const MotionPlannerMachineState_t state = homed_origin();
+    const MotionPlannerRequest_t request = request_to(1000, 0, 0, 1000U);
+
+    /* X alone is 80 steps in 1 s = 80 Hz; the syringe at 50 steps per um is 50000 steps = 50000 Hz. */
+    set_syringe(&config, 50U, 1U);
+    MotionPlannerResult_t result = motion_planner_plan_linear(&request, &state, &config);
+    expect_status(result.status, MOTION_PLANNER_STATUS_OK, "syringe rate exactly at the limit is accepted");
+    expect_u64(result.block.master_step_count, 50000U, "the syringe is the master");
+
+    set_syringe(&config, 51U, 1U);
+    expect_status(
+        motion_planner_plan_linear(&request, &state, &config).status,
+        MOTION_PLANNER_STATUS_STEP_RATE_LIMIT_EXCEEDED,
+        "syringe rate above the limit is rejected"
+    );
+}
+
 int main(void) {
+    test_syringe_off_leaves_block_and_remainder_untouched();
+    test_syringe_steps_follow_the_path();
+    test_syringe_remainder_carries_over_blocks();
+    test_syringe_path_shorter_than_a_step();
+    test_syringe_as_master_channel();
+    test_syringe_configuration_is_validated();
+    test_syringe_step_count_overflow_is_rejected();
+    test_syringe_arithmetic_holds_at_the_maximum_inputs();
+    test_syringe_remainder_without_steps_builds_up_over_a_chain();
+    test_syringe_rate_limit_applies_to_the_syringe_channel();
     test_linear_plan_uses_physical_units_and_constant_feedrate();
     test_negative_and_positive_axis_directions();
     test_no_motion_when_target_is_same_or_below_step_resolution();

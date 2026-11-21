@@ -263,6 +263,7 @@ motion_task_queue_move(MotionTaskContext_t *context, const MotionPlannerRequest_
         for (uint32_t axis = 0U; axis < MOTION_PLANNER_AXIS_COUNT; ++axis) {
             context->machine_state.position_um[axis] = request->target_um[axis];
         }
+        context->machine_state.syringe_step_remainder = result.syringe_step_remainder;
         step_generator_task_notify_block_ready();
         return motion_task_done(COMMAND_DONE_ACCEPTED);
     }
