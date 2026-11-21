@@ -45,6 +45,9 @@
 
 /* Everything that differs between the axes: the timer and its STEP pin, the DMA stream that feeds it. */
 typedef struct {
+    /* 1: the channel belongs to an axis of motion_axis_hardware and `motion_axis` is valid; 0: it has none (the
+     * syringe), `motion_axis` is not read and the launch skips the legacy-axis busy check. */
+    uint8_t has_motion_axis;
     MotionAxis_t motion_axis;
     TIM_TypeDef *timer;
     volatile uint32_t *timer_rcc_enable_register;
@@ -104,6 +107,7 @@ struct StepStreamAxis {
 };
 
 static const StepStreamAxisHardware_t step_stream_axis_x_hardware = {
+    .has_motion_axis = 1U,
     .motion_axis = MOTION_AXIS_X,
     .timer = TIM4,
     .timer_rcc_enable_register = &RCC->APB1LENR,
@@ -127,6 +131,7 @@ static const StepStreamAxisHardware_t step_stream_axis_x_hardware = {
 
 /* Y: TIM1 CH1 on PA8. DIR (PA10) and ENA (PA11) belong to motion_axis_hardware, the channel drives STEP only. */
 static const StepStreamAxisHardware_t step_stream_axis_y_hardware = {
+    .has_motion_axis = 1U,
     .motion_axis = MOTION_AXIS_Y,
     .timer = TIM1,
     .timer_rcc_enable_register = &RCC->APB2ENR,
@@ -151,6 +156,7 @@ static const StepStreamAxisHardware_t step_stream_axis_y_hardware = {
 /* Z: TIM3 CH1 on PB4 (16-bit timer: a half-word DMAR write duplicates into a 32-bit register, so TIM5 was dropped).
  * DIR (PC8) and ENA (PC9) belong to motion_axis_hardware, the channel drives STEP only. TIM3 sits on APB1 like X. */
 static const StepStreamAxisHardware_t step_stream_axis_z_hardware = {
+    .has_motion_axis = 1U,
     .motion_axis = MOTION_AXIS_Z,
     .timer = TIM3,
     .timer_rcc_enable_register = &RCC->APB1LENR,
@@ -172,6 +178,35 @@ static const StepStreamAxisHardware_t step_stream_axis_z_hardware = {
     .dma_flags_in_high_register = STEP_STREAM_AXIS_DMA_FLAGS_IN_HIGH_REGISTER(2U),
 };
 
+/* Syringe: TIM8 CH1 on PC6 (AF3), APB2 advanced timer like Y. DIR (PC7) and ENA (PG8) are not driven by this channel.
+ * DMAMUX1 input 51 is TIM8_UP (RM0468 Rev 3, Table 118); DMAMUX1 channel 3 is wired to DMA1 stream 3 (RM0468 17.3.2).
+ * SKELETON: nothing calls step_stream_axis_get_syringe() yet; before the first start the owner of the syringe must set
+ * up DIR (PC7) and ENA (PG8), otherwise STEP pulses come out with the driver disabled or the direction undefined.
+ * TIM8's vector TIM8_TRG_COM_TIM14_IRQHandler is shared with the HAL tick (TIM14) and only dispatches TIM14: this
+ * module writes TIM8->DIER only as 0 or TIM_DIER_UDE (a DMA request), so no TIM8 interrupt may ever be enabled here. */
+static const StepStreamAxisHardware_t step_stream_axis_syringe_hardware = {
+    .has_motion_axis = 0U,
+    .motion_axis = MOTION_AXIS_X,
+    .timer = TIM8,
+    .timer_rcc_enable_register = &RCC->APB2ENR,
+    .timer_rcc_enable_bit = RCC_APB2ENR_TIM8EN,
+    .timer_on_apb2 = 1U,
+    .advanced_timer = 1U,
+    .step_port = GPIOC,
+    .step_gpio_rcc_enable_bit = RCC_AHB4ENR_GPIOCEN,
+    .step_pin = 6U,
+    .step_alternate_function = 3U,
+    .dma = DMA1,
+    .dma_rcc_enable_bit = RCC_AHB1ENR_DMA1EN,
+    .dma_stream = DMA1_Stream3,
+    .dma_mux_channel = DMAMUX1_Channel3,
+    /* TIM8_UP. */
+    .dma_request = 51U,
+    .dma_irq = DMA1_Stream3_IRQn,
+    .dma_flag_shift = STEP_STREAM_AXIS_DMA_FLAG_SHIFT(3U),
+    .dma_flags_in_high_register = STEP_STREAM_AXIS_DMA_FLAGS_IN_HIGH_REGISTER(3U),
+};
+
 static uint16_t step_stream_axis_x_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
 static uint16_t step_stream_axis_x_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
@@ -181,6 +216,9 @@ static uint16_t step_stream_axis_y_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY
 static uint16_t step_stream_axis_z_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
     __attribute__((section(".stepper_dma_buffers"), aligned(64)));
 static uint16_t step_stream_axis_z_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
+static uint16_t step_stream_axis_syringe_dma_buffer[STEP_STREAM_AXIS_BUFFER_WORD_COUNT]
+    __attribute__((section(".stepper_dma_buffers"), aligned(64)));
+static uint16_t step_stream_axis_syringe_brake_storage[STEP_STREAM_AXIS_BRAKE_CAPACITY];
 
 /* Indexed by MotionAxis_t; an axis without a stream channel has no hardware. */
 static StepStreamAxis_t step_stream_axis_instances[MOTION_AXIS_HARDWARE_COUNT] = {
@@ -206,6 +244,16 @@ static StepStreamAxis_t step_stream_axis_instances[MOTION_AXIS_HARDWARE_COUNT] =
             .held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF,
         },
 };
+
+/* The syringe is not a MotionAxis_t (the planner has three axes), so it has its own instance. */
+static StepStreamAxis_t step_stream_axis_syringe_instance = {
+    .hardware = &step_stream_axis_syringe_hardware,
+    .dma_buffer = step_stream_axis_syringe_dma_buffer,
+    .brake_storage = step_stream_axis_syringe_brake_storage,
+    .held_half = STEP_STREAM_AXIS_LOGIC_NO_HALF,
+};
+
+StepStreamAxis_t *step_stream_axis_get_syringe(void) { return &step_stream_axis_syringe_instance; }
 
 StepStreamAxis_t *step_stream_axis_get(MotionAxis_t axis) {
     if ((uint32_t)axis >= (uint32_t)MOTION_AXIS_HARDWARE_COUNT || step_stream_axis_instances[axis].hardware == NULL) {
@@ -416,11 +464,14 @@ step_stream_axis_launch(StepStreamAxis_t *axis, uint32_t period_ticks, uint32_t 
         return STEP_STREAM_AXIS_STATUS_BUSY;
     }
 
-    const MotionAxisHardwareStatus_t motion_status = motion_axis_hardware_get_status(hardware->motion_axis);
-    if (motion_status == MOTION_AXIS_HARDWARE_STATUS_STARTING || motion_status == MOTION_AXIS_HARDWARE_STATUS_WAITING ||
-        motion_status == MOTION_AXIS_HARDWARE_STATUS_RUNNING) {
-        step_stream_axis_exit_critical(primask);
-        return STEP_STREAM_AXIS_STATUS_AXIS_BUSY;
+    if (hardware->has_motion_axis != 0U) {
+        const MotionAxisHardwareStatus_t motion_status = motion_axis_hardware_get_status(hardware->motion_axis);
+        if (motion_status == MOTION_AXIS_HARDWARE_STATUS_STARTING ||
+            motion_status == MOTION_AXIS_HARDWARE_STATUS_WAITING ||
+            motion_status == MOTION_AXIS_HARDWARE_STATUS_RUNNING) {
+            step_stream_axis_exit_critical(primask);
+            return STEP_STREAM_AXIS_STATUS_AXIS_BUSY;
+        }
     }
 
     /* Decide on the ring before any register is touched, so a refusal leaves the hardware as it was. */
@@ -955,3 +1006,5 @@ void DMA1_Stream0_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_
 void DMA1_Stream1_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_Y]); }
 
 void DMA1_Stream2_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_instances[MOTION_AXIS_Z]); }
+
+void DMA1_Stream3_IRQHandler(void) { step_stream_axis_dma_irq(&step_stream_axis_syringe_instance); }
