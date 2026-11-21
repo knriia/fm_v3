@@ -9,6 +9,8 @@
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(milliseconds) (milliseconds)
 #define eInvalid 0
+/* The same tick as Core/Inc/FreeRTOSConfig.h. */
+#define configTICK_RATE_HZ ((TickType_t)1000)
 
 /* The firmware assert halts the MCU; tests route it to Error_Handler so a failed check is observable. */
 void Error_Handler(void);

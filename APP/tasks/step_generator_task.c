@@ -4,6 +4,7 @@
 #include "motion/step_stream_feeder.h"
 #include "motion/step_stream_group.h"
 #include "motion_axis_hardware.h"
+#include "step_generator_channels.h"
 #include "step_stream_axis.h"
 
 #include "cmsis_os.h"
@@ -11,9 +12,9 @@
 
 #include <stddef.h>
 
-/* X (TIM4 CH1, DMA1 stream 0), Y (TIM1 CH1, DMA1 stream 1) and Z (TIM3 CH1, DMA1 stream 2) have a planned stream in
- * step_stream_axis. X is the reference of the timing: the members must share its timer kernel clock. */
-#define STEP_GENERATOR_TASK_AXIS MOTION_AXIS_X
+/* X (TIM4 CH1, DMA1 stream 0), Y (TIM1 CH1, DMA1 stream 1), Z (TIM3 CH1, DMA1 stream 2) and the syringe (TIM8 CH1, DMA1
+ * stream 3) have a planned stream in step_stream_axis. The first member of an instance is the reference of its timing:
+ * the other members must share its timer kernel clock. */
 /* The timer idles this long before the DMA delivers the first record of a stream. */
 #define STEP_GENERATOR_TASK_STARTUP_PERIOD_NS STEP_STREAM_AXIS_MIN_STARTUP_NS
 /* A record is never shorter than this: the DMA must finish a burst before the next timer update. */
@@ -23,12 +24,14 @@
 #define STEP_GENERATOR_TASK_IDLE_RECORD_NS 10000U
 /* Longest record of a wait; 0 is the format maximum (238 us). With several axes it must be short enough that a ring
  * half of an axis that mostly waits spans about the time of a half of an axis that steps: the plan has to hold the
- * blocks of the longest half. Still 0 with three axes: it is tuned on the hardware (kanban card 4e.3). */
+ * blocks of the longest half. Still 0 with four channels: it is tuned on the hardware (kanban card 4e.3). */
 #define STEP_GENERATOR_TASK_MAX_WAIT_RECORD_NS 0U
 /* The braking ramp starts at this step rate: the fast seek of homing. A faster axis is brought down to it at once. */
 #define STEP_GENERATOR_TASK_BRAKE_MAX_RATE_HZ 50000U
-/* DIR setup before the first STEP is at least this long; the shortest RTOS delay covers it. */
-#define STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS 1U
+/* DIR setup before the first STEP: a delay of N ticks lasts at least N-1 full ticks (the first one is cut short by the
+ * moment the call is made), so one more tick than a millisecond takes gives at least 1 ms, far above the 5 us that the
+ * drivers ask for. */
+#define STEP_GENERATOR_TASK_DIRECTION_SETTLE_TICKS (((configTICK_RATE_HZ) + 999U) / 1000U + 1U)
 
 #define STEP_GENERATOR_TASK_FLAG_BLOCK_READY (1UL << 0)
 #define STEP_GENERATOR_TASK_FLAG_STOP_RESET (1UL << 1)
@@ -37,17 +40,20 @@
     (STEP_GENERATOR_TASK_FLAG_BLOCK_READY | STEP_GENERATOR_TASK_FLAG_STOP_RESET |                                      \
         STEP_GENERATOR_TASK_FLAG_RING_HALF_RELEASED)
 
-/* The channels that move together: member 0 is X, member 1 is Y, member 2 is Z. */
-#define STEP_GENERATOR_TASK_MEMBER_COUNT 3U
-_Static_assert(STEP_GENERATOR_TASK_MEMBER_COUNT == STEP_GENERATOR_TASK_STREAM_MEMBERS, "diagnostics list every member");
-
-static const MotionAxis_t step_generator_task_member_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {
-    MOTION_AXIS_X,
-    MOTION_AXIS_Y,
-    MOTION_AXIS_Z,
-};
-/* The planner axis behind each member, in the order of the members. */
-static const uint32_t step_generator_task_member_planner_axes[STEP_GENERATOR_TASK_MEMBER_COUNT] = {0U, 1U, 2U};
+/* The members of an instance are the channels that move together: those of the printing stream are X, Y, Z and the
+ * syringe (member 3); the instances of HOME and CALIBRATE have one. This is the size of every table of an instance. */
+#define STEP_GENERATOR_TASK_MEMBER_COUNT STEP_GENERATOR_CHANNELS_PRINT_COUNT
+/* The diagnostic frame lists the three axes; the syringe has no entry of its own in it yet. */
+_Static_assert(STEP_GENERATOR_TASK_NO_AXIS == STEP_GENERATOR_CHANNELS_NO_AXIS, "one value for no axis");
+_Static_assert(
+    STEP_GENERATOR_TASK_STREAM_MEMBERS == STEP_GENERATOR_CHANNELS_AXIS_COUNT,
+    "the diagnostic frame lists the axes of the printing stream"
+);
+_Static_assert(
+    STEP_GENERATOR_TASK_MEMBER_COUNT <= STEP_STREAM_GROUP_MAX_MEMBERS &&
+        STEP_GENERATOR_TASK_MEMBER_COUNT <= STEP_STREAM_FEEDER_MAX_LANES,
+    "a group and a feeder take every member"
+);
 
 struct StepGeneratorInstance;
 
@@ -68,9 +74,13 @@ typedef struct StepGeneratorInstance {
     StepStreamGroup_t group;
     /* The queue of plan blocks this stream plays; set once at task start, NULL before it. */
     PlanBuffer_t *plan_buffer;
-    const MotionAxis_t *member_axes;
-    const uint32_t *member_planner_axes;
+    const StepGeneratorMember_t *members;
+    /* MOTION_PLAN_CHANNEL_* of each member, the form the feeder takes. */
+    const uint32_t *member_planner_channels;
     uint32_t member_count;
+    /* Policy of the instance, fixed at its definition: only the printing stream reports its progress to MotionTask
+     * (only it has moves to answer). */
+    uint8_t reports_progress;
     StepGeneratorMemberContext_t member_contexts[STEP_GENERATOR_TASK_MEMBER_COUNT];
     StepStreamAxisListener_t stream_listeners[STEP_GENERATOR_TASK_MEMBER_COUNT];
     /* 1 once the feeder is built; an instance that is not ready only stays halted. */
@@ -116,7 +126,7 @@ typedef struct StepGeneratorInstance {
     volatile uint32_t stop_unplayed_order;
 } StepGeneratorInstance_t;
 
-/* The printing stream of X, Y and Z. */
+/* The printing stream: X, Y, Z and the syringe move together in the blocks of one plan. */
 static StepGeneratorInstance_t step_generator_task_instance;
 /* The streams of HOME and CALIBRATE: one lane on one axis each, indexed by MotionAxis_t, so the axes of a command run
  * independently. */
@@ -137,12 +147,10 @@ static StepGeneratorInstance_t *const step_generator_task_instances[] = {
 /* Written once at task start and read by MotionTask and the DMA interrupt to wake the task. */
 static osThreadId_t volatile step_generator_task_thread_id;
 
-/* The stream channel of the axis; the instance lives for the whole run, so this is a lookup and no state. */
-static StepStreamAxis_t *step_generator_task_axis(void) { return step_stream_axis_get(STEP_GENERATOR_TASK_AXIS); }
-
 /* The group passes only members below its count, so the index is always inside the table. */
 static StepStreamAxis_t *step_generator_task_member_axis(const StepGeneratorInstance_t *self, uint32_t member) {
-    return step_stream_axis_get(self->member_axes[member]);
+    const StepGeneratorMember_t *const entry = &self->members[member];
+    return entry->driver->stream(entry->id);
 }
 
 static void step_generator_counter_increment(volatile uint32_t *counter) {
@@ -251,6 +259,26 @@ uint8_t step_generator_instance_is_ready(const StepGeneratorInstance_t *instance
     return instance == NULL ? 0U : instance->ready;
 }
 
+uint32_t step_generator_instance_get_max_step_rate_hz(const StepGeneratorInstance_t *instance) {
+    if (instance == NULL || instance->ready == 0U) {
+        return 0U;
+    }
+    /* The generator refuses a step interval shorter than the pulse plus the low time, or than a record. It divides the
+     * block into whole nanoseconds per step first (the interval alternates between the floor and the ceiling of the
+     * mean) and converts them to ticks after, rounding down, so a step must last at least as many whole nanoseconds as
+     * the shortest interval takes: the rate is 1e9 over that, rounded down, which keeps even the shorter interval of
+     * the alternation at or above the minimum. The ticks are never zero: the feeder config refuses a zero pulse and a
+     * zero record. */
+    const StepStreamGeneratorConfig_t *const generator = &instance->feeder.config.generator;
+    const uint64_t pulse_and_low = (uint64_t)generator->pulse_ticks + generator->low_ticks;
+    const uint64_t minimum_step_ticks =
+        generator->min_record_ticks > pulse_and_low ? generator->min_record_ticks : pulse_and_low;
+    const uint64_t nanoseconds_per_second = 1000000000ULL;
+    const uint64_t minimum_step_ns =
+        (minimum_step_ticks * nanoseconds_per_second + generator->timer_clock_hz - 1U) / generator->timer_clock_hz;
+    return (uint32_t)(nanoseconds_per_second / minimum_step_ns);
+}
+
 uint32_t step_generator_instance_reset_count(const StepGeneratorInstance_t *instance) {
     return instance == NULL ? 0U : instance->diagnostics.stop_resets;
 }
@@ -290,15 +318,17 @@ static StepStreamFeederAxisResult_t step_generator_task_group_result(StepStreamG
 static void step_generator_task_watch_moving_axes(StepGeneratorInstance_t *self) {
     const uint8_t moving_planner_axes = step_stream_feeder_get_moving_axes(&self->feeder);
     for (uint32_t member = 0U; member < self->member_count; ++member) {
-        const uint8_t moves = (uint8_t)((moving_planner_axes >> self->member_planner_axes[member]) & 1U);
-        motion_axis_hardware_set_stream_axis_watched(self->member_axes[member], moves);
+        const uint8_t moves = (uint8_t)((moving_planner_axes >> self->member_planner_channels[member]) & 1U);
+        const StepGeneratorMember_t *const entry = &self->members[member];
+        entry->driver->set_watched(entry->id, moves);
     }
 }
 
 /* No stream runs: the axes of the instance are watched again until the next stream narrows them to those it moves. */
 static void step_generator_task_watch_all_axes(const StepGeneratorInstance_t *self) {
     for (uint32_t member = 0U; member < self->member_count; ++member) {
-        motion_axis_hardware_set_stream_axis_watched(self->member_axes[member], 1U);
+        const StepGeneratorMember_t *const entry = &self->members[member];
+        entry->driver->set_watched(entry->id, 1U);
     }
 }
 
@@ -338,19 +368,18 @@ static StepStreamFeederAxisResult_t
 step_generator_task_port_set_direction(void *context, uint32_t lane, uint8_t positive) {
     const StepGeneratorInstance_t *const self = context;
     /* With task switching paused, STOP and MotionTask cannot touch the axis between the flag check and the write. */
-    MotionAxisHardwareStatus_t status = MOTION_AXIS_HARDWARE_STATUS_UNINITIALIZED;
+    uint8_t written = 0U;
     (void)osKernelLock();
     if (self->halted == 0U) {
-        /* The feeder passes lanes below the member count only; this port needs the motion axis, not the channel. */
-        status = motion_axis_hardware_set_stream_outputs(self->member_axes[lane], positive);
+        /* The feeder passes lanes below the member count only. */
+        const StepGeneratorMember_t *const entry = &self->members[lane];
+        written = entry->driver->set_direction(entry->id, positive);
     }
     (void)osKernelUnlock();
-    /* A refusal returns the status of a busy or faulted axis; a write leaves a status the axis can start from. */
-    if (status != MOTION_AXIS_HARDWARE_STATUS_READY && status != MOTION_AXIS_HARDWARE_STATUS_COMPLETE &&
-        status != MOTION_AXIS_HARDWARE_STATUS_STOPPED) {
+    if (written == 0U) {
         return STEP_STREAM_FEEDER_AXIS_ERROR;
     }
-    (void)osDelay(STEP_GENERATOR_TASK_DIRECTION_SETTLE_MS);
+    (void)osDelay(STEP_GENERATOR_TASK_DIRECTION_SETTLE_TICKS);
     return STEP_STREAM_FEEDER_AXIS_OK;
 }
 
@@ -426,7 +455,7 @@ static void step_generator_task_channel_braking(void *context) {
 static void step_generator_task_limit_reached(void *context, MotionAxis_t axis, MotionAxisHardwareStopReason_t reason) {
     StepGeneratorInstance_t *const self = context;
     for (uint32_t member = 0U; member < self->member_count; ++member) {
-        if (self->member_axes[member] == axis) {
+        if (self->members[member].reported_axis == (uint32_t)axis) {
             const uint32_t primask = step_stream_axis_enter_critical();
             step_generator_counter_increment(&self->limit_trips[member]);
             /* Only a switch the group acts on is latched: one that finds the group idle, stopping or faulted brakes
@@ -532,9 +561,11 @@ static void step_generator_task_critical_exit(void *context, uint32_t saved) {
         .context = &(instance).member_contexts[(index)],                                                               \
     }
 
-/* `instance` is the object being initialized, `axes` and `planner_axes` point into the member tables, `count` is the
- * number of members in the group. The context tables are filled for every slot; the unused ones are never read. */
-#define STEP_GENERATOR_TASK_INSTANCE_INITIAL(instance, axes, planner_axes, count)                                      \
+/* `instance` is the object being initialized, `member_table` and `planner_channels` point into the member tables,
+ * `count` is the number of members in the group (at most STEP_GENERATOR_TASK_MEMBER_COUNT, see the asserts below the
+ * definitions), `progress` is the policy flag of the instance. The context tables are filled for every slot; the unused
+ * ones are never read. */
+#define STEP_GENERATOR_TASK_INSTANCE_INITIAL(instance, member_table, planner_channels, count, progress)                \
     {                                                                                                                  \
         .group =                                                                                                       \
             {                                                                                                          \
@@ -558,45 +589,62 @@ static void step_generator_task_critical_exit(void *context, uint32_t saved) {
                     },                                                                                                 \
                 .member_count = (count),                                                                               \
             },                                                                                                         \
-        .member_axes = (axes),                                                                                         \
-        .member_planner_axes = (planner_axes),                                                                         \
+        .members = (member_table),                                                                                     \
+        .member_planner_channels = (planner_channels),                                                                 \
         .member_count = (count),                                                                                       \
+        .reports_progress = (progress),                                                                                \
         .member_contexts =                                                                                             \
             {                                                                                                          \
                 STEP_GENERATOR_TASK_MEMBER_CONTEXT(instance, 0U),                                                      \
                 STEP_GENERATOR_TASK_MEMBER_CONTEXT(instance, 1U),                                                      \
                 STEP_GENERATOR_TASK_MEMBER_CONTEXT(instance, 2U),                                                      \
+                STEP_GENERATOR_TASK_MEMBER_CONTEXT(instance, 3U),                                                      \
             },                                                                                                         \
         .stream_listeners =                                                                                            \
             {                                                                                                          \
                 STEP_GENERATOR_TASK_MEMBER_LISTENER(instance, 0U),                                                     \
                 STEP_GENERATOR_TASK_MEMBER_LISTENER(instance, 1U),                                                     \
                 STEP_GENERATOR_TASK_MEMBER_LISTENER(instance, 2U),                                                     \
+                STEP_GENERATOR_TASK_MEMBER_LISTENER(instance, 3U),                                                     \
             },                                                                                                         \
         .halt_member = STEP_GENERATOR_TASK_NO_MEMBER,                                                                  \
         .limit_member = STEP_GENERATOR_TASK_NO_MEMBER,                                                                 \
     }
 
+/* A stream of HOME or CALIBRATE: one lane on one axis. */
+#define STEP_GENERATOR_TASK_AXIS_MEMBER_COUNT 1U
 #define STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(axis)                                                                \
     STEP_GENERATOR_TASK_INSTANCE_INITIAL(                                                                              \
         step_generator_task_axis_instances[axis],                                                                      \
-        &step_generator_task_member_axes[axis],                                                                        \
-        &step_generator_task_member_planner_axes[axis],                                                                \
+        &step_generator_channels_axis_members[axis],                                                                   \
+        &step_generator_channels_axis_planner_channels[axis],                                                          \
+        STEP_GENERATOR_TASK_AXIS_MEMBER_COUNT,                                                                         \
+        0U                                                                                                             \
+    )
+
+/* The printing stream: all four channels, and it is the one that reports progress. A test builds it again with this
+ * macro. */
+#define STEP_GENERATOR_TASK_PRINT_INSTANCE_INITIAL(instance)                                                           \
+    STEP_GENERATOR_TASK_INSTANCE_INITIAL(                                                                              \
+        instance,                                                                                                      \
+        step_generator_channels_print_members,                                                                         \
+        step_generator_channels_print_planner_channels,                                                                \
+        STEP_GENERATOR_CHANNELS_PRINT_COUNT,                                                                           \
         1U                                                                                                             \
     )
 
-static StepGeneratorInstance_t step_generator_task_instance = STEP_GENERATOR_TASK_INSTANCE_INITIAL(
-    step_generator_task_instance,
-    step_generator_task_member_axes,
-    step_generator_task_member_planner_axes,
-    STEP_GENERATOR_TASK_MEMBER_COUNT
-);
+static StepGeneratorInstance_t step_generator_task_instance =
+    STEP_GENERATOR_TASK_PRINT_INSTANCE_INITIAL(step_generator_task_instance);
 
 static StepGeneratorInstance_t step_generator_task_axis_instances[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT] = {
     [MOTION_AXIS_X] = STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_X),
     [MOTION_AXIS_Y] = STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_Y),
     [MOTION_AXIS_Z] = STEP_GENERATOR_TASK_AXIS_INSTANCE_INITIAL(MOTION_AXIS_Z),
 };
+
+/* The tables of an instance hold STEP_GENERATOR_TASK_MEMBER_COUNT members, so no instance may name more. */
+_Static_assert(STEP_GENERATOR_CHANNELS_PRINT_COUNT <= STEP_GENERATOR_TASK_MEMBER_COUNT, "the printing stream fits");
+_Static_assert(STEP_GENERATOR_TASK_AXIS_MEMBER_COUNT <= STEP_GENERATOR_TASK_MEMBER_COUNT, "an axis stream fits");
 
 static void step_generator_task_publish_diagnostics(StepGeneratorInstance_t *self) {
     StepStreamFeederDiagnostics_t feeder_diagnostics;
@@ -644,9 +692,10 @@ static void step_generator_task_setup_brake(
     }
 }
 
-/* The feeder counts every record in the ticks of one clock, so the members must share the timer kernel clock. */
+/* The feeder counts every record in the ticks of one clock, so the members must share the timer kernel clock. The first
+ * member is the reference: an instance times its records by the timer of its own channels, not by that of X. */
 static uint8_t step_generator_task_member_clocks_match(const StepGeneratorInstance_t *self) {
-    const uint32_t reference_hz = step_stream_axis_get_timer_clock_hz(step_generator_task_axis());
+    const uint32_t reference_hz = step_stream_axis_get_timer_clock_hz(step_generator_task_member_axis(self, 0U));
     for (uint32_t member = 1U; member < self->member_count; ++member) {
         if (step_stream_axis_get_timer_clock_hz(step_generator_task_member_axis(self, member)) != reference_hz) {
             return 0U;
@@ -671,7 +720,7 @@ static uint8_t step_generator_task_setup_feeder(
     }
     StepStreamFeederConfig_t config;
     if (step_stream_feeder_make_config(
-            step_stream_axis_get_timer_clock_hz(step_generator_task_axis()),
+            step_stream_axis_get_timer_clock_hz(step_generator_task_member_axis(self, 0U)),
             task_config->step_pulse_width_ns,
             task_config->step_low_time_ns,
             STEP_GENERATOR_TASK_MIN_RECORD_NS,
@@ -679,7 +728,7 @@ static uint8_t step_generator_task_setup_feeder(
             STEP_GENERATOR_TASK_IDLE_RECORD_NS,
             STEP_GENERATOR_TASK_STARTUP_PERIOD_NS,
             STEP_STREAM_AXIS_HALF_RECORD_COUNT,
-            self->member_planner_axes,
+            self->member_planner_channels,
             self->member_count,
             &config
         ) != STEP_STREAM_FEEDER_STATUS_OK) {
@@ -697,12 +746,11 @@ static uint8_t step_generator_task_setup_feeder(
         .discard_blocks = step_generator_task_port_discard_blocks,
         .context = self,
     };
-    /* The ramp depends on the config only, so it is set up whether or not the feeder takes it. It belongs to the axis,
-     * not to the instance, and the printing instance covers all of them: the single-axis instances would only build the
-     * same tables again. */
-    if (self == &step_generator_task_instance) {
-        step_generator_task_setup_brake(self, task_config, &config);
-    }
+    /* The ramp depends on the config only, so it is set up whether or not the feeder takes it, and by every instance
+     * for its own channels: an instance that cannot be built (the printing stream, when a clock differs) must not leave
+     * the homing of an axis without its ramp. A channel built twice gets the same table. The syringe has no switch, so
+     * no switch starts its ramp; the group still brakes it with the axes, and without a ramp it stops at once. */
+    step_generator_task_setup_brake(self, task_config, &config);
     return (uint8_t)(step_stream_feeder_init(&self->feeder, &config, &ports) == STEP_STREAM_FEEDER_STATUS_OK);
 }
 
@@ -718,8 +766,8 @@ static void step_generator_task_release_channels(StepGeneratorInstance_t *self) 
             step_generator_task_member_axis(self, member),
             &self->member_contexts[member]
         );
-        const uint8_t limit_released =
-            motion_axis_hardware_set_stream_limit_listener(self->member_axes[member], NULL, self);
+        const StepGeneratorMember_t *const entry = &self->members[member];
+        const uint8_t limit_released = entry->driver->set_limit_listener(entry->id, NULL, self);
         if (listener_status != STEP_STREAM_AXIS_STATUS_OK || limit_released == 0U) {
             all_released = 0U;
         }
@@ -734,15 +782,13 @@ static void step_generator_task_release_channels(StepGeneratorInstance_t *self) 
  * that holds its channels takes them again without change. */
 static uint8_t step_generator_task_claim_channels(StepGeneratorInstance_t *self) {
     for (uint32_t member = 0U; member < self->member_count; ++member) {
-        const uint8_t taken = (uint8_t)(step_stream_axis_set_listener(
-                                            step_generator_task_member_axis(self, member),
-                                            &self->stream_listeners[member]
-                                        ) == STEP_STREAM_AXIS_STATUS_OK &&
-                                        motion_axis_hardware_set_stream_limit_listener(
-                                            self->member_axes[member],
-                                            step_generator_task_limit_reached,
-                                            self
-                                        ) != 0U);
+        const StepGeneratorMember_t *const entry = &self->members[member];
+        const uint8_t taken =
+            (uint8_t)(step_stream_axis_set_listener(
+                          step_generator_task_member_axis(self, member),
+                          &self->stream_listeners[member]
+                      ) == STEP_STREAM_AXIS_STATUS_OK &&
+                      entry->driver->set_limit_listener(entry->id, step_generator_task_limit_reached, self) != 0U);
         if (taken == 0U) {
             /* The release lets go of this instance's own listeners only, so the members it never took stay as they
              * are. */
@@ -841,7 +887,7 @@ static void step_generator_task_publish_progress(StepGeneratorInstance_t *self) 
     step_stream_axis_exit_critical(primask);
     /* MotionTask turns the snapshot into answers to the client; only the printing stream has moves to answer. */
     const StepGeneratorProgressListener_t listener = step_generator_task_progress_listener;
-    if (changed != 0U && listener != NULL && self == &step_generator_task_instance) {
+    if (changed != 0U && listener != NULL && self->reports_progress != 0U) {
         listener();
     }
 }
@@ -871,7 +917,7 @@ void step_generator_instance_get_progress(const StepGeneratorInstance_t *instanc
     }
     step_stream_axis_exit_critical(primask);
     progress->halt_axis =
-        member < instance->member_count ? (uint32_t)instance->member_axes[member] : STEP_GENERATOR_TASK_NO_AXIS;
+        member < instance->member_count ? instance->members[member].reported_axis : STEP_GENERATOR_TASK_NO_AXIS;
 }
 
 /* One pass over an instance: the reset requested after STOP, then the feeding. */
@@ -992,14 +1038,18 @@ void step_generator_task_get_stream_diagnostics(StepGeneratorTaskStreamDiagnosti
     diagnostics->halts_total = self->halts_total;
     diagnostics->feeder_status = self->feeder_status;
     diagnostics->feeder_phase = (uint32_t)step_stream_feeder_get_phase(&self->feeder);
-    for (uint32_t member = 0U; member < self->member_count; ++member) {
+    /* The frame lists the axes; the syringe, the member after them, has no entry of its own. */
+    for (uint32_t member = 0U; member < STEP_GENERATOR_TASK_STREAM_MEMBERS; ++member) {
         const StepStreamAxis_t *channel = step_generator_task_member_axis(self, member);
-        const MotionAxis_t axis = self->member_axes[member];
+        const StepGeneratorMember_t *const entry = &self->members[member];
+        uint32_t hardware_status = 0U;
+        uint32_t hardware_stop_reason = 0U;
+        entry->driver->get_hardware(entry->id, &hardware_status, &hardware_stop_reason);
         diagnostics->members[member] = (StepGeneratorTaskMemberDiagnostics_t){
             .channel_state = (uint32_t)step_stream_axis_get_state(channel),
             .channel_fault = (uint32_t)step_stream_axis_get_fault(channel),
-            .hardware_status = (uint32_t)motion_axis_hardware_get_status(axis),
-            .hardware_stop_reason = (uint32_t)motion_axis_hardware_get_last_stop_reason(axis),
+            .hardware_status = hardware_status,
+            .hardware_stop_reason = hardware_stop_reason,
             .limit_trips = self->limit_trips[member],
         };
     }

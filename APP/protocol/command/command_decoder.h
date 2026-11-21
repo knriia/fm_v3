@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 #define COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE 0x01U
+/* The syringe moves by e_delta steps (positive feeds, negative retracts) at e_speed steps per second. */
+#define COMMAND_MOTION_OPERATION_FLAG_DOSER_MOVE 0x02U
 /* With XYZ_MOVE: x, y, z are increments to the planned position instead of an absolute target. */
 #define COMMAND_MOTION_OPERATION_FLAG_RELATIVE 0x10U
 

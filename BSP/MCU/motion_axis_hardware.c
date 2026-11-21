@@ -1,5 +1,6 @@
 #include "motion_axis_hardware.h"
 
+#include "dwt_delay.h"
 #include "motion/motion_event_source.h"
 #include "step_stream_axis.h"
 
@@ -14,7 +15,6 @@
 #define MOTION_AXIS_NANOSECONDS_PER_SECOND 1000000000ULL
 /* Fits 32 bits, so the step interrupt divides by a step rate with the hardware divider, not a library call. */
 #define MOTION_AXIS_NANOSECONDS_PER_SECOND_U32 1000000000U
-#define MOTION_AXIS_DWT_UNLOCK_KEY 0xC5ACCE55U
 #define MOTION_AXIS_MAX_PERIOD_TICKS 65536ULL
 #define MOTION_AXIS_ISR_GUARD_TICKS 256U
 #define MOTION_AXIS_JOG_MAX_STEPS 1000000U
@@ -801,13 +801,6 @@ static volatile uint32_t *motion_axis_compare_register(TIM_TypeDef *timer, uint8
     }
 }
 
-/* The step interrupts time themselves with the DWT cycle counter. Cortex-M7 keeps DWT locked until LAR gets the key;
- * enabling it again for another axis changes nothing. */
-static void motion_axis_enable_cycle_counter(void) {
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->LAR = MOTION_AXIS_DWT_UNLOCK_KEY;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-}
 
 static void motion_axis_clear_timer_irqs(const Ctx_t *c) {
     for (uint32_t index = 0U; index < c->board->timer_irq_count; ++index) {
@@ -854,7 +847,8 @@ MotionAxisHardwareStatus_t motion_axis_hardware_init(MotionAxis_t axis, const Mo
     (void)RCC->AHB4ENR;
     __DSB();
 
-    motion_axis_enable_cycle_counter();
+    /* The step interrupts time themselves with the DWT cycle counter. */
+    dwt_delay_init();
     motion_axis_configure_gpio(c);
     motion_axis_configure_exti(c);
     motion_axis_configure_timer(c);
@@ -964,14 +958,6 @@ MotionAxisHardwareStatus_t motion_axis_hardware_start(MotionAxis_t axis) {
     return motion_axis_start_event(c, &first_event);
 }
 
-/* Busy-waits with the DWT cycle counter; only for the few microseconds the driver data sheet asks for. */
-static void motion_axis_wait_ns(uint32_t ns) {
-    const uint64_t cycles = ((uint64_t)ns * SystemCoreClock + 999999999ULL) / 1000000000ULL;
-    const uint32_t start_cycles = DWT->CYCCNT;
-    while ((uint32_t)(DWT->CYCCNT - start_cycles) < (uint32_t)cycles) {
-    }
-}
-
 MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t axis, uint8_t positive_direction) {
     Ctx_t *c = motion_axis_context(axis);
     if (c == NULL) {
@@ -981,7 +967,7 @@ MotionAxisHardwareStatus_t motion_axis_hardware_set_stream_outputs(MotionAxis_t 
         return c->status;
     }
     motion_axis_set_enabled(c, 1U);
-    motion_axis_wait_ns(c->config.enable_setup_ns);
+    dwt_delay_ns(c->config.enable_setup_ns);
     motion_axis_set_direction(c, positive_direction != 0U ? 1U : 0U);
     /* A new planned move: the switch point of an earlier one is stale. */
     c->limit_latched = 0U;

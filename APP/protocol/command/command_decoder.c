@@ -59,7 +59,8 @@ static uint16_t command_decoder_validate_command(const CommandRequestDTO_t *requ
         const uint16_t spindle_pwm = command_decoder_read_u16_le(&payload[26]);
         const uint16_t laser_pwm = command_decoder_read_u16_le(&payload[28]);
         if (((operation_flags & COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE) != 0U && speed == 0U) ||
-            ((operation_flags & 0x02U) != 0U && e_speed == 0U) || spindle_pwm > 10000U || laser_pwm > 10000U) {
+            ((operation_flags & COMMAND_MOTION_OPERATION_FLAG_DOSER_MOVE) != 0U && e_speed == 0U) ||
+            spindle_pwm > 10000U || laser_pwm > 10000U) {
             return COMMAND_ERROR_INVALID_PARAMETER;
         }
         return 0U;

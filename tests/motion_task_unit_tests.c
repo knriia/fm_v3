@@ -476,18 +476,22 @@ static PlanBuffer_t *fake_generator_queue(const StepGeneratorInstance_t *instanc
     return index == TEST_PRINT_GENERATOR ? &test_plan_buffer : &fake_generators[index].queue;
 }
 
+/* Marks the instance busy when its queue has taken a block since the last call. */
+static void fake_generator_note_block(StepGeneratorInstance_t *generator) {
+    PlanBufferDiagnostics_t diagnostics = {0};
+    (void)plan_buffer_get_diagnostics(fake_generator_queue(generator), &diagnostics);
+    if (diagnostics.enqueued_total > generator->enqueued_seen) {
+        generator->busy = 1U;
+    }
+    generator->enqueued_seen = diagnostics.enqueued_total;
+}
+
 /* A block queued for an instance makes it busy until its stream has ended or STOP has reset it. The real task finds
  * the instance by its queue; the fake does the same: it is the one whose queue has taken a block since the last call. */
 void step_generator_task_notify_block_ready(void) {
     ++test_block_ready_notifications;
     for (uint32_t index = 0U; index < TEST_GENERATOR_COUNT; ++index) {
-        StepGeneratorInstance_t *const generator = &fake_generators[index];
-        PlanBufferDiagnostics_t diagnostics = {0};
-        (void)plan_buffer_get_diagnostics(fake_generator_queue(generator), &diagnostics);
-        if (diagnostics.enqueued_total > generator->enqueued_seen) {
-            generator->busy = 1U;
-        }
-        generator->enqueued_seen = diagnostics.enqueued_total;
+        fake_generator_note_block(&fake_generators[index]);
     }
 }
 
@@ -518,6 +522,20 @@ uint8_t step_generator_instance_is_halted(const StepGeneratorInstance_t *instanc
 uint8_t step_generator_instance_is_ready(const StepGeneratorInstance_t *instance) { return instance->ready; }
 
 uint32_t step_generator_instance_reset_count(const StepGeneratorInstance_t *instance) { return instance->reset_count; }
+
+/* The highest STEP rate the generator of the printing stream plays, as the test sets it; large by default, so that a test
+ * that does not care about the rate is not limited by it. Like the real one it is 0 for an instance that is not ready. */
+#define TEST_GENERATOR_RATE_DEFAULT_HZ 1000000U
+static uint32_t test_generator_max_step_rate_hz;
+static uint32_t test_generator_rate_calls;
+
+uint32_t step_generator_instance_get_max_step_rate_hz(const StepGeneratorInstance_t *instance) {
+    ++test_generator_rate_calls;
+    if (instance == NULL || instance->ready == 0U) {
+        return 0U;
+    }
+    return test_generator_max_step_rate_hz;
+}
 
 void step_generator_instance_halt(StepGeneratorInstance_t *instance) { ++instance->halts; }
 
@@ -863,6 +881,8 @@ static void reset_receive_script(void) {
             TEST_AXIS_QUEUE_CAPACITY
         );
     }
+    test_generator_max_step_rate_hz = TEST_GENERATOR_RATE_DEFAULT_HZ;
+    test_generator_rate_calls = 0U;
     test_receive_hook = NULL;
     test_progress_read_hook = NULL;
     test_status_read_hook = NULL;
@@ -4932,6 +4952,22 @@ static void test_not_ready_print_instance_refuses_only_moves(void) {
     expect_result_at(0U, 725U, TEST_ERROR_NOT_CONFIGURED, "a move is not configured, not halted, without a feeder");
 }
 
+static void request_stop_at_read_1(uint32_t read_index) {
+    if (read_index == 1U) {
+        stop_from_the_network_task();
+    }
+}
+
+static void run_commands_with_hook(
+    MotionTaskContext_t *context,
+    const CommandDTO_t *commands,
+    uint32_t count,
+    void (*hook)(uint32_t read_index)
+) {
+    test_receive_hook = hook;
+    run_commands(context, commands, count);
+}
+
 /* ---- Final results of the planned moves: DONE COMPLETED or ERROR STREAM_INTERRUPTED ---- */
 
 #define TEST_DONE_COMPLETED 0x0002U
@@ -6539,6 +6575,900 @@ static void test_a_woken_wait_reads_the_queue_again(void) {
     expect_u32(test_receive_calls, 3U, "each wake-up is followed by a read of the queue");
 }
 
+/* ---- DOSER_MOVE: a move of the syringe alone goes through the printing queue like an XYZ move ---- */
+
+#define TEST_ERROR_STEP_RATE_TOO_HIGH 0x0129U
+#define TEST_ERROR_DOSER_STEPS_TOO_MANY 0x012AU
+
+static CommandDTO_t doser_move_with_flags(uint32_t sequence, uint8_t flags, int32_t e_delta, uint32_t e_speed) {
+    return (CommandDTO_t){
+        .sequence = sequence,
+        .code = COMMAND_CODE_MOTION_OPERATION,
+        .parameters.motion_operation =
+            {
+                .operation_flags = flags,
+                /* Values an XYZ move would plan with, so a command that fell into the XYZ branch would be queued. */
+                .x = 1000,
+                .speed = 1000U,
+                .e_delta = e_delta,
+                .e_speed = e_speed,
+            },
+    };
+}
+
+static CommandDTO_t doser_move(uint32_t sequence, int32_t e_delta, uint32_t e_speed) {
+    return doser_move_with_flags(sequence, COMMAND_MOTION_OPERATION_FLAG_DOSER_MOVE, e_delta, e_speed);
+}
+
+/* A context with a planned position, homing and syringe remainder that a syringe move must leave alone. */
+static MotionTaskContext_t doser_test_context(void) {
+    MotionTaskContext_t context = valid_motion_context();
+    context.machine_state.position_um[0] = 100;
+    context.machine_state.position_um[1] = 200;
+    context.machine_state.position_um[2] = 300;
+    context.machine_state.homed_axes_mask = MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK;
+    context.machine_state.syringe_step_remainder = 7U;
+    return context;
+}
+
+static void expect_doser_context_untouched(const MotionTaskContext_t *context, const char *message) {
+    expect_i64(context->machine_state.position_um[0], 100, message);
+    expect_i64(context->machine_state.position_um[1], 200, message);
+    expect_i64(context->machine_state.position_um[2], 300, message);
+    expect_u32(context->machine_state.homed_axes_mask, MOTION_PLANNER_AXIS_X_MASK | MOTION_PLANNER_AXIS_Z_MASK, message);
+    expect_u32(context->machine_state.syringe_step_remainder, 7U, message);
+}
+
+/* The queues of the single-axis instances took no block. */
+static void expect_axis_queues_empty(const char *message) {
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(enqueued_blocks(&fake_generators[axis].queue), 0U, message);
+        expect_u32(queued_blocks(&fake_generators[axis].queue), 0U, message);
+    }
+}
+
+/* Nothing was halted, reset, flushed or stopped: a refusal of one command is not a STOP. */
+static void expect_nothing_was_stopped(const char *message) {
+    expect_u32(test_generator_all_halts, 0U, message);
+    expect_u32(test_generator_all_resumes, 0U, message);
+    expect_u32(gen_print.halts, 0U, message);
+    expect_u32(gen_print.resumes, 0U, message);
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        expect_u32(fake_generators[axis].halts, 0U, message);
+        expect_u32(fake_generators[axis].resumes, 0U, message);
+        expect_u32(fake_axes[axis].stop_requests, 0U, message);
+    }
+    expect_u32(test_discard_calls, 0U, message);
+    expect_u32(test_discard_pending_calls, 0U, message);
+    expect_u32(test_flush_calls, 0U, message);
+}
+
+/* A refused move changes nothing: no block in any queue, no wake-up of the generator, no planner call, no halt. */
+static void expect_doser_refusal_changes_nothing(const char *message) {
+    expect_u32(enqueued_blocks(&test_plan_buffer), 0U, message);
+    expect_u32(queued_blocks(&test_plan_buffer), 0U, message);
+    expect_axis_queues_empty(message);
+    expect_u32(test_block_ready_notifications, 0U, message);
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, message);
+    expect_nothing_was_stopped(message);
+}
+
+/* The order that the next move accepted by MotionTask gets. The tracker numbers on across runs and STOP (reset keeps the
+ * count, so a stale order can never be taken for a new one), so the number is learned from a move that is run and read
+ * first: the next accepted move gets the following order (0 is never used). The run is erased by the test's own
+ * reset_receive_script. */
+static uint32_t order_of_the_next_move(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t probe = doser_move(1U, 1, 1000U);
+    run_commands(&context, &probe, 1U);
+    MotionPlanBlock_t block = {0};
+    expect_u32(plan_buffer_try_pop(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the probe block is queued");
+    return block.order + 1U != 0U ? block.order + 1U : 1U;
+}
+
+/* Checks the block of a syringe move, with the order that the tracker gave it. */
+static void expect_doser_block(
+    const MotionPlanBlock_t *block,
+    uint32_t sequence,
+    int64_t step_delta,
+    uint64_t step_count,
+    uint32_t rate_hz,
+    uint8_t positive_direction_mask,
+    uint32_t expected_order
+) {
+    expect_u32(block->sequence, sequence, "the block carries the sequence of the command");
+    expect_i64(block->step_delta[0], 0, "X does not move");
+    expect_i64(block->step_delta[1], 0, "Y does not move");
+    expect_i64(block->step_delta[2], 0, "Z does not move");
+    expect_i64(block->step_delta[MOTION_PLAN_CHANNEL_SYRINGE], step_delta, "the syringe lane has the signed steps");
+    expect_i64((int64_t)block->master_step_count, (int64_t)step_count, "the step count is the magnitude of the steps");
+    expect_i64((int64_t)block->step_event_rate_numerator, (int64_t)rate_hz, "the rate is the speed of the command");
+    expect_i64((int64_t)block->step_event_rate_denominator, 1, "the rate is steps per second");
+    expect_u32(block->moving_axes_mask, 0x08U, "only the syringe lane moves");
+    expect_u32(block->positive_direction_mask, positive_direction_mask, "the direction follows the sign of the steps");
+    expect_i64((int64_t)block->path_length_um, 0, "the syringe move has no path");
+    expect_u32(block->feedrate_um_per_s, 0U, "the syringe move has no feedrate");
+    expect_u32(block->order, expected_order, "the tracker numbered the block");
+}
+
+static MotionPlanBlock_t plan_block_at(uint32_t offset) {
+    MotionPlanBlock_t block = {0};
+    const PlanBufferStatus_t status =
+        plan_buffer_try_peek(&test_plan_buffer, plan_buffer_get_epoch(&test_plan_buffer), offset, &block);
+    expect_u32(status, PLAN_BUFFER_STATUS_OK, "the printing queue holds a block at the offset");
+    return block;
+}
+
+typedef struct {
+    uint32_t sequence;
+    int32_t e_delta;
+    uint32_t e_speed;
+    uint64_t step_count;
+    uint8_t positive_direction_mask;
+} TestDoserMove_t;
+
+/* The context allows 50000 step events per second, the generator 1000000, and the stroke is not limited. */
+static const TestDoserMove_t test_doser_moves[] = {
+    {500U, 1200, 800U, 1200U, 0x08U},
+    {501U, -3000, 50000U, 3000U, 0x00U},
+    {502U, INT32_MIN, 1U, 2147483648U, 0x00U},
+    {503U, INT32_MAX, 50000U, 2147483647U, 0x08U},
+    {504U, 1, 1U, 1U, 0x08U},
+    {505U, -1, 49999U, 1U, 0x00U},
+};
+
+static void test_doser_move_queues_one_block_in_the_print_queue(void) {
+    for (uint32_t index = 0U; index < sizeof(test_doser_moves) / sizeof(test_doser_moves[0]); ++index) {
+        const TestDoserMove_t *move = &test_doser_moves[index];
+        const uint32_t expected_order = order_of_the_next_move();
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        const CommandDTO_t command = doser_move(move->sequence, move->e_delta, move->e_speed);
+        run_commands(&context, &command, 1U);
+
+        expect_u32(test_result_count, 1U, "the syringe move is answered once");
+        expect_done_at(0U, move->sequence, COMMAND_DONE_ACCEPTED, "the syringe move is accepted");
+        expect_u32(enqueued_blocks(&test_plan_buffer), 1U, "one block went into the printing queue");
+        expect_u32(queued_blocks(&test_plan_buffer), 1U, "the block waits for the printing stream");
+        expect_u32(test_block_ready_notifications, 1U, "the generator is told about the block once");
+        MotionPlanBlock_t block;
+        (void)memset(&block, 0x5A, sizeof(block));
+        expect_u32(plan_buffer_try_pop(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the queued block is read back");
+        expect_doser_block(
+            &block,
+            move->sequence,
+            move->e_delta,
+            move->step_count,
+            move->e_speed,
+            move->positive_direction_mask,
+            expected_order
+        );
+        expect_axis_queues_empty("no single-axis queue takes the syringe move");
+        expect_u32(motion_task_test_get_planner_call_count(), 0U, "the planner is not asked");
+        expect_u32(test_generator_rate_calls, 1U, "the generator of the printing stream is asked for its rate limit once");
+        expect_doser_context_untouched(&context, "a syringe move changes no planned position or remainder");
+        MotionTaskDiagnostics diagnostics = {0};
+        motion_task_get_diagnostics(&diagnostics);
+        expect_u32(diagnostics.planner_calls, 0U, "a syringe move is not a planner call");
+        expect_nothing_was_stopped("an accepted syringe move stops nothing");
+    }
+}
+
+/* The limit is the lower of the planner's and the generator's: each is checked on its own side of the other. */
+static void test_doser_rate_is_limited_by_the_lower_of_the_generator_and_the_planner(void) {
+    /* The generator plays less than the planner allows: 133333 passes, 133334 does not. */
+    uint32_t expected_order = order_of_the_next_move();
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    context.planner_config.max_step_event_rate_hz = 150000U;
+    test_generator_max_step_rate_hz = 133333U;
+    const CommandDTO_t generator_limited[] = {
+        doser_move(510U, 100, 133334U),
+        doser_move(511U, 100, 133333U),
+    };
+    run_commands(&context, generator_limited, 2U);
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 510U, TEST_ERROR_STEP_RATE_TOO_HIGH, "a rate above the generator limit is STEP_RATE_TOO_HIGH");
+    expect_done_at(1U, 511U, COMMAND_DONE_ACCEPTED, "a rate equal to the generator limit is accepted");
+    expect_u32(enqueued_blocks(&test_plan_buffer), 1U, "only the move within the limit is queued");
+    MotionPlanBlock_t block;
+    expect_u32(plan_buffer_try_pop(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the accepted block is queued");
+    expect_doser_block(&block, 511U, 100, 100U, 133333U, 0x08U, expected_order);
+    expect_u32(test_block_ready_notifications, 1U, "the generator is woken only for the accepted move");
+    expect_nothing_was_stopped("the refused rate stops nothing");
+
+    /* The planner allows less than the generator plays: 150000 passes, 150001 does not. */
+    expected_order = order_of_the_next_move();
+    reset_receive_script();
+    context = doser_test_context();
+    context.planner_config.max_step_event_rate_hz = 150000U;
+    test_generator_max_step_rate_hz = 200000U;
+    const CommandDTO_t planner_limited[] = {
+        doser_move(512U, -100, 150001U),
+        doser_move(513U, -100, 150000U),
+    };
+    run_commands(&context, planner_limited, 2U);
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 512U, TEST_ERROR_STEP_RATE_TOO_HIGH, "a rate above the planner limit is STEP_RATE_TOO_HIGH");
+    expect_done_at(1U, 513U, COMMAND_DONE_ACCEPTED, "a rate equal to the planner limit is accepted");
+    expect_u32(enqueued_blocks(&test_plan_buffer), 1U, "only the move within the limit is queued");
+    expect_u32(plan_buffer_try_pop(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the accepted block is queued");
+    expect_doser_block(&block, 513U, -100, 100U, 150000U, 0x00U, expected_order);
+    expect_doser_context_untouched(&context, "no syringe move changes the planned position");
+
+    /* Equal limits. */
+    reset_receive_script();
+    context = doser_test_context();
+    context.planner_config.max_step_event_rate_hz = 70000U;
+    test_generator_max_step_rate_hz = 70000U;
+    const CommandDTO_t equal_limits[] = {
+        doser_move(514U, 5, 70001U),
+        doser_move(515U, 5, 70000U),
+    };
+    run_commands(&context, equal_limits, 2U);
+    expect_result_at(0U, 514U, TEST_ERROR_STEP_RATE_TOO_HIGH, "above equal limits is refused");
+    expect_done_at(1U, 515U, COMMAND_DONE_ACCEPTED, "at equal limits is accepted");
+}
+
+/* A limit of 0 (nothing configured, or a generator that knows no timing) refuses every rate; it is no invalid parameter. */
+static void test_doser_rate_with_a_zero_limit_is_too_high(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    context.planner_config.max_step_event_rate_hz = 0U;
+    const CommandDTO_t planner_zero = doser_move(516U, 100, 1U);
+    run_commands(&context, &planner_zero, 1U);
+    expect_u32(test_result_count, 1U, "the command is answered once");
+    expect_result_at(0U, 516U, TEST_ERROR_STEP_RATE_TOO_HIGH, "without a configured planner limit every rate is too high");
+    expect_doser_refusal_changes_nothing("nothing is queued");
+
+    reset_receive_script();
+    context = doser_test_context();
+    test_generator_max_step_rate_hz = 0U;
+    const CommandDTO_t generator_zero = doser_move(517U, 100, 1U);
+    run_commands(&context, &generator_zero, 1U);
+    expect_u32(test_result_count, 1U, "the command is answered once");
+    expect_result_at(0U, 517U, TEST_ERROR_STEP_RATE_TOO_HIGH, "a generator without a rate refuses every rate");
+    expect_doser_refusal_changes_nothing("nothing is queued");
+    expect_doser_context_untouched(&context, "the planned position is unchanged");
+}
+
+/* The decoder keeps a zero rate out; should one arrive, it is an invalid parameter, also with zero steps. */
+static void test_doser_move_with_a_zero_rate_is_an_invalid_parameter(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    const CommandDTO_t commands[] = {
+        doser_move(518U, 100, 0U),
+        doser_move(519U, 0, 0U),
+    };
+    run_commands(&context, commands, 2U);
+
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 518U, TEST_ERROR_INVALID_PARAMETER, "a zero rate is an invalid parameter");
+    expect_result_at(1U, 519U, TEST_ERROR_INVALID_PARAMETER, "a zero rate wins over zero steps");
+    expect_doser_refusal_changes_nothing("nothing is queued");
+}
+
+/* A rate above the limit is a mistake of the command, not of the machine state: nothing is stopped or emptied, and the
+ * command behind it is served. */
+static void test_doser_rate_refusal_does_not_stop_or_empty_anything(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    const MotionPlanBlock_t pending = {.sequence = 90U};
+    expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending), PLAN_BUFFER_STATUS_OK, "a printing block waits");
+    expect_u32(plan_buffer_try_push(&gen_x.queue, &pending), PLAN_BUFFER_STATUS_OK, "an X block waits");
+    const CommandDTO_t commands[] = {
+        doser_move(520U, 100, 50001U),
+        doser_move(521U, -200, 1000U),
+    };
+    run_commands(&context, commands, 2U);
+
+    expect_u32(test_result_count, 2U, "both commands are answered");
+    expect_result_at(0U, 520U, TEST_ERROR_STEP_RATE_TOO_HIGH, "the refused rate is answered with its own code");
+    expect_done_at(1U, 521U, COMMAND_DONE_ACCEPTED, "the command behind the refusal is served");
+    expect_nothing_was_stopped("a refused rate is no planner refusal: nothing is stopped or reset");
+    expect_u32(queued_blocks(&test_plan_buffer), 2U, "the pending block stays and the second move is queued behind it");
+    expect_u32(cancelled_blocks(&test_plan_buffer), 0U, "no printing block is cancelled");
+    expect_u32(queued_blocks(&gen_x.queue), 1U, "the X block stays");
+    expect_u32(cancelled_blocks(&gen_x.queue), 0U, "the X block is not cancelled");
+    expect_u32(test_block_ready_notifications, 1U, "only the accepted move wakes the generator");
+    expect_doser_context_untouched(&context, "the planned position is unchanged");
+}
+
+static void test_doser_move_of_zero_steps_is_already_at_target(void) {
+    /* The second case has a rate above the limit: with nothing to move the answer is still ALREADY_AT_TARGET. */
+    const uint32_t rates[] = {1000U, 60000U};
+    for (uint32_t index = 0U; index < sizeof(rates) / sizeof(rates[0]); ++index) {
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        const CommandDTO_t command = doser_move(530U + index, 0, rates[index]);
+        run_commands(&context, &command, 1U);
+
+        expect_u32(test_result_count, 1U, "the command is answered once");
+        expect_done_at(0U, 530U + index, TEST_DONE_ALREADY_AT_TARGET, "no steps is DONE ALREADY_AT_TARGET");
+        expect_doser_refusal_changes_nothing("no block is queued for zero steps");
+        expect_doser_context_untouched(&context, "the planned position is unchanged");
+    }
+}
+
+typedef struct {
+    uint32_t limit;
+    int32_t e_delta;
+    uint8_t accepted;
+} TestDoserStroke_t;
+
+/* The stroke limit counts the magnitude of the steps: equal passes, one more does not, the sign does not matter. */
+static const TestDoserStroke_t test_doser_strokes[] = {
+    {0U, INT32_MAX, 1U},
+    {0U, INT32_MIN, 1U},
+    {1000U, 1000, 1U},
+    {1000U, 1001, 0U},
+    {1000U, -1000, 1U},
+    {1000U, -1001, 0U},
+    {1000U, 1, 1U},
+    {1000U, -1, 1U},
+    {1000U, INT32_MAX, 0U},
+    {1000U, INT32_MIN, 0U},
+    {1U, 1, 1U},
+    {1U, -1, 1U},
+    {1U, 2, 0U},
+    {1U, -2, 0U},
+    {2147483647U, INT32_MAX, 1U},
+    {2147483647U, INT32_MIN, 0U},
+    {2147483648U, INT32_MIN, 1U},
+    {UINT32_MAX, INT32_MIN, 1U},
+};
+
+static void test_doser_stroke_limit_counts_the_magnitude_of_the_steps(void) {
+    for (uint32_t index = 0U; index < sizeof(test_doser_strokes) / sizeof(test_doser_strokes[0]); ++index) {
+        const TestDoserStroke_t *stroke = &test_doser_strokes[index];
+        const uint32_t expected_order = order_of_the_next_move();
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        context.doser_max_step_count = stroke->limit;
+        const CommandDTO_t command = doser_move(1000U + index, stroke->e_delta, 1000U);
+        run_commands(&context, &command, 1U);
+
+        expect_u32(test_result_count, 1U, "the command is answered once");
+        if (stroke->accepted != 0U) {
+            expect_done_at(0U, 1000U + index, COMMAND_DONE_ACCEPTED, "a move within the stroke is accepted");
+            MotionPlanBlock_t block;
+            expect_u32(plan_buffer_try_pop(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the block is queued");
+            const int64_t signed_steps = stroke->e_delta;
+            expect_doser_block(
+                &block,
+                1000U + index,
+                signed_steps,
+                (uint64_t)(signed_steps < 0 ? -signed_steps : signed_steps),
+                1000U,
+                stroke->e_delta > 0 ? 0x08U : 0x00U,
+                expected_order
+            );
+        } else {
+            expect_result_at(0U, 1000U + index, TEST_ERROR_DOSER_STEPS_TOO_MANY, "a move beyond the stroke is refused");
+            expect_doser_refusal_changes_nothing("a move beyond the stroke queues nothing");
+        }
+        expect_doser_context_untouched(&context, "the stroke check changes no planned position");
+    }
+}
+
+/* The stroke is checked before the rate and before the zero-step answer; a refusal stops nothing. */
+static void test_doser_stroke_refusal_comes_before_the_other_checks(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    context.doser_max_step_count = 100U;
+    const CommandDTO_t commands[] = {
+        /* More steps than the stroke and a rate above the limit. */
+        doser_move(1100U, 101, 50001U),
+        /* More steps than the stroke and a zero rate. */
+        doser_move(1101U, -101, 0U),
+        /* No steps: nothing to check against the stroke, the rate is above the limit. */
+        doser_move(1102U, 0, 50001U),
+        /* The command behind the refusals is served. */
+        doser_move(1103U, 100, 1000U),
+    };
+    run_commands(&context, commands, 4U);
+
+    expect_u32(test_result_count, 4U, "every command is answered once");
+    expect_result_at(0U, 1100U, TEST_ERROR_DOSER_STEPS_TOO_MANY, "the stroke is refused before the rate");
+    expect_result_at(1U, 1101U, TEST_ERROR_DOSER_STEPS_TOO_MANY, "the stroke is refused before the zero rate");
+    expect_done_at(2U, 1102U, TEST_DONE_ALREADY_AT_TARGET, "zero steps is within every stroke");
+    expect_done_at(3U, 1103U, COMMAND_DONE_ACCEPTED, "the command behind the refusals is served");
+    expect_u32(enqueued_blocks(&test_plan_buffer), 1U, "only the last move is queued");
+    expect_nothing_was_stopped("a refused stroke stops nothing");
+    expect_axis_queues_empty("no single-axis queue takes a block");
+    expect_u32(test_block_ready_notifications, 1U, "only the accepted move wakes the generator");
+}
+
+static void test_doser_move_combined_with_other_flags_is_not_supported(void) {
+    /* XYZ + doser, doser + 0x04, doser + 0x08, doser + relative, every flag. */
+    const uint8_t flags[] = {0x03U, 0x06U, 0x0AU, 0x12U, 0xFFU};
+    for (uint32_t index = 0U; index < sizeof(flags) / sizeof(flags[0]); ++index) {
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        const CommandDTO_t command = doser_move_with_flags(540U + index, flags[index], 500, 1000U);
+        run_commands(&context, &command, 1U);
+
+        expect_u32(test_result_count, 1U, "the command is answered once");
+        expect_result_at(0U, 540U + index, TEST_ERROR_NOT_SUPPORTED, "the doser part next to other flags is refused");
+        expect_doser_refusal_changes_nothing("nothing is queued");
+        expect_doser_context_untouched(&context, "the planned position is unchanged");
+    }
+
+    /* The refusal comes before the state of the machine: without a context, with a halted stream or not ready. */
+    reset_receive_script();
+    const CommandDTO_t no_context = doser_move_with_flags(550U, 0x03U, 500, 1000U);
+    run_commands(NULL, &no_context, 1U);
+    expect_result_at(0U, 550U, TEST_ERROR_NOT_SUPPORTED, "the combination is refused before the missing context");
+
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    gen_print.halted = 1U;
+    const CommandDTO_t halted = doser_move_with_flags(551U, 0x03U, 500, 1000U);
+    run_commands(&context, &halted, 1U);
+    expect_result_at(0U, 551U, TEST_ERROR_NOT_SUPPORTED, "the combination is refused before the halted stream");
+}
+
+static void test_doser_move_is_not_configured_without_a_context_or_a_feeder(void) {
+    reset_receive_script();
+    const CommandDTO_t command = doser_move(560U, 100, 1000U);
+    run_commands(NULL, &command, 1U);
+    expect_u32(test_result_count, 1U, "the command is answered once");
+    expect_result_at(0U, 560U, TEST_ERROR_NOT_CONFIGURED, "a syringe move without a context is not configured");
+    expect_doser_refusal_changes_nothing("nothing is queued");
+
+    /* The printing instance has no feeder: nothing would ever play the block. Halted and not ready is still a missing
+     * feeder, not a stream that STOP could lift. */
+    const uint8_t halted_values[] = {0U, 1U};
+    for (uint32_t index = 0U; index < sizeof(halted_values) / sizeof(halted_values[0]); ++index) {
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        gen_print.ready = 0U;
+        gen_print.halted = halted_values[index];
+        const CommandDTO_t not_ready = doser_move(561U + index, 100, 1000U);
+        run_commands(&context, &not_ready, 1U);
+
+        expect_u32(test_result_count, 1U, "the command is answered once");
+        expect_result_at(0U, 561U + index, TEST_ERROR_NOT_CONFIGURED, "a printing stream without a feeder is not configured");
+        expect_doser_refusal_changes_nothing("nothing is queued for a stream that plays nothing");
+        expect_doser_context_untouched(&context, "the planned position is unchanged");
+    }
+}
+
+static void test_doser_move_is_refused_while_the_printing_stream_is_halted(void) {
+    /* A busy halted stream is reported as halted: STOP is what the client needs. */
+    const uint8_t busy_values[] = {0U, 1U};
+    for (uint32_t index = 0U; index < sizeof(busy_values) / sizeof(busy_values[0]); ++index) {
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        const MotionPlanBlock_t pending = {.sequence = 90U};
+        expect_u32(plan_buffer_try_push(&test_plan_buffer, &pending), PLAN_BUFFER_STATUS_OK, "a plan is pending");
+        gen_print.halted = 1U;
+        gen_print.busy = busy_values[index];
+        const CommandDTO_t command = doser_move(570U + index, 100, 1000U);
+        run_commands(&context, &command, 1U);
+
+        expect_u32(test_result_count, 1U, "the command is answered once");
+        expect_result_at(0U, 570U + index, TEST_ERROR_STREAM_HALTED, "a halted printing stream refuses the move");
+        expect_u32(queued_blocks(&test_plan_buffer), 1U, "the pending plan stays and no block is added");
+        expect_u32(enqueued_blocks(&test_plan_buffer), 1U, "nothing is enqueued");
+        expect_u32(test_block_ready_notifications, 0U, "the generator is not woken");
+        expect_axis_queues_empty("no single-axis queue takes the move");
+        expect_nothing_was_stopped("the refusal stops nothing");
+        expect_doser_context_untouched(&context, "the planned position is unchanged");
+    }
+
+    /* The halt is reported before a busy axis. */
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    gen_print.halted = 1U;
+    gen_x.busy = 1U;
+    const CommandDTO_t command = doser_move(572U, 100, 1000U);
+    run_commands(&context, &command, 1U);
+    expect_result_at(0U, 572U, TEST_ERROR_STREAM_HALTED, "the halted stream is reported before a busy axis");
+
+    /* Only an axis instance is halted: the printing stream decides, and it accepts. */
+    reset_receive_script();
+    context = doser_test_context();
+    gen_x.halted = 1U;
+    gen_y.halted = 1U;
+    gen_z.halted = 1U;
+    const CommandDTO_t accepted = doser_move(573U, 100, 1000U);
+    run_commands(&context, &accepted, 1U);
+    expect_done_at(0U, 573U, COMMAND_DONE_ACCEPTED, "only the printing stream decides the refusal");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the move is queued");
+}
+
+static void test_doser_move_is_refused_while_an_axis_stream_is_busy(void) {
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        reset_receive_script();
+        MotionTaskContext_t context = doser_test_context();
+        fake_generators[axis].busy = 1U;
+        const CommandDTO_t command = doser_move(580U + axis, 100, 1000U);
+        run_commands(&context, &command, 1U);
+
+        expect_u32(test_result_count, 1U, "the command is answered once");
+        expect_result_at(0U, 580U + axis, TEST_ERROR_AXIS_BUSY, "a busy single-axis stream refuses the syringe move");
+        expect_doser_refusal_changes_nothing("nothing is queued while an axis stream plays");
+        expect_doser_context_untouched(&context, "the planned position is unchanged");
+    }
+
+    /* A busy axis is reported before a rate or a stroke that the move breaks. */
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    context.doser_max_step_count = 10U;
+    gen_y.busy = 1U;
+    const CommandDTO_t command = doser_move(583U, 100, 60000U);
+    run_commands(&context, &command, 1U);
+    expect_result_at(0U, 583U, TEST_ERROR_AXIS_BUSY, "a busy axis is reported before the stroke and the rate");
+}
+
+/* The printing stream being busy is no refusal: the syringe move queues behind what it plays, in order. */
+static void test_doser_move_is_accepted_while_the_printing_stream_plays(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    gen_print.busy = 1U;
+    const CommandDTO_t command = doser_move(585U, 100, 1000U);
+    run_commands(&context, &command, 1U);
+
+    expect_u32(test_result_count, 1U, "the command is answered once");
+    expect_done_at(0U, 585U, COMMAND_DONE_ACCEPTED, "a busy printing stream still takes the syringe move");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "the block is queued");
+    expect_u32(test_block_ready_notifications, 1U, "the generator is woken");
+}
+
+/* HOME or CALIBRATE of any axis holds its timers, and the printing stream takes all of them: the move is refused. */
+static void test_doser_move_is_refused_while_any_axis_homes(void) {
+    const CommandDTO_t *const homes[MOTION_AXIS_HARDWARE_COUNT] = {
+        &test_home_x_command,
+        &test_home_y_command,
+        &test_home_z_command,
+    };
+    const CommandDTO_t *const calibrations[MOTION_AXIS_HARDWARE_COUNT] = {
+        &test_calibrate_x_command,
+        &test_calibrate_y_command,
+        &test_calibrate_z_command,
+    };
+    for (uint32_t axis = 0U; axis < (uint32_t)MOTION_AXIS_HARDWARE_COUNT; ++axis) {
+        for (uint32_t calibrate = 0U; calibrate < 2U; ++calibrate) {
+            reset_receive_script();
+            MotionTaskContext_t context = valid_motion_context();
+            const CommandDTO_t doser = doser_move(590U + axis * 2U + calibrate, 100, 1000U);
+            script_read(0U, osOK, calibrate != 0U ? calibrations[axis] : homes[axis]);
+            script_read(1U, osOK, &doser);
+            test_block_when_empty = 1U;
+            (void)run_motion_task_until_scripted_stop(&context);
+
+            expect_u32(fake_axes[axis].bench_starts, 1U, "the homing of the axis is running");
+            expect_u32(test_result_count, 2U, "HOME and the syringe move are answered");
+            expect_result_at(1U, 590U + axis * 2U + calibrate, TEST_ERROR_AXIS_BUSY, "the syringe move finds the axis busy");
+            expect_u32(enqueued_blocks(&test_plan_buffer), 0U, "the syringe move is not queued while an axis homes");
+            expect_u32(motion_task_test_get_planner_call_count(), 0U, "nothing is planned");
+            expect_u32(test_block_ready_notifications, 1U, "only the seek of the homing woke the generator");
+            expect_u32(test_generator_all_halts, 0U, "the refusal stops nothing");
+            expect_i64(context.machine_state.position_um[0], 0, "the refused move leaves the planned position");
+        }
+    }
+}
+
+/* The move waits for room in the plan buffer like an XYZ move: no answer meanwhile, and it is queued when room appears. */
+static void test_doser_move_into_a_full_plan_buffer_waits_until_room_appears(void) {
+    const uint32_t expected_order = order_of_the_next_move();
+    reset_receive_script();
+    fill_plan_buffer_until_full();
+    expect_u32(queued_blocks(&test_plan_buffer), PLAN_BUFFER_CAPACITY, "the plan buffer is full");
+    MotionTaskContext_t context = doser_test_context();
+    const CommandDTO_t move = doser_move(600U, -250, 1000U);
+    script_moves(&move, 1U);
+    prepare_sleeps_woken_by_room(&context, 1U);
+    test_sleep_actions[1] = make_room_for_one_block;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    for (uint32_t sleep = 0U; sleep < 2U; ++sleep) {
+        const TestSleepSnapshot_t *held = &test_sleep_snapshots[sleep];
+        expect_u32(held->results, 0U, "a syringe move that finds no room is not answered while it waits");
+        expect_u32(held->queue_reads, 1U, "the move was taken out of the command queue");
+        expect_u32(held->queued_blocks, PLAN_BUFFER_CAPACITY, "the plan buffer does not change while the move waits");
+        expect_u32(held->enqueued_blocks, PLAN_BUFFER_CAPACITY, "nothing is pushed for a waiting move");
+        expect_u32(held->block_notifications, 0U, "a waiting move wakes no generator");
+        expect_i64(held->planned_x_um, 100, "the planned position does not move for a waiting move");
+    }
+    expect_u32(test_flags_set_calls, 1U, "only the room that the stream made raised a flag");
+    expect_u32(test_flags_set_flags, TEST_FLAG_SPACE, "the room wakes the task with the space flag");
+
+    expect_u32(test_result_count, 1U, "the move is answered once, after the room appeared");
+    expect_done_at(0U, 600U, COMMAND_DONE_ACCEPTED, "the waiting move is accepted when room appears");
+    expect_u32(queued_blocks(&test_plan_buffer), PLAN_BUFFER_CAPACITY, "the freed place is taken by the move");
+    expect_u32(enqueued_blocks(&test_plan_buffer), PLAN_BUFFER_CAPACITY + 1U, "the move was pushed once");
+    const MotionPlanBlock_t last = plan_block_at(PLAN_BUFFER_CAPACITY - 1U);
+    expect_doser_block(&last, 600U, -250, 250U, 1000U, 0x00U, expected_order);
+    expect_u32(plan_block_sequence_at(0U), 2U, "the block the stream gave back is gone from the front");
+    expect_u32(test_block_ready_notifications, 1U, "the generator is woken for the accepted move");
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "the planner is not asked");
+    expect_doser_context_untouched(&context, "the planned position is unchanged");
+    expect_u32(test_flags_wait_calls, 3U, "two sleeps for the room and one when the task is idle");
+}
+
+/* Syringe and XYZ moves share the queue and the wait: the commands are served in their order. */
+static void test_commands_behind_a_waiting_doser_move_keep_their_order(void) {
+    const uint32_t first_order = order_of_the_next_move();
+    reset_receive_script();
+    fill_plan_buffer_until_full();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t commands[] = {
+        doser_move(610U, 100, 1000U),
+        xyz_move_to(611U, 2000, 1000U),
+        doser_move(612U, -50, 2000U),
+    };
+    script_moves(commands, 3U);
+    prepare_sleeps_woken_by_room(&context, 0U);
+    test_sleep_actions[0] = make_room_for_one_block;
+    test_sleep_actions[1] = make_room_for_one_block;
+    test_sleep_actions[2] = make_room_for_one_block;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_sleep_snapshots[0].results, 0U, "nothing is answered while the first move waits");
+    expect_u32(test_sleep_snapshots[0].queue_reads, 1U, "the commands behind the waiting move are not read");
+    expect_u32(test_sleep_snapshots[1].results, 1U, "only the first move is answered when the second waits");
+    expect_u32(test_sleep_snapshots[1].queue_reads, 2U, "the second move was read, the third was not");
+    expect_u32(test_sleep_snapshots[1].planner_calls, 0U, "the syringe move is no planner call, the XYZ move waits");
+    expect_u32(test_sleep_snapshots[2].results, 2U, "two moves are answered when the third waits");
+    expect_u32(test_sleep_snapshots[2].queue_reads, 3U, "all three were read");
+    expect_u32(test_sleep_snapshots[2].planner_calls, 1U, "only the XYZ move was planned");
+    expect_i64(test_sleep_snapshots[2].planned_x_um, 2000, "the planned position is the target of the XYZ move");
+
+    expect_u32(test_result_count, 3U, "the three commands are answered once each");
+    expect_done_at(0U, 610U, COMMAND_DONE_ACCEPTED, "the first move is answered first");
+    expect_done_at(1U, 611U, COMMAND_DONE_ACCEPTED, "the second move is answered second");
+    expect_done_at(2U, 612U, COMMAND_DONE_ACCEPTED, "the third move is answered third");
+    expect_u32(queued_blocks(&test_plan_buffer), PLAN_BUFFER_CAPACITY, "the buffer is full again with the three moves");
+    const MotionPlanBlock_t first = plan_block_at(PLAN_BUFFER_CAPACITY - 3U);
+    const MotionPlanBlock_t second = plan_block_at(PLAN_BUFFER_CAPACITY - 2U);
+    const MotionPlanBlock_t third = plan_block_at(PLAN_BUFFER_CAPACITY - 1U);
+    expect_doser_block(&first, 610U, 100, 100U, 1000U, 0x08U, first_order);
+    expect_u32(second.sequence, 611U, "the XYZ move is queued between the syringe moves");
+    expect_u32(second.order, first_order + 1U, "the XYZ block follows the syringe block in the order of the stream");
+    expect_i64(second.step_delta[MOTION_PLAN_CHANNEL_SYRINGE], 0, "the XYZ block has no syringe steps");
+    expect_doser_block(&third, 612U, -50, 50U, 2000U, 0x00U, first_order + 2U);
+    expect_i64(context.machine_state.position_um[0], 2000, "the planned position is the target of the XYZ move");
+    expect_i64(context.machine_state.position_um[1], 0, "the syringe moves did not touch Y");
+    expect_i64(context.machine_state.position_um[2], 0, "the syringe moves did not touch Z");
+    MotionTaskDiagnostics diagnostics = {0};
+    motion_task_get_diagnostics(&diagnostics);
+    expect_u32(diagnostics.commands_dequeued, 3U, "each command is counted once, however often it was considered");
+}
+
+/* The moves of the syringe and of the axes in one queue are played, and answered, in the order of the commands. */
+static void test_doser_and_xyz_moves_share_the_order_of_the_stream(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        xyz_move_to(620U, 1000, 1000U),
+        doser_move(621U, 300, 1000U),
+        xyz_move_to(622U, 2000, 1000U),
+    };
+    run_commands(&context, moves, 3U);
+    record_print_blocks();
+
+    expect_u32(test_result_count, 3U, "each move is answered once");
+    expect_u32(test_block_record_count, 3U, "each move queued one block");
+    expect_u32(test_block_record_sequences[0], 620U, "the first block is the XYZ move");
+    expect_u32(test_block_record_sequences[1], 621U, "the second block is the syringe move");
+    expect_u32(test_block_record_sequences[2], 622U, "the third block is the second XYZ move");
+    expect_u32(test_block_record_orders[1], test_block_record_orders[0] + 1U, "the syringe block has the next order");
+    expect_u32(test_block_record_orders[2], test_block_record_orders[1] + 1U, "the next XYZ block follows it");
+    expect_i64(test_block_record_syringe_steps[1], 300, "the syringe block carries its steps");
+    expect_i64(context.machine_state.position_um[0], 2000, "the planned position follows the XYZ moves");
+    expect_u32(motion_task_test_get_planner_call_count(), 2U, "only the XYZ moves were planned");
+}
+
+/* A refusal of a stroke or a rate only after the wait: the move is decided for good when it has room. */
+static void test_doser_refusals_come_after_the_wait_for_room(void) {
+    reset_receive_script();
+    fill_plan_buffer_until_full();
+    MotionTaskContext_t context = doser_test_context();
+    context.doser_max_step_count = 100U;
+    const CommandDTO_t move = doser_move(630U, 101, 1000U);
+    script_moves(&move, 1U);
+    prepare_sleeps_woken_by_room(&context, 0U);
+    test_sleep_actions[0] = make_room_for_one_block;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_sleep_snapshots[0].results, 0U, "the move is held, not refused, while there is no room");
+    expect_u32(test_result_count, 1U, "the move is answered once");
+    expect_result_at(0U, 630U, TEST_ERROR_DOSER_STEPS_TOO_MANY, "the stroke is checked once the move has room");
+    expect_u32(enqueued_blocks(&test_plan_buffer), PLAN_BUFFER_CAPACITY, "nothing is queued for the refused move");
+    expect_u32(test_block_ready_notifications, 0U, "the generator is not woken");
+}
+
+/* A halted stream frees no room, so a syringe move that waits for it is refused rather than held for ever. */
+static void test_halted_stream_ends_the_wait_of_a_doser_move(void) {
+    reset_receive_script();
+    fill_plan_buffer_until_full();
+    MotionTaskContext_t context = doser_test_context();
+    const CommandDTO_t move = doser_move(640U, 100, 1000U);
+    script_moves(&move, 1U);
+    prepare_sleeps(&context, 1U);
+    test_sleep_actions[0] = halt_the_print_stream;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_sleep_snapshots[0].results, 0U, "the move waits while the stream is not halted");
+    expect_u32(test_result_count, 1U, "the move is answered once");
+    expect_result_at(0U, 640U, TEST_ERROR_STREAM_HALTED, "the move is refused when the stream halts meanwhile");
+    expect_u32(enqueued_blocks(&test_plan_buffer), PLAN_BUFFER_CAPACITY, "nothing is queued for the refused move");
+    expect_doser_context_untouched(&context, "the planned position is unchanged");
+}
+
+/* The tracker holds every move that waits for its result, syringe moves included: when it is full the move waits. */
+static void test_doser_move_waits_while_the_result_tracker_is_full(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    const uint32_t capacity = MOVE_RESULT_TRACKER_CAPACITY;
+    for (uint32_t index = 0U; index <= capacity; ++index) {
+        const CommandDTO_t move = doser_move(1200U + index, 100 + (int32_t)index, 1000U);
+        script_read(index, osOK, &move);
+    }
+    script_read(capacity + 1U, osErrorResource, NULL);
+    const TestProgressStep_t steps[] = {{.played_blocks = capacity, .played_sequence = 1200U + capacity - 1U}};
+    script_progress_steps(steps, 1U);
+    reset_sleep_snapshots(&context);
+    test_flags_wait_hook = snapshot_then_apply_progress_step;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    record_print_blocks();
+
+    const TestSleepSnapshot_t *held = &test_sleep_snapshots[0];
+    expect_u32(held->results, capacity, "the move that finds the tracker full is not answered while it waits");
+    expect_u32(held->queue_reads, capacity + 1U, "the move was taken out of the command queue");
+    expect_u32(held->block_notifications, capacity, "the waiting move wakes no generator");
+
+    expect_u32(test_result_count, 2U * capacity + 1U, "every move is answered once and the played ones a second time");
+    for (uint32_t index = 0U; index < capacity; ++index) {
+        expect_done_at(index, 1200U + index, COMMAND_DONE_ACCEPTED, "a move that fits is accepted");
+    }
+    for (uint32_t index = 0U; index < capacity; ++index) {
+        expect_completed_at(capacity + index, 1200U + index, "the results are given before the waiting move goes on");
+    }
+    expect_done_at(2U * capacity, 1200U + capacity, COMMAND_DONE_ACCEPTED, "the waiting move is accepted once there is room");
+    expect_u32(test_block_record_count, capacity + 1U, "the waiting move queued one block");
+    for (uint32_t index = 1U; index < test_block_record_count; ++index) {
+        expect_u32(
+            test_block_record_orders[index],
+            test_block_record_orders[index - 1U] + 1U,
+            "the orders follow each other without a gap"
+        );
+    }
+    expect_u32(motion_task_test_get_planner_call_count(), 0U, "no planner call for syringe moves");
+    expect_u32(test_block_ready_notifications, capacity + 1U, "the generator is woken for every queued block");
+    expect_doser_context_untouched(&context, "the planned position is unchanged");
+}
+
+/* The result of a syringe move comes like that of an XYZ move: DONE ACCEPTED at once, DONE COMPLETED once it is played. */
+static void test_played_doser_moves_are_answered_completed_in_order(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        doser_move(700U, 100, 1000U),
+        xyz_move_to(701U, 1000, 1000U),
+        doser_move(702U, -100, 1000U),
+    };
+    script_moves(moves, 3U);
+    const TestProgressStep_t steps[] = {
+        {.played_blocks = 1U, .played_sequence = 700U},
+        {.played_blocks = 3U, .played_sequence = 702U},
+    };
+    script_progress_steps(steps, 2U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 6U, "three acceptances and three completions");
+    expect_done_at(0U, 700U, COMMAND_DONE_ACCEPTED, "the first syringe move is accepted");
+    expect_done_at(1U, 701U, COMMAND_DONE_ACCEPTED, "the XYZ move is accepted");
+    expect_done_at(2U, 702U, COMMAND_DONE_ACCEPTED, "the second syringe move is accepted");
+    expect_completed_at(3U, 700U, "the first syringe move is completed once it is played");
+    expect_completed_at(4U, 701U, "the XYZ move is completed next");
+    expect_completed_at(5U, 702U, "the last syringe move is completed once it has been played");
+}
+
+/* A stream that stops with a syringe move not played answers it with ERROR STREAM_INTERRUPTED, naming the cause. */
+static void test_a_stopped_stream_interrupts_the_unplayed_doser_move(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = valid_motion_context();
+    const CommandDTO_t moves[] = {
+        doser_move(710U, 200, 1000U),
+        doser_move(711U, -200, 1000U),
+    };
+    script_moves(moves, 2U);
+    /* A ring fault of the syringe channel: no axis is to blame. */
+    const TestProgressStep_t steps[] = {{
+        .played_blocks = 1U,
+        .played_sequence = 710U,
+        .stop_resolved = 1U,
+        .unplayed_sequence = 711U,
+        .halt_cause = STEP_GENERATOR_TASK_HALT_CAUSE_GROUP_FAULT,
+        .halt_axis = STEP_GENERATOR_TASK_NO_AXIS,
+        .halt_detail = 5U,
+    }};
+    script_progress_steps(steps, 1U);
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+
+    expect_u32(test_result_count, 4U, "two acceptances, one completion and one error");
+    expect_completed_at(2U, 710U, "the syringe move played before the stop is completed");
+    expect_interrupted_at(
+        3U,
+        711U,
+        TEST_CAUSE_GROUP_FAULT,
+        TEST_AXIS_NONE,
+        5U,
+        "the unplayed syringe move gets the cause, no axis and the detail"
+    );
+}
+
+/* STOP cancels the queued syringe move with the printing queue and a new syringe move is accepted. */
+static void test_stop_cancels_the_doser_move_and_the_next_one_is_accepted(void) {
+    /* The first move gets this order, and STOP keeps the count: the move after STOP gets the next one. */
+    const uint32_t first_order = order_of_the_next_move();
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    const CommandDTO_t commands[] = {
+        doser_move(720U, 400, 1000U),
+        {.sequence = 721U, .code = COMMAND_CODE_STOP},
+        doser_move(722U, -50, 2000U),
+    };
+    run_commands_with_hook(&context, commands, 3U, request_stop_at_read_1);
+
+    expect_u32(test_generator_all_halts, 1U, "the immediate STOP halted all instances once");
+    expect_u32(test_generator_all_resumes, 1U, "STOP restarted all instances once");
+    expect_u32(gen_print.halts, 1U, "the printing instance, which plays the syringe block, was halted once");
+    expect_u32(gen_print.reset_count, 1U, "the printing instance was reset");
+    expect_u32(gen_print.halted, 0U, "the printing instance is no longer halted");
+    expect_u32(cancelled_blocks(&test_plan_buffer), 1U, "STOP cancelled the queued syringe block");
+    expect_u32(test_discarded_results, 1U, "STOP erased the unread answer of the first move");
+    expect_u32(test_result_count, 2U, "STOP and the move behind it are answered");
+    expect_done_at(0U, 721U, COMMAND_DONE_ACCEPTED, "STOP is accepted");
+    expect_done_at(1U, 722U, COMMAND_DONE_ACCEPTED, "a syringe move is accepted after STOP");
+    expect_u32(enqueued_blocks(&test_plan_buffer), 2U, "the move after STOP was queued");
+    expect_u32(queued_blocks(&test_plan_buffer), 1U, "only the move after STOP is left in the queue");
+    MotionPlanBlock_t block;
+    expect_u32(plan_buffer_try_pop(&test_plan_buffer, &block), PLAN_BUFFER_STATUS_OK, "the new block is queued");
+    expect_doser_block(&block, 722U, -50, 50U, 2000U, 0x00U, first_order + 1U);
+    expect_u32(test_block_ready_notifications, 2U, "the generator was told about both blocks");
+    expect_axis_queues_empty("no single-axis queue was touched");
+}
+
+/* The queue is full at the moment of queueing although the task checked it: the refusal is a guard and gives the order
+ * of the tracker back, so the next block follows the last accepted one. */
+static void test_doser_move_that_finds_the_buffer_full_after_the_decision_is_refused_as_a_guard(void) {
+    reset_receive_script();
+    MotionTaskContext_t context = doser_test_context();
+    const CommandDTO_t moves[] = {
+        doser_move(730U, 100, 1000U),
+        /* The buffer is filled behind its back. */
+        doser_move(731U, 200, 1000U),
+        doser_move(732U, -300, 1000U),
+    };
+    script_moves(moves, 3U);
+    test_receive_hook = guard_hook_at_reads;
+    expect_u32((uint32_t)run_until_blocked(&context), 2U, "the task ends blocked on its flags");
+    record_print_blocks();
+
+    expect_u32(test_result_count, 3U, "three answers");
+    expect_done_at(0U, 730U, COMMAND_DONE_ACCEPTED, "the first move is accepted");
+    expect_result_at(1U, 731U, TEST_ERROR_PLAN_QUEUE_FULL, "the move whose block does not fit is refused");
+    expect_done_at(2U, 732U, COMMAND_DONE_ACCEPTED, "the next move is accepted");
+    expect_u32(
+        recorded_order_of(732U),
+        recorded_order_of(730U) + 1U,
+        "the refused move gave its order back, so the next block carries the following one"
+    );
+    expect_i64(recorded_syringe_steps_of(730U), 100, "the first block has its steps");
+    expect_i64(recorded_syringe_steps_of(732U), -300, "the last block has its steps");
+    PlanBufferDiagnostics_t buffer = {0};
+    (void)plan_buffer_get_diagnostics(&test_plan_buffer, &buffer);
+    expect_u32(buffer.full_rejections, 1U, "the buffer counted the refused push");
+    expect_u32(test_block_ready_notifications, 2U, "the refused block woke no generator");
+    expect_doser_context_untouched(&context, "the planned position is unchanged");
+    expect_nothing_was_stopped("the guard stops nothing");
+}
+
 int main(void) {
     test_notify_before_the_task_started_does_nothing();
     test_accepted_moves_get_consecutive_block_orders();
@@ -6595,6 +7525,30 @@ int main(void) {
     test_stop_reports_not_settled_when_the_reset_leaves_the_stream_halted();
     test_stop_waits_for_the_reset_count_not_the_halt_flag();
     test_not_ready_print_instance_refuses_only_moves();
+    test_doser_move_queues_one_block_in_the_print_queue();
+    test_doser_rate_is_limited_by_the_lower_of_the_generator_and_the_planner();
+    test_doser_rate_with_a_zero_limit_is_too_high();
+    test_doser_move_with_a_zero_rate_is_an_invalid_parameter();
+    test_doser_rate_refusal_does_not_stop_or_empty_anything();
+    test_doser_move_of_zero_steps_is_already_at_target();
+    test_doser_stroke_limit_counts_the_magnitude_of_the_steps();
+    test_doser_stroke_refusal_comes_before_the_other_checks();
+    test_doser_move_combined_with_other_flags_is_not_supported();
+    test_doser_move_is_not_configured_without_a_context_or_a_feeder();
+    test_doser_move_is_refused_while_the_printing_stream_is_halted();
+    test_doser_move_is_refused_while_an_axis_stream_is_busy();
+    test_doser_move_is_accepted_while_the_printing_stream_plays();
+    test_doser_move_is_refused_while_any_axis_homes();
+    test_doser_move_into_a_full_plan_buffer_waits_until_room_appears();
+    test_commands_behind_a_waiting_doser_move_keep_their_order();
+    test_doser_and_xyz_moves_share_the_order_of_the_stream();
+    test_doser_refusals_come_after_the_wait_for_room();
+    test_halted_stream_ends_the_wait_of_a_doser_move();
+    test_doser_move_waits_while_the_result_tracker_is_full();
+    test_played_doser_moves_are_answered_completed_in_order();
+    test_a_stopped_stream_interrupts_the_unplayed_doser_move();
+    test_stop_cancels_the_doser_move_and_the_next_one_is_accepted();
+    test_doser_move_that_finds_the_buffer_full_after_the_decision_is_refused_as_a_guard();
     test_move_is_refused_while_the_printing_stream_is_halted();
     test_home_is_refused_while_the_printing_stream_is_halted();
     test_calibrate_is_refused_while_the_printing_stream_is_halted();

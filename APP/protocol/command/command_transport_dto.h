@@ -53,7 +53,9 @@ typedef enum {
  * A planner refusal MotionPlannerStatus_t `status` is reported as COMMAND_ERROR_PLANNER_BASE + status, so NO_MOVEMENT
  * is 0x0101 and AXIS_SPEED_LIMIT_EXCEEDED is 0x0107. */
 #define COMMAND_ERROR_PLANNER_BASE 0x0100U
-/* An axis the command names is homing, calibrating, moving, or its stream is busy. */
+/* An axis the command names is homing, calibrating, moving, or its stream is busy. A move of the printing stream (XYZ
+ * or syringe) is refused with it while HOME or CALIBRATE of any axis runs, because the stream takes all the channels.
+ */
 #define COMMAND_ERROR_AXIS_BUSY 0x0120U
 /* The start and end switches of an axis are active together: a wiring or sensor fault. */
 #define COMMAND_ERROR_LIMITS_CONFLICT 0x0121U
@@ -62,7 +64,8 @@ typedef enum {
 /* The plan queue did not take the block of the move. MotionTask holds a move back until there is room, so this is left
  * for a queue that cannot take blocks at all (not ready, not there). */
 #define COMMAND_ERROR_PLAN_QUEUE_FULL 0x0123U
-/* The command, or the part of it that MotionTask would run, is not implemented. */
+/* The command, or the part of it that MotionTask would run, is not implemented: also a DOSER_MOVE together with other
+ * flags (an XYZ move feeds the syringe from its path, so explicit steps next to it are not defined). */
 #define COMMAND_ERROR_NOT_SUPPORTED 0x0124U
 /* STOP did not bring every axis to rest in time, or the printing stream is still halted after the reset that follows
  * it; the step generator stays halted. */
@@ -79,14 +82,19 @@ typedef enum {
  * stopped. The cause, axis and detail fields of the ERROR payload say why; STOP is needed to lift the stop. The answer
  * comes after the move's DONE and only for the move that was playing when the stream stopped. */
 #define COMMAND_ERROR_STREAM_INTERRUPTED 0x0128U
+/* A syringe move (DOSER_MOVE) asks for a STEP rate above what the step generator plays or the planner allows; the move
+ * is refused whole. The command is no planner refusal: nothing is stopped for it. */
+#define COMMAND_ERROR_STEP_RATE_TOO_HIGH 0x0129U
+/* A syringe move asks for more steps than the configured stroke of the piston allows in one move; refused whole. */
+#define COMMAND_ERROR_DOSER_STEPS_TOO_MANY 0x012AU
 
 /* Result codes of a DONE frame. */
 #define COMMAND_DONE_ACCEPTED 0x0000U
 #define COMMAND_DONE_ALREADY_AT_TARGET 0x0001U
 /* The second DONE of a move: the move was played to its end.
  * Answers of a motion operation (an XYZ move): ACK, DONE ACCEPTED (queued), then COMMAND_DONE_COMPLETED or ERROR
- * COMMAND_ERROR_STREAM_INTERRUPTED. ALREADY_AT_TARGET, a refusal, HOME and CALIBRATE are answered once and get no
- * second answer. */
+ * COMMAND_ERROR_STREAM_INTERRUPTED. A syringe move (DOSER_MOVE alone) is answered the same way. ALREADY_AT_TARGET
+ * (also a syringe move of zero steps), a refusal, HOME and CALIBRATE are answered once and get no second answer. */
 #define COMMAND_DONE_COMPLETED 0x0002U
 
 /* ERROR payload fields beyond the code. cause is a STEP_GENERATOR_TASK_HALT_CAUSE_* (0 for a refusal that is not a

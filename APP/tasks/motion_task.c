@@ -10,6 +10,7 @@
 #include "motion/move_result_tracker.h"
 #include "motion/plan_buffer.h"
 #include "motion/step_executor.h"
+#include "motion/syringe_block.h"
 #include "step_generator_task.h"
 
 #include "cmsis_os.h"
@@ -211,6 +212,11 @@ static int motion_task_is_xyz_move(const CommandDTO_t *command) {
            (command->parameters.motion_operation.operation_flags & COMMAND_MOTION_OPERATION_FLAG_XYZ_MOVE) != 0U;
 }
 
+static int motion_task_is_doser_move(const CommandDTO_t *command) {
+    return command->code == COMMAND_CODE_MOTION_OPERATION &&
+           (command->parameters.motion_operation.operation_flags & COMMAND_MOTION_OPERATION_FLAG_DOSER_MOVE) != 0U;
+}
+
 /* What MotionTask decides about one command: DONE with a COMMAND_DONE_* code, ERROR with a COMMAND_ERROR_* code, or
  * to wait. A command that waits has changed nothing and gets no answer yet; it is decided again when MotionTask wakes
  * (room in a queue it needs, a STOP). */
@@ -282,6 +288,54 @@ static uint8_t motion_task_is_planner_refusal(const MotionTaskDecision_t *decisi
                    decision->code < COMMAND_ERROR_AXIS_BUSY
                ? 1U
                : 0U;
+}
+
+/* The highest STEP rate of a syringe move: the lower of the planner's limit and what the generator of the printing
+ * stream plays (a faster block would stop the stream with a feeder error after the move was accepted). */
+static uint32_t motion_task_doser_rate_limit(const MotionTaskContext_t *context) {
+    const uint32_t generator_limit_hz =
+        step_generator_instance_get_max_step_rate_hz(step_generator_task_get_print_instance());
+    return generator_limit_hz < context->planner_config.max_step_event_rate_hz
+               ? generator_limit_hz
+               : context->planner_config.max_step_event_rate_hz;
+}
+
+/* A syringe move without axes: one block on the syringe channel alone, in the plan of the printing stream like any
+ * move, so it is played in order with the moves of the axes and its result is reported by the tracker of moves as
+ * theirs is. It needs no axis, no homing and no planned position. The move is decided only while the plan and the
+ * tracker have room (motion_task_move_waits_for_room). The context is not NULL. */
+static MotionTaskDecision_t motion_task_queue_doser_move(MotionTaskContext_t *context, const CommandDTO_t *command) {
+    const CommandMotionOperationParameters_t *motion = &command->parameters.motion_operation;
+    const int64_t step_count = motion->e_delta < 0 ? -(int64_t)motion->e_delta : (int64_t)motion->e_delta;
+    /* The piston has no switch to stop at its end, so one move may not run farther than the configured stroke. */
+    if (context->doser_max_step_count != 0U && (uint64_t)step_count > context->doser_max_step_count) {
+        return motion_task_decision_from_error(COMMAND_ERROR_DOSER_STEPS_TOO_MANY);
+    }
+    MotionPlanBlock_t block;
+    const SyringeBlockStatus_t status = syringe_block_make(
+        command->sequence,
+        motion->e_delta,
+        motion->e_speed,
+        motion_task_doser_rate_limit(context),
+        &block
+    );
+    if (status == SYRINGE_BLOCK_STATUS_NO_MOVEMENT) {
+        return motion_task_done(COMMAND_DONE_ALREADY_AT_TARGET);
+    }
+    if (status == SYRINGE_BLOCK_STATUS_RATE_LIMIT_EXCEEDED) {
+        return motion_task_decision_from_error(COMMAND_ERROR_STEP_RATE_TOO_HIGH);
+    }
+    if (status != SYRINGE_BLOCK_STATUS_OK) {
+        /* No planner is involved, so this is no planner refusal: nothing is stopped for it. */
+        return motion_task_decision_from_error(COMMAND_ERROR_INVALID_PARAMETER);
+    }
+    block.order = move_result_tracker_add(&motion_task_move_tracker, command->sequence);
+    if (plan_buffer_try_push(motion_task_plan_buffer, &block) != PLAN_BUFFER_STATUS_OK) {
+        move_result_tracker_remove_last(&motion_task_move_tracker);
+        return motion_task_decision_from_error(COMMAND_ERROR_PLAN_QUEUE_FULL);
+    }
+    step_generator_task_notify_block_ready();
+    return motion_task_done(COMMAND_DONE_ACCEPTED);
 }
 
 /* A target beyond int32 is clamped; it is far outside any axis, so the planner rejects it. */
@@ -1019,7 +1073,13 @@ static MotionTaskDecision_t motion_task_execute_command(
             refusal != 0U ? refusal : motion_task_start_axes(states, context, axes_mask, calibrate)
         );
     }
-    if (motion_task_is_xyz_move(command) != 0) {
+    if (motion_task_is_xyz_move(command) != 0 || motion_task_is_doser_move(command) != 0) {
+        /* The doser part next to others (an XYZ move whose syringe feed is derived from the path) is not defined yet:
+         * the explicit steps and the ones from the path must not add up, so the combination is refused. */
+        if (motion_task_is_doser_move(command) != 0 &&
+            command->parameters.motion_operation.operation_flags != COMMAND_MOTION_OPERATION_FLAG_DOSER_MOVE) {
+            return motion_task_decision_from_error(COMMAND_ERROR_NOT_SUPPORTED);
+        }
         /* A stream whose feeder was never built plays nothing, so a block queued for it would wait for good. */
         if (context == NULL || step_generator_instance_is_ready(step_generator_task_get_print_instance()) == 0U) {
             return motion_task_decision_from_error(COMMAND_ERROR_NOT_CONFIGURED);
@@ -1027,15 +1087,18 @@ static MotionTaskDecision_t motion_task_execute_command(
         if (stream_halted != 0U) {
             return motion_task_decision_from_error(COMMAND_ERROR_STREAM_HALTED);
         }
+        /* HOME and CALIBRATE hold the channels of their axes, and the stream takes all of them, the syringe's too. */
         if (busy_mask != 0U || motion_task_axis_streams_busy_axes() != 0U) {
             return motion_task_decision_from_error(COMMAND_ERROR_AXIS_BUSY);
         }
         /* Last, after the refusals that depend on the state of the machine, so a halted stream, which frees no room,
-         * never waits. The planner's own refusal comes only after the wait, when the move is decided for good. */
+         * never waits. The refusal of the planner or of the syringe block comes only after the wait, when the move is
+         * decided for good. */
         if (motion_task_move_waits_for_room() != 0U) {
             return motion_task_wait();
         }
-        return motion_task_queue_xyz_move(context, command);
+        return motion_task_is_doser_move(command) != 0 ? motion_task_queue_doser_move(context, command)
+                                                       : motion_task_queue_xyz_move(context, command);
     }
     return motion_task_decision_from_error(COMMAND_ERROR_NOT_SUPPORTED);
 }

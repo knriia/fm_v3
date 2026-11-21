@@ -44,7 +44,8 @@
 ## Сборка и проверка
 
 - Host-тесты: `tests/coverage.ps1`; покрытие должно оставаться 100% по каждому файлу. Регистровые файлы BSP (например, `step_stream_axis.c`) тестами не покрываются, поэтому логику без регистров выносить в отдельные модули (`*_logic.c`) и покрывать там.
-- Если гейт покрытия падает на файлах `x_axis_*` или `command_decoder_task`, виноваты устаревшие исполняемые файлы в `cmake-build-coverage`, а не код: запускать с `-BuildDirectory` на новую папку.
+- Если гейт покрытия падает на файлах `x_axis_*` или `command_decoder_task`, виноваты устаревшие исполняемые файлы в `cmake_build/coverage`, а не код: запускать с `-BuildDirectory` на новую папку внутри `cmake_build/`.
+- Все каталоги сборки (CMake, clangd, покрытие, временные) создавать только внутри `cmake_build/`; в корне проекта `cmake-build-*` не создавать.
 - `cmake`, `ninja` и `arm-none-eabi-gcc` не в PATH. Быстрая проверка прошивочного файла без сборки: `arm-none-eabi-gcc -fsyntax-only` из STM32CubeIDE (`C:\ST\STM32CubeIDE_1.10.1\...\tools\bin`) с `-mcpu=cortex-m7 -mthumb -DSTM32H723xx -DUSE_HAL_DRIVER` и каталогами `BSP/MCU`, `APP`, `APP/motion`, `Core/Inc`, `Drivers/CMSIS/...`, `Drivers/STM32H7xx_HAL_Driver/Inc`.
 
 ## Git workflow

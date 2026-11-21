@@ -23,7 +23,9 @@ typedef struct {
     uint32_t stop_resets;
 } StepGeneratorTaskDiagnostics;
 
-/* Number of channels that stream together (X, Y, Z); the diagnostic frame carries one entry per channel. */
+/* Number of axes that stream together (X, Y, Z); the diagnostic frame carries one entry per axis. The syringe, the
+ * fourth member of the printing stream, has no entry yet: its halts show in the fields of the stream, not in a member
+ * entry. */
 #define STEP_GENERATOR_TASK_STREAM_MEMBERS 3U
 /* Who stopped the feeding the last time; 0 until the first halt. */
 #define STEP_GENERATOR_TASK_HALT_CAUSE_NONE 0U
@@ -62,9 +64,9 @@ typedef struct {
     /* STEP_GENERATOR_TASK_HALT_CAUSE_* of the first halt since the last reset: a later halt, e.g. MotionTask ending the
      * move after a switch stopped it, does not overwrite it. It stays after the reset, so with halted 0 it is old. */
     uint32_t halt_cause;
-    /* Member (0 = X, 1 = Y, 2 = Z): for a limit the one whose switch fired first since the last reset, or the braking
-     * channel when no switch was reported; for a fault the faulted one; STEP_GENERATOR_TASK_NO_MEMBER when no channel
-     * is to blame. */
+    /* Member (0 = X, 1 = Y, 2 = Z, 3 = syringe): for a limit the one whose switch fired first since the last reset, or
+     * the braking channel when no switch was reported; for a fault the faulted one; STEP_GENERATOR_TASK_NO_MEMBER when
+     * no channel is to blame. */
     uint32_t halt_member;
     /* StepStreamAxisFault_t of the latest group fault. */
     uint32_t halt_fault;
@@ -93,13 +95,14 @@ typedef struct {
     PlanBuffer_t *axis_plan_buffers[STEP_GENERATOR_TASK_AXIS_INSTANCE_COUNT];
 } StepGeneratorTaskConfig_t;
 
-/* Turns plan blocks into ring records of the X stream axis, keeps its ring filled and starts and stops the stream.
+/* Turns plan blocks into ring records of the stream channels (X, Y, Z and the syringe), keeps their rings filled and
+ * starts and stops the streams.
  * argument is a const StepGeneratorTaskConfig_t * that outlives the task; without it the task only reports an error. */
 void StepGeneratorTask(void *argument);
 /* One stream: its feeder, channels, halt state and diagnostics. The task serves all instances; the type is opaque. */
 typedef struct StepGeneratorInstance StepGeneratorInstance_t;
 
-/* The instance of the printing stream (X, Y, Z); its diagnostics go into the diagnostic frame. */
+/* The instance of the printing stream (X, Y, Z and the syringe); the diagnostic frame carries its diagnostics. */
 StepGeneratorInstance_t *step_generator_task_get_print_instance(void);
 /* The one-lane instance of an axis: it plays the homing and calibration moves of that axis, so the axes of one command
  * run at the same time, each with its own plan queue. NULL for an axis outside MotionAxis_t. */
@@ -166,6 +169,10 @@ uint8_t step_generator_instance_is_ready(const StepGeneratorInstance_t *instance
 /* How many resets after STOP the instance has finished; the count rises after the reset ended, so a reset that failed
  * has already halted the instance again. A NULL instance reads 0. */
 uint32_t step_generator_instance_reset_count(const StepGeneratorInstance_t *instance);
+/* The highest STEP rate in Hz that the generator of the instance plays: the timer clock over the longer of the pulse
+ * plus the low time and the shortest record. A block with a higher rate would stop the stream with a feeder error. 0
+ * for a NULL instance and for one that is not ready (its timing is not known). */
+uint32_t step_generator_instance_get_max_step_rate_hz(const StepGeneratorInstance_t *instance);
 /* After STOP, once the channels no longer move: drop the started block and the held one of this instance, then go on.
  * Other instances keep streaming. */
 void step_generator_instance_resume_after_stop(StepGeneratorInstance_t *instance);
